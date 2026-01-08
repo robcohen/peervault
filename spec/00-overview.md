@@ -96,3 +96,4 @@ Peer Management ──────► Iroh Transport ◄────────
 | [10-security](./10-security.md) | Threat model, encryption, trust |
 | [11-performance](./11-performance.md) | Budgets, optimization, benchmarks |
 | [12-migration](./12-migration.md) | Schema versioning, upgrades |
+| [13-plugin-development](./13-plugin-development.md) | Build setup, API patterns, guidelines |
