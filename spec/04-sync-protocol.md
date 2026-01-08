@@ -27,6 +27,113 @@ Define how Automerge documents are synchronized between peers over Iroh connecti
 └─────────────────────────────────────────────────────────────┘
 ```
 
+## Sequence Diagrams
+
+### Full Sync Session
+
+```
+┌────────┐                                              ┌────────┐
+│ Peer A │                                              │ Peer B │
+└───┬────┘                                              └───┬────┘
+    │                                                       │
+    │ ──────────── Iroh Connection Established ──────────►  │
+    │                                                       │
+    │                 INDEX SYNC PHASE                      │
+    │ ─────────────── index-sync (A's changes) ──────────►  │
+    │ ◄─────────────── index-sync (B's changes) ──────────  │
+    │ ─────────────── index-sync (A's changes) ──────────►  │
+    │ ◄─────────────── index-sync (B's changes) ──────────  │
+    │                    ... until converged ...            │
+    │                                                       │
+    │                DOCUMENT SYNC PHASE                    │
+    │                                                       │
+    │ ─────── For each doc in merged index: ───────        │
+    │                                                       │
+    │ ─────────────── doc-sync (docId, data) ────────────►  │
+    │ ◄─────────────── doc-sync (docId, data) ────────────  │
+    │                    ... until converged ...            │
+    │ ─────────────── doc-complete (docId) ──────────────►  │
+    │ ◄─────────────── doc-complete (docId) ──────────────  │
+    │                                                       │
+    │                    ... next doc ...                   │
+    │                                                       │
+    │ ─────────────── sync-complete ─────────────────────►  │
+    │ ◄─────────────── sync-complete ─────────────────────  │
+    │                                                       │
+    │                 LIVE SYNC MODE                        │
+    │ ◄═══════════ bidirectional doc-sync ═══════════════► │
+    │                (on local changes)                     │
+    │                                                       │
+```
+
+### Automerge Sync Protocol (Per Document)
+
+```
+┌────────┐                                              ┌────────┐
+│ Peer A │                                              │ Peer B │
+│        │                                              │        │
+│ Doc v3 │                                              │ Doc v2 │
+└───┬────┘                                              └───┬────┘
+    │                                                       │
+    │  generateSyncMessage(doc, state)                      │
+    │  → "I have changes 1,2,3, need anything?"             │
+    │ ─────────────── sync message ──────────────────────►  │
+    │                                                       │
+    │                       receiveSyncMessage(doc, state, msg)
+    │                       → Merge changes, update state
+    │                       generateSyncMessage(doc, state)
+    │                       → "Thanks, I had 1,2, here's my 2'"
+    │ ◄─────────────── sync message ──────────────────────  │
+    │                                                       │
+    │  receiveSyncMessage(doc, state, msg)                  │
+    │  → Merge change 2', both now have 1,2,2',3            │
+    │  generateSyncMessage(doc, state)                      │
+    │  → "I think we're synced"                             │
+    │ ─────────────── sync message (empty) ──────────────►  │
+    │                                                       │
+    │                       generateSyncMessage → null      │
+    │ ◄─────────────── sync message (empty) ──────────────  │
+    │                                                       │
+    │                    ✓ CONVERGED                        │
+    │               Both have identical docs                │
+    │                                                       │
+```
+
+### Conflict-Free Merge Example
+
+```
+         Initial State: "Hello world"
+                    │
+        ┌───────────┴───────────┐
+        │                       │
+        ▼                       ▼
+    ┌────────┐              ┌────────┐
+    │ Peer A │              │ Peer B │
+    │ offline│              │ offline│
+    └───┬────┘              └───┬────┘
+        │                       │
+    Edit: Insert               Edit: Insert
+    "brave " at pos 6          "new " at pos 6
+        │                       │
+        ▼                       ▼
+  "Hello brave world"     "Hello new world"
+        │                       │
+        └───────────┬───────────┘
+                    │ SYNC
+                    ▼
+            ┌──────────────┐
+            │   Automerge  │
+            │    Merge     │
+            └──────┬───────┘
+                   │
+                   ▼
+        "Hello brave new world"
+         (or "Hello new brave world")
+
+    Both insertions preserved!
+    Order determined by actor IDs (deterministic)
+```
+
 ## Message Types
 
 ```typescript

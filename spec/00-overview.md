@@ -75,6 +75,8 @@ Peer Management ──────► Iroh Transport ◄────────
 
 ## Spec Documents
 
+### Core Components
+
 | Spec | Description |
 |------|-------------|
 | [01-data-model](./01-data-model.md) | Automerge document schemas |
@@ -84,3 +86,13 @@ Peer Management ──────► Iroh Transport ◄────────
 | [05-transport-iroh](./05-transport-iroh.md) | P2P networking |
 | [06-peer-management](./06-peer-management.md) | Pairing and discovery |
 | [07-plugin-ui](./07-plugin-ui.md) | User interface |
+
+### Cross-Cutting Concerns
+
+| Spec | Description |
+|------|-------------|
+| [08-testing](./08-testing.md) | Test strategy, fixtures, CI |
+| [09-error-handling](./09-error-handling.md) | Error taxonomy, recovery |
+| [10-security](./10-security.md) | Threat model, encryption, trust |
+| [11-performance](./11-performance.md) | Budgets, optimization, benchmarks |
+| [12-migration](./12-migration.md) | Schema versioning, upgrades |

@@ -123,6 +123,133 @@ interface PeerManager {
 4. On connect: add peer, start sync
 ```
 
+## Sequence Diagrams
+
+### Device Pairing Flow
+
+```
+┌──────────┐          ┌─────────┐          ┌──────────┐
+│ Device A │          │   User  │          │ Device B │
+│(Initiator)│          │         │          │ (Joiner) │
+└────┬─────┘          └────┬────┘          └────┬─────┘
+     │                     │                    │
+     │  Click "Add Device" │                    │
+     │◄────────────────────│                    │
+     │                     │                    │
+     │  generateTicket()   │                    │
+     │─────────┐           │                    │
+     │         │           │                    │
+     │◄────────┘           │                    │
+     │                     │                    │
+     │  Display QR Code    │                    │
+     │────────────────────►│                    │
+     │                     │                    │
+     │                     │  Scan QR / Paste   │
+     │                     │───────────────────►│
+     │                     │                    │
+     │                     │     Click "Join"   │
+     │                     │───────────────────►│
+     │                     │                    │
+     │                     │  connectWithTicket()
+     │◄─────────────────── Iroh Connection ────►│
+     │                     │                    │
+     │  onIncomingConnection()                  │
+     │─────────┐           │                    │
+     │         │           │                    │
+     │◄────────┘           │                    │
+     │                     │                    │
+     │  Prompt for name    │                    │
+     │────────────────────►│                    │
+     │                     │                    │
+     │  "MacBook Pro"      │                    │
+     │◄────────────────────│                    │
+     │                     │                    │
+     │  addPeer()          │      addPeer()     │
+     │─────────┐           │    ┌───────────────│
+     │         │           │    │               │
+     │◄────────┘           │    └──────────────►│
+     │                     │                    │
+     │◄════════════ Begin Sync ════════════════►│
+     │                     │                    │
+     │  "Connected!"       │    "Connected!"    │
+     │────────────────────►│◄───────────────────│
+     │                     │                    │
+```
+
+### Connection Lifecycle
+
+```
+┌────────────┐     ┌────────────┐     ┌────────────┐     ┌────────────┐
+│Disconnected│     │ Connecting │     │ Connected  │     │  Syncing   │
+└─────┬──────┘     └─────┬──────┘     └─────┬──────┘     └─────┬──────┘
+      │                  │                  │                  │
+      │ connectToPeer()  │                  │                  │
+      │─────────────────►│                  │                  │
+      │                  │                  │                  │
+      │                  │ success          │                  │
+      │                  │─────────────────►│                  │
+      │                  │                  │                  │
+      │                  │                  │ syncWithPeer()   │
+      │                  │                  │─────────────────►│
+      │                  │                  │                  │
+      │                  │                  │ sync complete    │
+      │                  │                  │◄─────────────────│
+      │                  │                  │                  │
+      │                  │ connection       │                  │
+      │                  │ failed           │                  │
+      │◄─────────────────│                  │                  │
+      │                  │                  │                  │
+      │ scheduleReconnect()                 │                  │
+      │────────┐         │                  │                  │
+      │        │ (10s)   │                  │                  │
+      │◄───────┘         │                  │                  │
+      │                  │                  │                  │
+      │                  │                  │ disconnect       │
+      │◄─────────────────────────────────────────────────────│
+      │                  │                  │                  │
+      │ if autoConnect:  │                  │                  │
+      │ scheduleReconnect()                 │                  │
+      │                  │                  │                  │
+```
+
+### Incoming Connection Handling
+
+```
+┌────────────┐     ┌────────────┐     ┌────────────┐
+│   Iroh     │     │   Peer     │     │   Sync     │
+│ Transport  │     │  Manager   │     │  Engine    │
+└─────┬──────┘     └─────┬──────┘     └─────┬──────┘
+      │                  │                  │
+      │ incoming         │                  │
+      │ connection       │                  │
+      │─────────────────►│                  │
+      │                  │                  │
+      │                  │ is nodeId in     │
+      │                  │ peers list?      │
+      │                  │─────────┐        │
+      │                  │         │        │
+      │                  │◄────────┘        │
+      │                  │                  │
+      │                  │ [if unknown]     │
+      │                  │ reject & close   │
+      │◄─────────────────│                  │
+      │                  │                  │
+      │                  │ [if known]       │
+      │                  │ updateState()    │
+      │                  │─────────┐        │
+      │                  │         │        │
+      │                  │◄────────┘        │
+      │                  │                  │
+      │                  │ syncWithPeer()   │
+      │                  │─────────────────►│
+      │                  │                  │
+      │                  │                  │ begin sync
+      │                  │                  │─────────┐
+      │                  │                  │         │
+      │                  │                  │◄────────┘
+      │                  │                  │
+```
+
 ### Implementation
 
 ```typescript
