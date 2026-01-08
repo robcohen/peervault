@@ -6,11 +6,50 @@ Define how Iroh is used for peer-to-peer connections, including initialization, 
 
 ## Requirements
 
-- **REQ-IR-01**: MUST use pure WASM Iroh (no native sidecar)
-- **REQ-IR-02**: MUST support NAT traversal via hole-punching
-- **REQ-IR-03**: MUST fall back to relay when direct connection fails
-- **REQ-IR-04**: MUST encrypt all traffic (Iroh default)
-- **REQ-IR-05**: MUST persist endpoint identity across restarts
+- **REQ-IR-01**: MUST use Iroh compiled to WASM for browser/Obsidian compatibility
+- **REQ-IR-02**: MUST support relay-based connections (hole-punching unavailable in browser)
+- **REQ-IR-03**: MUST encrypt all traffic end-to-end (relay cannot decrypt)
+- **REQ-IR-04**: MUST persist endpoint identity across restarts
+- **REQ-IR-05**: MUST work on desktop, mobile (iOS/Android), and browser contexts
+
+## Iroh WASM Status (as of v0.33, January 2025)
+
+> **Important**: This section documents the current state of Iroh's WASM support, which affects our implementation approach.
+
+### What Works
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| WASM compilation | ✅ Stable | As of iroh 0.33 |
+| Browser support | ✅ Alpha | Via wasm-bindgen |
+| Relay connections | ✅ Works | All browser traffic flows through relays |
+| End-to-end encryption | ✅ Works | Relay cannot decrypt |
+| iroh-gossip | ✅ Works | WASM-compatible as of 0.33 |
+
+### What Doesn't Work in Browser/WASM
+
+| Feature | Status | Reason |
+|---------|--------|--------|
+| Direct UDP | ❌ | Browser sandbox restriction |
+| Hole-punching | ❌ | Requires direct UDP |
+| Local network discovery | ❌ | `discovery-local-network` feature unavailable |
+| DHT discovery | ❌ | `discovery-dht` feature unavailable |
+
+### Implementation Constraints
+
+1. **No NPM Package**: Iroh does not publish WASM builds to NPM. We must create a custom Rust wrapper crate using `wasm-bindgen`.
+
+2. **Relay-Only Mode**: In browser contexts, ALL connections flow through relay servers. This is unavoidable but connections remain encrypted.
+
+3. **Feature Flags**: Must use `iroh = { version = "0.33", default-features = false }` for WASM builds.
+
+4. **Desktop Advantage**: On Electron desktop (not mobile), we *could* use native Iroh for hole-punching, but this adds complexity. For v1, we use relay-only everywhere for consistency.
+
+### References
+
+- [Iroh WASM/Browser Support Docs](https://docs.iroh.computer/deployment/wasm-browser-support)
+- [iroh-examples (browser demos)](https://github.com/n0-computer/iroh-examples)
+- [Common WASM Troubleshooting](https://github.com/n0-computer/iroh/discussions/3200)
 
 ## Iroh Concepts
 
@@ -99,7 +138,8 @@ interface SyncStream {
 ### Endpoint Initialization
 
 ```typescript
-import { Endpoint, SecretKey } from '@aspect/iroh';
+// Import from our custom WASM wrapper (see Dependencies section)
+import { Endpoint, SecretKey } from 'peervault-iroh';
 
 class IrohTransportImpl implements IrohTransport {
   private endpoint: Endpoint | null = null;
@@ -269,12 +309,56 @@ class SyncStreamImpl implements SyncStream {
       │                  │                  │                  │
 ```
 
-### Connection Establishment (NAT Traversal)
+### Connection Establishment (Browser/WASM - Relay Only)
+
+> **Note**: In browser/WASM contexts, all connections are relayed. Hole-punching requires direct UDP access which browsers don't permit.
 
 ```
 ┌────────┐           ┌─────────┐           ┌────────┐
 │ Peer A │           │  Relay  │           │ Peer B │
-│ (NAT)  │           │ Server  │           │ (NAT)  │
+│(Browser)│          │ Server  │           │(Browser)│
+└───┬────┘           └────┬────┘           └───┬────┘
+    │                     │                    │
+    │  WebSocket connect  │                    │
+    │────────────────────►│                    │
+    │                     │                    │
+    │  Register NodeId    │                    │
+    │────────────────────►│                    │
+    │                     │                    │
+    │                     │  WebSocket connect │
+    │                     │◄───────────────────│
+    │                     │                    │
+    │                     │  Register NodeId   │
+    │                     │◄───────────────────│
+    │                     │                    │
+    │  Connect to Peer B  │                    │
+    │  (via ticket)       │                    │
+    │────────────────────►│                    │
+    │                     │                    │
+    │                     │  Forward to B      │
+    │                     │───────────────────►│
+    │                     │                    │
+    │                     │  Accept connection │
+    │                     │◄───────────────────│
+    │                     │                    │
+    │◄════ All traffic relayed (encrypted) ═══►│
+    │                     │                    │
+    │  E2E Encrypted      │  Cannot decrypt    │
+    │  (peer keys)        │  (relay is blind)  │
+    │                     │                    │
+    │        TLS 1.3 + QUIC over WebSocket     │
+    │◄════════════════════════════════════════►│
+    │                     │                    │
+```
+
+### Connection Establishment (Native Desktop - With Hole Punching)
+
+> **Note**: On native desktop (Electron main process), direct UDP is available and hole-punching can succeed.
+
+```
+┌────────┐           ┌─────────┐           ┌────────┐
+│ Peer A │           │  Relay  │           │ Peer B │
+│(Desktop)│          │ Server  │           │(Desktop)│
 └───┬────┘           └────┬────┘           └───┬────┘
     │                     │                    │
     │  Register with relay                     │
@@ -292,20 +376,14 @@ class SyncStreamImpl implements SyncStream {
     │                     │───────────────────►│
     │                     │                    │
     │       HOLE PUNCHING ATTEMPT              │
-    │◄──────────────────────────────────────── │
+    │◄─────────── UDP probes ─────────────────►│
     │                     │                    │
     │ [if hole-punch succeeds]                 │
-    │◄═══════ Direct P2P Connection ══════════►│
+    │◄═══════ Direct P2P (UDP/QUIC) ══════════►│
+    │         (relay not used)                 │
     │                     │                    │
     │ [if hole-punch fails]                    │
-    │                     │                    │
     │◄════ Relayed Connection via Server ═════►│
-    │                     │                    │
-    │        TLS 1.3 Handshake                 │
-    │◄────────────────────────────────────────►│
-    │                     │                    │
-    │        Encrypted QUIC Stream             │
-    │◄════════════════════════════════════════►│
     │                     │                    │
 ```
 
@@ -476,19 +554,78 @@ class ConnectionManager {
 
 ## Dependencies
 
-- `@aspect/iroh` - Iroh WASM bindings
+### WASM Build (Custom)
+
+Iroh does not publish WASM bindings to NPM. We need to create a custom Rust wrapper crate:
+
+```
+peervault-iroh/
+├── Cargo.toml           # Rust crate with wasm-bindgen
+├── src/
+│   └── lib.rs           # Wrapper exposing Iroh to JS
+├── pkg/                 # Generated by wasm-pack
+│   ├── peervault_iroh.js
+│   ├── peervault_iroh.d.ts
+│   └── peervault_iroh_bg.wasm
+└── build.sh             # wasm-pack build --target web
+```
+
+**Cargo.toml (key dependencies):**
+```toml
+[package]
+name = "peervault-iroh"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+iroh = { version = "0.33", default-features = false }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["console"] }
+getrandom = { version = "0.2", features = ["js"] }
+
+[profile.release]
+opt-level = "s"      # Optimize for size
+lto = true           # Link-time optimization
+```
+
+**Build command:**
+```bash
+wasm-pack build --target web --release
+```
+
+The generated `pkg/` folder is then included in the Obsidian plugin's build.
 
 ## Error Handling
 
-| Error | Recovery |
-|-------|----------|
-| WASM load failure | Surface error, suggest reload |
-| Relay unreachable | Try direct connection, retry relay |
-| Hole-punch fails | Fall back to relay |
-| Connection timeout | Retry with exponential backoff |
+| Error | Recovery | Context |
+|-------|----------|---------|
+| WASM load failure | Surface error, suggest reload | All platforms |
+| WASM instantiation OOM | Reduce concurrent operations, surface memory warning | Mobile especially |
+| Relay unreachable | Retry with backoff, try alternate relay | Browser (no fallback to direct) |
+| All relays unavailable | Surface offline status, queue changes | Browser |
+| Connection timeout | Retry with exponential backoff (max 60s) | All platforms |
+| Peer not responding | Mark peer offline, continue retry in background | All platforms |
+| WebSocket closed unexpectedly | Reconnect automatically | Browser |
+| Hole-punch fails | Fall back to relay (automatic) | Desktop native only |
 
 ## Open Questions
 
-1. **Custom relays**: Allow users to specify their own relay server?
-2. **Bandwidth monitoring**: Expose connection stats to UI?
-3. **Mobile battery**: Reduce connection keepalives on mobile?
+1. **Custom relays**: Allow users to specify their own relay server? (Iroh supports this via `RelayUrl`)
+2. **Bandwidth monitoring**: Expose connection stats to UI? (Iroh provides `Connection::stats()`)
+3. **Mobile battery**: Reduce connection keepalives on mobile? (Consider disconnecting when app backgrounded)
+4. **WASM bundle size**: The Iroh WASM binary may be 2-5MB. Should we lazy-load it after plugin init?
+5. **Relay trust**: Default Iroh relays are operated by n0. For privacy-sensitive users, should we document self-hosting?
+6. **Native desktop optimization**: Worth implementing hybrid mode (native Iroh for desktop, WASM for mobile) in v2?
+
+## Resolved Decisions
+
+| Question | Decision | Rationale |
+|----------|----------|-----------|
+| Direct connection vs relay-only | Relay-only for v1 | Browser/WASM cannot do hole-punching; simplifies implementation |
+| NPM package vs custom build | Custom wasm-bindgen wrapper | Iroh doesn't publish WASM to NPM |
+| Desktop hole-punching | Deferred to v2 | Adds complexity; relay works everywhere |
