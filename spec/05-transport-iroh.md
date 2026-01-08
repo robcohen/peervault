@@ -25,6 +25,14 @@ Define how Iroh is used for peer-to-peer connections, including initialization, 
 - **REQ-IR-12**: MAY monitor connection quality and upgrade transports
 - **REQ-IR-13**: MAY prioritize sync for currently-open files
 
+### v1.3 (Resilience)
+- **REQ-IR-14**: MUST handle mobile app lifecycle (background/suspend/resume)
+- **REQ-IR-15**: MUST support connection migration (WiFi ↔ cellular)
+- **REQ-IR-16**: MUST queue messages when offline, deliver when reconnected
+- **REQ-IR-17**: SHOULD chunk large messages (>128KB) for progress and resumability
+- **REQ-IR-18**: MUST negotiate protocol version on connection
+- **REQ-IR-19**: SHOULD support graceful degradation for older protocol versions
+
 ## Version Roadmap
 
 ```
@@ -45,6 +53,13 @@ v1.2 ─────────────────────────
   │ + Connection quality monitoring
   │ + Adaptive transport switching
   │ + Priority sync for open files
+  │
+v1.3 ──────────────────────────────────────────────────────────►
+  │ + Mobile app lifecycle handling
+  │ + Connection migration (WiFi ↔ cellular)
+  │ + Offline message queue
+  │ + Large message chunking
+  │ + Protocol versioning
 ```
 
 ## Iroh WASM Status (as of v0.33, January 2025)
@@ -1506,6 +1521,1189 @@ class Multiplexer {
 | Handshake time | Per document | Once |
 | NAT mappings | 100 | 1 |
 
+## WebRTC Signaling Protocol
+
+### Overview
+
+WebRTC requires exchanging SDP (Session Description Protocol) offers/answers to establish connections. We use the Iroh relay as our signaling channel.
+
+### Message Types
+
+```typescript
+type SignalingMessage =
+  | { type: 'sdp-offer'; sdp: string; iceUfrag: string }
+  | { type: 'sdp-answer'; sdp: string; iceUfrag: string }
+  | { type: 'ice-candidate'; candidate: string; sdpMid: string; sdpMLineIndex: number }
+  | { type: 'ice-complete' }
+  | { type: 'error'; code: string; message: string };
+
+interface SignalingChannel {
+  /** Send signaling message to peer */
+  send(peerId: string, message: SignalingMessage): Promise<void>;
+
+  /** Receive signaling messages */
+  onMessage(callback: (peerId: string, message: SignalingMessage) => void): void;
+}
+```
+
+### Signaling Flow
+
+```
+┌────────┐           ┌─────────┐           ┌────────┐
+│ Peer A │           │  Iroh   │           │ Peer B │
+│(Caller)│           │  Relay  │           │(Callee)│
+└───┬────┘           └────┬────┘           └───┬────┘
+    │                     │                    │
+    │ createOffer()       │                    │
+    │─────────┐           │                    │
+    │         │           │                    │
+    │◄────────┘           │                    │
+    │                     │                    │
+    │ setLocalDescription │                    │
+    │─────────┐           │                    │
+    │         │           │                    │
+    │◄────────┘           │                    │
+    │                     │                    │
+    │  sdp-offer          │                    │
+    │────────────────────►│                    │
+    │                     │                    │
+    │                     │  sdp-offer         │
+    │                     │───────────────────►│
+    │                     │                    │
+    │                     │    setRemoteDescription
+    │                     │                ┌───│
+    │                     │                │   │
+    │                     │                └──►│
+    │                     │                    │
+    │                     │    createAnswer()  │
+    │                     │                ┌───│
+    │                     │                │   │
+    │                     │                └──►│
+    │                     │                    │
+    │                     │  sdp-answer        │
+    │                     │◄───────────────────│
+    │                     │                    │
+    │  sdp-answer         │                    │
+    │◄────────────────────│                    │
+    │                     │                    │
+    │ setRemoteDescription│                    │
+    │─────────┐           │                    │
+    │         │           │                    │
+    │◄────────┘           │                    │
+    │                     │                    │
+    │  ice-candidate      │                    │
+    │────────────────────►│                    │
+    │                     │───────────────────►│
+    │                     │                    │
+    │                     │  ice-candidate     │
+    │◄────────────────────│◄───────────────────│
+    │                     │                    │
+    │  [ICE negotiation continues...]          │
+    │                     │                    │
+    │  ice-complete       │                    │
+    │────────────────────►│───────────────────►│
+    │                     │                    │
+    │◄═══════════════════════════════════════►│
+    │           WebRTC Data Channel            │
+    │                                          │
+```
+
+### Implementation
+
+```typescript
+class WebRTCSignaling implements SignalingChannel {
+  private irohStream: SyncStream;
+  private pendingCandidates = new Map<string, RTCIceCandidate[]>();
+
+  constructor(private iroh: IrohTransport) {}
+
+  async initiateConnection(peerId: string, ticket: string): Promise<RTCDataChannel> {
+    // Connect to peer via Iroh for signaling
+    const conn = await this.iroh.connectWithTicket(ticket);
+    this.irohStream = await conn.openStream();
+
+    // Create WebRTC peer connection
+    const pc = new RTCPeerConnection({
+      iceServers: STUN_SERVERS
+    });
+
+    // Create data channel
+    const dc = pc.createDataChannel('peervault-sync', {
+      ordered: true,
+      maxRetransmits: 3
+    });
+
+    // Handle ICE candidates
+    pc.onicecandidate = async (event) => {
+      if (event.candidate) {
+        await this.send(peerId, {
+          type: 'ice-candidate',
+          candidate: event.candidate.candidate,
+          sdpMid: event.candidate.sdpMid!,
+          sdpMLineIndex: event.candidate.sdpMLineIndex!
+        });
+      } else {
+        await this.send(peerId, { type: 'ice-complete' });
+      }
+    };
+
+    // Create and send offer
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    await this.send(peerId, {
+      type: 'sdp-offer',
+      sdp: offer.sdp!,
+      iceUfrag: this.extractIceUfrag(offer.sdp!)
+    });
+
+    // Wait for answer
+    const answer = await this.waitForAnswer(peerId);
+    await pc.setRemoteDescription(new RTCSessionDescription({
+      type: 'answer',
+      sdp: answer.sdp
+    }));
+
+    // Apply any buffered ICE candidates
+    for (const candidate of this.pendingCandidates.get(peerId) ?? []) {
+      await pc.addIceCandidate(candidate);
+    }
+
+    // Wait for connection
+    await this.waitForConnection(dc);
+
+    return dc;
+  }
+
+  async send(peerId: string, message: SignalingMessage): Promise<void> {
+    const encoded = new TextEncoder().encode(JSON.stringify(message));
+    await this.irohStream.send(encoded);
+  }
+}
+
+// STUN servers for ICE candidate gathering
+const STUN_SERVERS: RTCIceServer[] = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun.cloudflare.com:3478' }
+];
+```
+
+### Security Considerations
+
+- SDP contains IP addresses - acceptable since peers already have tickets
+- No TURN servers by default - Iroh relay serves as fallback
+- ICE candidates validated against expected peer
+
+## Mobile App Lifecycle
+
+### Overview
+
+Mobile platforms aggressively suspend background apps. We must handle this gracefully to avoid data loss and provide good UX.
+
+### Platform Behaviors
+
+| Platform | Background Time | Behavior | Network Access |
+|----------|-----------------|----------|----------------|
+| iOS | ~30 seconds | Suspended | ❌ Terminated |
+| Android | ~5 minutes | Doze mode | ⚠️ Limited |
+| Desktop | Unlimited | Normal | ✅ Full |
+
+### Lifecycle States
+
+```typescript
+type AppLifecycleState =
+  | 'active'        // App is in foreground
+  | 'background'    // App moved to background
+  | 'suspended'     // About to be suspended (iOS)
+  | 'resumed';      // Returned from background
+
+interface LifecycleManager {
+  /** Current app state */
+  readonly state: AppLifecycleState;
+
+  /** Subscribe to state changes */
+  onStateChange(callback: (state: AppLifecycleState) => void): void;
+
+  /** Request background execution time (iOS) */
+  requestBackgroundTime(): Promise<BackgroundTask>;
+}
+
+interface BackgroundTask {
+  /** Remaining time in milliseconds */
+  readonly remainingTime: number;
+
+  /** Mark task complete */
+  complete(): void;
+}
+```
+
+### Implementation
+
+```typescript
+class MobileLifecycleManager implements LifecycleManager {
+  private _state: AppLifecycleState = 'active';
+  private listeners = new Set<(state: AppLifecycleState) => void>();
+
+  constructor() {
+    this.setupListeners();
+  }
+
+  private setupListeners(): void {
+    // Obsidian mobile provides these events
+    if (Platform.isMobile) {
+      // iOS/Android visibility change
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') {
+          this.transition('background');
+        } else {
+          this.transition('resumed');
+          // After a short delay, consider fully active
+          setTimeout(() => this.transition('active'), 100);
+        }
+      });
+
+      // iOS-specific: about to suspend
+      window.addEventListener('freeze', () => {
+        this.transition('suspended');
+      });
+
+      // iOS-specific: resumed from suspend
+      window.addEventListener('resume', () => {
+        this.transition('resumed');
+      });
+    }
+  }
+
+  private transition(newState: AppLifecycleState): void {
+    if (this._state === newState) return;
+
+    console.log(`Lifecycle: ${this._state} → ${newState}`);
+    this._state = newState;
+
+    for (const listener of this.listeners) {
+      listener(newState);
+    }
+  }
+}
+```
+
+### Transport Behavior by State
+
+```typescript
+class LifecycleAwareTransport {
+  constructor(
+    private transport: TransportManager,
+    private lifecycle: LifecycleManager,
+    private syncQueue: OfflineQueue
+  ) {
+    this.lifecycle.onStateChange(this.handleStateChange.bind(this));
+  }
+
+  private async handleStateChange(state: AppLifecycleState): Promise<void> {
+    switch (state) {
+      case 'background':
+        // Reduce activity, prepare for suspension
+        await this.enterBackgroundMode();
+        break;
+
+      case 'suspended':
+        // Last chance to save state
+        await this.prepareForSuspension();
+        break;
+
+      case 'resumed':
+        // Reconnect and sync
+        await this.resumeFromBackground();
+        break;
+
+      case 'active':
+        // Full operation
+        await this.enterActiveMode();
+        break;
+    }
+  }
+
+  private async enterBackgroundMode(): Promise<void> {
+    // Stop non-essential operations
+    this.transport.pauseUpgrades();
+
+    // Reduce ping frequency (save battery)
+    this.transport.setPingInterval(30000); // 30s instead of 5s
+
+    // Flush any pending writes
+    await this.syncQueue.flush();
+  }
+
+  private async prepareForSuspension(): Promise<void> {
+    // iOS gives us ~30 seconds
+
+    // Save connection state for quick reconnect
+    await this.saveConnectionState();
+
+    // Close connections gracefully
+    await this.transport.closeAll();
+
+    // Ensure all local changes are persisted
+    await this.syncQueue.persistPending();
+  }
+
+  private async resumeFromBackground(): Promise<void> {
+    // Reconnect to peers
+    await this.transport.reconnectAll();
+
+    // Check for missed changes
+    await this.syncQueue.processPending();
+
+    // Trigger immediate sync
+    await this.triggerSync();
+  }
+
+  private async enterActiveMode(): Promise<void> {
+    // Restore normal operation
+    this.transport.resumeUpgrades();
+    this.transport.setPingInterval(5000);
+  }
+}
+```
+
+### Background Sync Strategy
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     App Lifecycle                            │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  ACTIVE                    BACKGROUND         SUSPENDED      │
+│  ══════                    ══════════         ═════════      │
+│                                                              │
+│  • Full sync               • Flush pending    • Save state   │
+│  • Ping every 5s           • Ping every 30s   • Close conns  │
+│  • Try upgrades            • No upgrades      • Persist queue│
+│  • Real-time               • Best-effort                     │
+│                                                              │
+│                                 │                            │
+│                                 │ iOS: ~30s                  │
+│                                 │ Android: ~5min             │
+│                                 ▼                            │
+│                            ┌─────────┐                       │
+│                            │ SUSPEND │                       │
+│                            └─────────┘                       │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Connection Migration
+
+### Overview
+
+Handle network changes (WiFi → cellular, IP address changes) without losing sync state.
+
+### Scenarios
+
+| Scenario | Detection | Action |
+|----------|-----------|--------|
+| WiFi → Cellular | Network type change | Reconnect, apply metered throttle |
+| Cellular → WiFi | Network type change | Reconnect, try upgrade to local |
+| IP address change | Connection failure | Reconnect with existing state |
+| Network loss | Connection timeout | Queue changes, wait for network |
+| Network restored | Online event | Reconnect, sync queued changes |
+
+### Network Change Detection
+
+```typescript
+interface NetworkState {
+  online: boolean;
+  type: 'wifi' | 'cellular' | 'ethernet' | 'unknown';
+  metered: boolean;
+  effectiveType: '4g' | '3g' | '2g' | 'slow-2g';
+}
+
+interface NetworkMonitor {
+  /** Current network state */
+  readonly state: NetworkState;
+
+  /** Subscribe to network changes */
+  onChange(callback: (state: NetworkState) => void): void;
+}
+
+class BrowserNetworkMonitor implements NetworkMonitor {
+  private _state: NetworkState;
+  private listeners = new Set<(state: NetworkState) => void>();
+
+  constructor() {
+    this._state = this.getCurrentState();
+    this.setupListeners();
+  }
+
+  private getCurrentState(): NetworkState {
+    const conn = (navigator as any).connection;
+
+    return {
+      online: navigator.onLine,
+      type: conn?.type ?? 'unknown',
+      metered: conn?.saveData || conn?.type === 'cellular',
+      effectiveType: conn?.effectiveType ?? '4g'
+    };
+  }
+
+  private setupListeners(): void {
+    // Online/offline events
+    window.addEventListener('online', () => this.update());
+    window.addEventListener('offline', () => this.update());
+
+    // Network Information API (where available)
+    const conn = (navigator as any).connection;
+    if (conn) {
+      conn.addEventListener('change', () => this.update());
+    }
+  }
+
+  private update(): void {
+    const newState = this.getCurrentState();
+
+    // Check for meaningful changes
+    if (
+      newState.online !== this._state.online ||
+      newState.type !== this._state.type ||
+      newState.metered !== this._state.metered
+    ) {
+      const oldState = this._state;
+      this._state = newState;
+
+      console.log('Network changed:', oldState, '→', newState);
+
+      for (const listener of this.listeners) {
+        listener(newState);
+      }
+    }
+  }
+}
+```
+
+### Connection Migration Handler
+
+```typescript
+class ConnectionMigrator {
+  private syncState = new Map<string, SyncState>();
+
+  constructor(
+    private transport: TransportManager,
+    private network: NetworkMonitor
+  ) {
+    this.network.onChange(this.handleNetworkChange.bind(this));
+  }
+
+  private async handleNetworkChange(state: NetworkState): Promise<void> {
+    if (!state.online) {
+      // Network lost - save state and wait
+      await this.saveAllSyncState();
+      return;
+    }
+
+    // Network available - reconnect
+    await this.reconnectAll(state);
+  }
+
+  private async saveAllSyncState(): Promise<void> {
+    for (const [peerId, conn] of this.transport.getAllConnections()) {
+      // Save Automerge sync state for each peer
+      this.syncState.set(peerId, await this.getSyncState(peerId));
+    }
+  }
+
+  private async reconnectAll(network: NetworkState): Promise<void> {
+    for (const [peerId, savedState] of this.syncState) {
+      try {
+        // Reconnect to peer
+        const conn = await this.transport.reconnect(peerId);
+
+        // Resume sync from saved state (skip already-synced data)
+        await this.resumeSync(peerId, savedState);
+
+        // If we switched to WiFi, try local discovery
+        if (network.type === 'wifi') {
+          this.transport.tryUpgrade(peerId);
+        }
+      } catch (err) {
+        console.error(`Failed to reconnect to ${peerId}:`, err);
+        // Will retry on next network change or manual trigger
+      }
+    }
+  }
+}
+```
+
+### Seamless Migration Flow
+
+```
+┌────────┐                              ┌────────┐
+│ Peer A │                              │ Peer B │
+│ (WiFi) │                              │        │
+└───┬────┘                              └───┬────┘
+    │                                       │
+    │◄══════════ Syncing (Local) ══════════►│
+    │           Connection #1               │
+    │                                       │
+    │ [WiFi disconnected]                   │
+    │                                       │
+    │ save sync state                       │
+    │─────────┐                             │
+    │         │                             │
+    │◄────────┘                             │
+    │                                       │
+    │ [Switch to Cellular]                  │
+    │                                       │
+    │ reconnect (new IP)                    │
+    │───────────────────────────────────────►
+    │                                       │
+    │◄══════════ Syncing (Relay) ══════════►│
+    │           Connection #2               │
+    │                                       │
+    │ resume from saved state               │
+    │ (no re-sync of old data)              │
+    │                                       │
+    │ [WiFi reconnected]                    │
+    │                                       │
+    │ try local discovery                   │
+    │─────────┐                             │
+    │         │                             │
+    │◄────────┘                             │
+    │                                       │
+    │ upgrade to local                      │
+    │───────────────────────────────────────►
+    │                                       │
+    │◄══════════ Syncing (Local) ══════════►│
+    │           Connection #3               │
+    │                                       │
+```
+
+## Large Message Chunking
+
+### Overview
+
+Automerge sync messages can be large, especially for initial sync. We chunk large messages to:
+- Avoid memory pressure on mobile
+- Allow progress indication
+- Enable resumable transfers
+
+### Configuration
+
+```typescript
+interface ChunkConfig {
+  /** Maximum chunk size in bytes */
+  maxChunkSize: number;
+
+  /** Threshold above which to chunk */
+  chunkThreshold: number;
+}
+
+const DEFAULT_CHUNK_CONFIG: ChunkConfig = {
+  maxChunkSize: 64 * 1024,      // 64 KB chunks
+  chunkThreshold: 128 * 1024,   // Chunk messages > 128 KB
+};
+```
+
+### Chunk Protocol
+
+```typescript
+// Chunk frame format
+interface ChunkFrame {
+  /** Unique message ID (for reassembly) */
+  messageId: string;
+
+  /** Chunk index (0-based) */
+  index: number;
+
+  /** Total number of chunks */
+  total: number;
+
+  /** Chunk data */
+  data: Uint8Array;
+}
+
+// Wire format: [16 bytes messageId][4 bytes index][4 bytes total][data]
+const CHUNK_HEADER_SIZE = 24;
+```
+
+### Implementation
+
+```typescript
+class ChunkedStream implements SyncStream {
+  private pendingMessages = new Map<string, Uint8Array[]>();
+
+  constructor(
+    private inner: SyncStream,
+    private config: ChunkConfig = DEFAULT_CHUNK_CONFIG
+  ) {}
+
+  async send(data: Uint8Array): Promise<void> {
+    if (data.length <= this.config.chunkThreshold) {
+      // Small message - send directly with "single" marker
+      const frame = new Uint8Array(1 + data.length);
+      frame[0] = 0x00; // Not chunked
+      frame.set(data, 1);
+      return this.inner.send(frame);
+    }
+
+    // Large message - chunk it
+    const messageId = crypto.randomUUID();
+    const chunks = this.splitIntoChunks(data);
+
+    for (let i = 0; i < chunks.length; i++) {
+      const frame = this.encodeChunk({
+        messageId,
+        index: i,
+        total: chunks.length,
+        data: chunks[i]
+      });
+
+      await this.inner.send(frame);
+
+      // Optional: emit progress
+      this.emitProgress(messageId, i + 1, chunks.length);
+    }
+  }
+
+  async receive(): Promise<Uint8Array> {
+    while (true) {
+      const frame = await this.inner.receive();
+
+      if (frame[0] === 0x00) {
+        // Not chunked - return directly
+        return frame.slice(1);
+      }
+
+      // Chunked message
+      const chunk = this.decodeChunk(frame);
+
+      // Get or create pending message buffer
+      let chunks = this.pendingMessages.get(chunk.messageId);
+      if (!chunks) {
+        chunks = new Array(chunk.total);
+        this.pendingMessages.set(chunk.messageId, chunks);
+      }
+
+      // Store chunk
+      chunks[chunk.index] = chunk.data;
+
+      // Check if complete
+      if (chunks.every(c => c !== undefined)) {
+        this.pendingMessages.delete(chunk.messageId);
+        return this.reassemble(chunks);
+      }
+
+      // Emit progress
+      const received = chunks.filter(c => c !== undefined).length;
+      this.emitProgress(chunk.messageId, received, chunk.total);
+    }
+  }
+
+  private splitIntoChunks(data: Uint8Array): Uint8Array[] {
+    const chunks: Uint8Array[] = [];
+    const chunkSize = this.config.maxChunkSize;
+
+    for (let offset = 0; offset < data.length; offset += chunkSize) {
+      const end = Math.min(offset + chunkSize, data.length);
+      chunks.push(data.slice(offset, end));
+    }
+
+    return chunks;
+  }
+
+  private reassemble(chunks: Uint8Array[]): Uint8Array {
+    const totalLength = chunks.reduce((sum, c) => sum + c.length, 0);
+    const result = new Uint8Array(totalLength);
+
+    let offset = 0;
+    for (const chunk of chunks) {
+      result.set(chunk, offset);
+      offset += chunk.length;
+    }
+
+    return result;
+  }
+
+  private encodeChunk(chunk: ChunkFrame): Uint8Array {
+    const frame = new Uint8Array(1 + CHUNK_HEADER_SIZE + chunk.data.length);
+
+    frame[0] = 0x01; // Chunked marker
+
+    // Message ID (16 bytes as UUID bytes)
+    const idBytes = this.uuidToBytes(chunk.messageId);
+    frame.set(idBytes, 1);
+
+    // Index and total (4 bytes each)
+    const view = new DataView(frame.buffer);
+    view.setUint32(17, chunk.index, false);
+    view.setUint32(21, chunk.total, false);
+
+    // Data
+    frame.set(chunk.data, 25);
+
+    return frame;
+  }
+}
+```
+
+### Progress Reporting
+
+```typescript
+interface TransferProgress {
+  messageId: string;
+  direction: 'send' | 'receive';
+  chunksComplete: number;
+  chunksTotal: number;
+  bytesComplete: number;
+  bytesTotal: number;
+}
+
+// Usage in UI
+syncStream.onProgress((progress) => {
+  const percent = (progress.chunksComplete / progress.chunksTotal) * 100;
+  updateProgressBar(percent);
+});
+```
+
+## Offline Message Queue
+
+### Overview
+
+When offline or peers are unavailable, queue changes locally and sync when reconnected.
+
+### Queue Structure
+
+```typescript
+interface QueuedMessage {
+  /** Unique message ID */
+  id: string;
+
+  /** Target peer ID */
+  peerId: string;
+
+  /** Document ID */
+  docId: string;
+
+  /** Sync message data */
+  data: Uint8Array;
+
+  /** Timestamp when queued */
+  queuedAt: number;
+
+  /** Number of send attempts */
+  attempts: number;
+
+  /** Last attempt timestamp */
+  lastAttempt?: number;
+}
+
+interface OfflineQueue {
+  /** Queue a message for later delivery */
+  enqueue(peerId: string, docId: string, data: Uint8Array): Promise<string>;
+
+  /** Get all pending messages for a peer */
+  getPending(peerId: string): Promise<QueuedMessage[]>;
+
+  /** Mark message as delivered */
+  markDelivered(id: string): Promise<void>;
+
+  /** Mark message as failed (will retry) */
+  markFailed(id: string): Promise<void>;
+
+  /** Remove expired messages */
+  pruneExpired(): Promise<number>;
+
+  /** Persist queue to storage (for app suspension) */
+  persistPending(): Promise<void>;
+}
+```
+
+### Implementation
+
+```typescript
+class PersistentOfflineQueue implements OfflineQueue {
+  private queue = new Map<string, QueuedMessage>();
+  private readonly MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+  private readonly MAX_ATTEMPTS = 10;
+
+  constructor(private storage: StorageAdapter) {}
+
+  async enqueue(
+    peerId: string,
+    docId: string,
+    data: Uint8Array
+  ): Promise<string> {
+    const id = crypto.randomUUID();
+
+    const message: QueuedMessage = {
+      id,
+      peerId,
+      docId,
+      data,
+      queuedAt: Date.now(),
+      attempts: 0
+    };
+
+    this.queue.set(id, message);
+
+    // Persist immediately for crash safety
+    await this.persistMessage(message);
+
+    return id;
+  }
+
+  async getPending(peerId: string): Promise<QueuedMessage[]> {
+    const messages: QueuedMessage[] = [];
+
+    for (const msg of this.queue.values()) {
+      if (msg.peerId === peerId && msg.attempts < this.MAX_ATTEMPTS) {
+        messages.push(msg);
+      }
+    }
+
+    // Sort by queue time (oldest first)
+    return messages.sort((a, b) => a.queuedAt - b.queuedAt);
+  }
+
+  async markDelivered(id: string): Promise<void> {
+    this.queue.delete(id);
+    await this.storage.delete(`queue:${id}`);
+  }
+
+  async markFailed(id: string): Promise<void> {
+    const msg = this.queue.get(id);
+    if (msg) {
+      msg.attempts++;
+      msg.lastAttempt = Date.now();
+      await this.persistMessage(msg);
+    }
+  }
+
+  async pruneExpired(): Promise<number> {
+    const now = Date.now();
+    let pruned = 0;
+
+    for (const [id, msg] of this.queue) {
+      const age = now - msg.queuedAt;
+      const tooOld = age > this.MAX_AGE_MS;
+      const tooManyAttempts = msg.attempts >= this.MAX_ATTEMPTS;
+
+      if (tooOld || tooManyAttempts) {
+        this.queue.delete(id);
+        await this.storage.delete(`queue:${id}`);
+        pruned++;
+      }
+    }
+
+    return pruned;
+  }
+
+  async persistPending(): Promise<void> {
+    // Batch persist all pending messages
+    const messages = Array.from(this.queue.values());
+    await this.storage.setBatch(
+      messages.map(msg => [`queue:${msg.id}`, this.serialize(msg)])
+    );
+  }
+
+  async loadFromStorage(): Promise<void> {
+    const keys = await this.storage.keys('queue:');
+    for (const key of keys) {
+      const data = await this.storage.get(key);
+      if (data) {
+        const msg = this.deserialize(data);
+        this.queue.set(msg.id, msg);
+      }
+    }
+  }
+}
+```
+
+### Queue Processing
+
+```typescript
+class QueueProcessor {
+  private processing = false;
+
+  constructor(
+    private queue: OfflineQueue,
+    private transport: TransportManager
+  ) {}
+
+  async processQueue(peerId: string): Promise<void> {
+    if (this.processing) return;
+    this.processing = true;
+
+    try {
+      const pending = await this.queue.getPending(peerId);
+
+      for (const msg of pending) {
+        const conn = this.transport.getConnection(peerId);
+        if (!conn) {
+          // Peer not connected, stop processing
+          break;
+        }
+
+        try {
+          const stream = await conn.getOrOpenStream(msg.docId);
+          await stream.send(msg.data);
+          await this.queue.markDelivered(msg.id);
+
+          console.log(`Delivered queued message ${msg.id}`);
+        } catch (err) {
+          console.error(`Failed to deliver ${msg.id}:`, err);
+          await this.queue.markFailed(msg.id);
+
+          // If connection lost, stop processing
+          if (!conn.isConnected()) break;
+        }
+      }
+    } finally {
+      this.processing = false;
+    }
+  }
+}
+```
+
+### Queue Status UI
+
+```typescript
+interface QueueStatus {
+  totalPending: number;
+  byPeer: Map<string, number>;
+  oldestMessage?: Date;
+  totalBytes: number;
+}
+
+// Show in UI
+function renderQueueStatus(status: QueueStatus): string {
+  if (status.totalPending === 0) {
+    return 'All changes synced';
+  }
+
+  return `${status.totalPending} changes pending sync`;
+}
+```
+
+## Protocol Versioning
+
+### Overview
+
+Support protocol evolution while maintaining backwards compatibility.
+
+### Version Format
+
+```typescript
+// Protocol version: major.minor
+// - Major: Breaking changes (incompatible)
+// - Minor: Backwards-compatible additions
+
+const PROTOCOL_VERSION = { major: 1, minor: 0 };
+
+interface ProtocolVersion {
+  major: number;
+  minor: number;
+}
+
+// Wire format for version negotiation
+interface VersionFrame {
+  type: 'version';
+  supported: ProtocolVersion[];  // Versions we support
+  preferred: ProtocolVersion;    // Version we prefer
+}
+```
+
+### Version Negotiation
+
+```
+┌────────┐                              ┌────────┐
+│ Peer A │                              │ Peer B │
+│ v1.1   │                              │ v1.0   │
+└───┬────┘                              └───┬────┘
+    │                                       │
+    │ VERSION                               │
+    │ supported: [1.0, 1.1]                 │
+    │ preferred: 1.1                        │
+    │──────────────────────────────────────►│
+    │                                       │
+    │                           VERSION     │
+    │                supported: [1.0]       │
+    │                preferred: 1.0         │
+    │◄──────────────────────────────────────│
+    │                                       │
+    │ [negotiate: use 1.0]                  │
+    │                                       │
+    │ VERSION_ACK                           │
+    │ selected: 1.0                         │
+    │──────────────────────────────────────►│
+    │                                       │
+    │◄════════ Communicate using v1.0 ═════►│
+    │                                       │
+```
+
+### Implementation
+
+```typescript
+class ProtocolNegotiator {
+  // Versions we support, newest first
+  private static SUPPORTED_VERSIONS: ProtocolVersion[] = [
+    { major: 1, minor: 1 },
+    { major: 1, minor: 0 }
+  ];
+
+  async negotiate(stream: SyncStream): Promise<ProtocolVersion> {
+    // Send our version info
+    await this.sendVersion(stream);
+
+    // Receive peer's version info
+    const peerVersions = await this.receiveVersion(stream);
+
+    // Find highest common version
+    const selected = this.selectVersion(peerVersions);
+
+    if (!selected) {
+      throw new ProtocolError(
+        'INCOMPATIBLE_VERSION',
+        `No compatible protocol version. ` +
+        `We support: ${this.formatVersions(ProtocolNegotiator.SUPPORTED_VERSIONS)}, ` +
+        `Peer supports: ${this.formatVersions(peerVersions)}`
+      );
+    }
+
+    // Send acknowledgment
+    await this.sendVersionAck(stream, selected);
+
+    console.log(`Negotiated protocol version: ${selected.major}.${selected.minor}`);
+    return selected;
+  }
+
+  private selectVersion(peerVersions: ProtocolVersion[]): ProtocolVersion | null {
+    // Find highest version both support
+    for (const ours of ProtocolNegotiator.SUPPORTED_VERSIONS) {
+      for (const theirs of peerVersions) {
+        if (ours.major === theirs.major) {
+          // Same major version - compatible
+          // Use lower minor version for safety
+          return {
+            major: ours.major,
+            minor: Math.min(ours.minor, theirs.minor)
+          };
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private async sendVersion(stream: SyncStream): Promise<void> {
+    const frame: VersionFrame = {
+      type: 'version',
+      supported: ProtocolNegotiator.SUPPORTED_VERSIONS,
+      preferred: ProtocolNegotiator.SUPPORTED_VERSIONS[0]
+    };
+
+    await stream.send(this.encodeFrame(frame));
+  }
+}
+```
+
+### Version-Specific Handlers
+
+```typescript
+class VersionedProtocol {
+  private handlers = new Map<string, ProtocolHandler>();
+
+  constructor() {
+    this.handlers.set('1.0', new ProtocolV1_0());
+    this.handlers.set('1.1', new ProtocolV1_1());
+  }
+
+  getHandler(version: ProtocolVersion): ProtocolHandler {
+    const key = `${version.major}.${version.minor}`;
+    const handler = this.handlers.get(key);
+
+    if (!handler) {
+      throw new Error(`No handler for protocol ${key}`);
+    }
+
+    return handler;
+  }
+}
+
+interface ProtocolHandler {
+  /** Encode a sync message */
+  encode(message: SyncMessage): Uint8Array;
+
+  /** Decode a sync message */
+  decode(data: Uint8Array): SyncMessage;
+
+  /** Features supported by this version */
+  readonly features: Set<string>;
+}
+
+// Version 1.0: Basic sync
+class ProtocolV1_0 implements ProtocolHandler {
+  readonly features = new Set(['sync', 'compression']);
+
+  encode(message: SyncMessage): Uint8Array {
+    // Basic encoding
+    return this.basicEncode(message);
+  }
+}
+
+// Version 1.1: Adds chunking
+class ProtocolV1_1 extends ProtocolV1_0 {
+  readonly features = new Set(['sync', 'compression', 'chunking', 'priority']);
+
+  encode(message: SyncMessage): Uint8Array {
+    // Enhanced encoding with chunking support
+    if (message.data.length > CHUNK_THRESHOLD) {
+      return this.chunkedEncode(message);
+    }
+    return super.encode(message);
+  }
+}
+```
+
+### Graceful Degradation
+
+```typescript
+class FeatureDetector {
+  constructor(private version: ProtocolVersion, private handler: ProtocolHandler) {}
+
+  hasFeature(feature: string): boolean {
+    return this.handler.features.has(feature);
+  }
+
+  async sendWithFallback(
+    stream: SyncStream,
+    data: Uint8Array,
+    options: SendOptions
+  ): Promise<void> {
+    // Try preferred method, fall back if unsupported
+
+    if (options.compress && this.hasFeature('compression')) {
+      data = await this.compress(data);
+    }
+
+    if (data.length > CHUNK_THRESHOLD && this.hasFeature('chunking')) {
+      await this.sendChunked(stream, data);
+    } else {
+      // Fall back to single message (may fail for large data on old protocol)
+      await stream.send(data);
+    }
+  }
+}
+```
+
+### Migration Path
+
+| Version | Features | Migration Notes |
+|---------|----------|-----------------|
+| 1.0 | Basic sync, compression | Initial release |
+| 1.1 | + Chunking, priority sync | Backwards compatible |
+| 2.0 | + New sync algorithm | Breaking - requires upgrade |
+
 ## Dependencies
 
 ### WASM Build (Custom)
@@ -1589,3 +2787,10 @@ The generated `pkg/` folder is then included in the Obsidian plugin's build.
 | Message size | Gzip compression for >1KB | 60-70% reduction for text sync messages |
 | Multiple documents | Stream multiplexing | Single connection handles all docs |
 | Connection health | RTT/packet loss monitoring | Enables adaptive transport switching |
+| WebRTC signaling | Use Iroh relay as signaling channel | No separate signaling server needed |
+| STUN servers | Google + Cloudflare public STUN | Free, reliable, global coverage |
+| Mobile background | Reduce activity, persist queue on suspend | Battery efficiency + data safety |
+| Network changes | Save sync state, reconnect, resume | Seamless migration without re-sync |
+| Large messages | 64KB chunks with progress reporting | Memory efficient, resumable, good UX |
+| Offline support | Persistent queue with 7-day retention | Changes never lost, eventual delivery |
+| Protocol evolution | Semantic versioning with negotiation | Backwards compatible upgrades |
