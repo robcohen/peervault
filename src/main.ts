@@ -7,7 +7,7 @@
 import { Plugin, Notice } from 'obsidian';
 import type { PeerVaultSettings, SyncStatus, PeerInfo } from './types';
 import { DEFAULT_SETTINGS } from './types';
-import { DocumentManager } from './core/document-manager';
+import { DocumentManager, waitForLoroWasm } from './core/document-manager';
 import { ObsidianStorageAdapter } from './core/storage-adapter';
 import { BlobStore } from './core/blob-store';
 import { VaultSync } from './core/vault-sync';
@@ -52,6 +52,12 @@ export default class PeerVaultPlugin extends Plugin {
     // Initialize logger
     this.logger = new Logger('PeerVault', () => this.settings?.debugMode ?? false);
     this.logger.info('Loading PeerVault plugin...');
+
+    // Wait for loro-crdt WASM to initialize (required for mobile compatibility)
+    // On mobile, WASM must be loaded asynchronously due to 4KB sync compilation limit
+    this.logger.debug('Waiting for WASM initialization...');
+    await waitForLoroWasm();
+    this.logger.debug('WASM initialized');
 
     // Load settings
     await this.loadSettings();

@@ -11,6 +11,19 @@ import type { Logger } from '../utils/logger';
 import { isBinaryFile } from './blob-store';
 import { computeTextEdits } from '../utils/text-diff';
 
+/**
+ * Wait for loro-crdt WASM to be initialized.
+ * This is required because on mobile, WASM must be loaded asynchronously.
+ * Call this before using any loro-crdt functions.
+ */
+export async function waitForLoroWasm(): Promise<void> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const loroModule = await import('loro-crdt') as any;
+  if (loroModule.__wasmReady) {
+    await loroModule.__wasmReady;
+  }
+}
+
 const SNAPSHOT_KEY = 'peervault-snapshot';
 
 // TreeID is a string in format `${counter}@${peer}` where peer is a number

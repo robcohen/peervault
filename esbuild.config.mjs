@@ -3,6 +3,9 @@ import fs from 'fs';
 import path from 'path';
 import { copyFileSync, mkdirSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
+import { createRequire } from 'module';
+
+const require = createRequire(import.meta.url);
 
 const isWatch = process.argv.includes('--watch');
 
@@ -47,11 +50,12 @@ function copyFilesToDist() {
   }
 }
 
-// Plugin to inline WASM as base64
-const inlineWasmPlugin = {
-  name: 'inline-wasm',
+// Plugin to patch loro-crdt WASM loading for mobile compatibility
+// Mobile browsers block sync WebAssembly.Module() for buffers > 4KB
+// We patch to use async WebAssembly.instantiate() instead
+const loroMobilePlugin = {
+  name: 'loro-mobile',
   setup(build) {
-    // Intercept the loro-crdt Node.js WASM loader and inline the WASM
     build.onLoad({ filter: /loro-crdt[\/\\]nodejs[\/\\]loro_wasm\.js$/ }, async (args) => {
       const wasmPath = path.join(path.dirname(args.path), 'loro_wasm_bg.wasm');
       const wasmBuffer = fs.readFileSync(wasmPath);
@@ -59,54 +63,49 @@ const inlineWasmPlugin = {
 
       let contents = fs.readFileSync(args.path, 'utf8');
 
-      // Replace the WASM loading code with inline base64
-      const wasmLoadPattern = /const path = require\('path'\)\.join\(__dirname, 'loro_wasm_bg\.wasm'\);\s*const bytes = require\('fs'\)\.readFileSync\(path\);\s*const wasmModule = new WebAssembly\.Module\(bytes\);/;
+      // Replace the sync WASM loading with async loading
+      // Original:
+      //   const path = require('path').join(__dirname, 'loro_wasm_bg.wasm');
+      //   const bytes = require('fs').readFileSync(path);
+      //   const wasmModule = new WebAssembly.Module(bytes);
+      //   const wasmInstance = new WebAssembly.Instance(wasmModule, imports);
+      //   wasm = wasmInstance.exports;
+      //   module.exports.__wasm = wasm;
+      //   wasm.__wbindgen_start();
+      const wasmLoadPattern = /const path = require\('path'\)\.join\(__dirname, 'loro_wasm_bg\.wasm'\);\s*const bytes = require\('fs'\)\.readFileSync\(path\);\s*const wasmModule = new WebAssembly\.Module\(bytes\);\s*const wasmInstance = new WebAssembly\.Instance\(wasmModule, imports\);\s*wasm = wasmInstance\.exports;\s*module\.exports\.__wasm = wasm;\s*wasm\.__wbindgen_start\(\);/;
 
-      const replacement = `const bytes = (function(){
-        var b64 = "${wasmBase64}";
-        if (typeof Buffer !== 'undefined') {
-          return Buffer.from(b64, 'base64');
-        } else {
-          var binary = atob(b64);
-          var bytes = new Uint8Array(binary.length);
-          for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-          return bytes;
-        }
-      })();
-      const wasmModule = new WebAssembly.Module(bytes);`;
+      // Use async WebAssembly.instantiate() which works on mobile
+      // The trick: we store a promise and make all exports async-aware
+      const replacement = `
+// WASM inlined as base64 for bundling
+const wasmBase64 = "${wasmBase64}";
+
+// Decode base64 to bytes
+function decodeBase64(b64) {
+  if (typeof Buffer !== 'undefined') {
+    return Buffer.from(b64, 'base64');
+  } else {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+}
+
+// Initialize WASM asynchronously (required for mobile - sync compilation blocked for >4KB)
+let wasmReady = (async () => {
+  const bytes = decodeBase64(wasmBase64);
+  const { instance } = await WebAssembly.instantiate(bytes, imports);
+  wasm = instance.exports;
+  module.exports.__wasm = wasm;
+  wasm.__wbindgen_start();
+})();
+
+// Export the ready promise so callers can await if needed
+module.exports.__wasmReady = wasmReady;
+`;
 
       contents = contents.replace(wasmLoadPattern, replacement);
-      return { contents, loader: 'js' };
-    });
-
-    // Intercept the Iroh WASM loader and inline the WASM
-    build.onLoad({ filter: /peervault-iroh[\/\\]pkg[\/\\]peervault_iroh\.js$/ }, async (args) => {
-      const wasmPath = path.join(path.dirname(args.path), 'peervault_iroh_bg.wasm');
-      const wasmBuffer = fs.readFileSync(wasmPath);
-      const wasmBase64 = wasmBuffer.toString('base64');
-
-      let contents = fs.readFileSync(args.path, 'utf8');
-
-      // The Iroh WASM uses import.meta.url to find the WASM file
-      // Replace the __wbg_init function to use inlined WASM
-      // Original: module_or_path = new URL('peervault_iroh_bg.wasm', import.meta.url);
-      const initPattern = /if \(module_or_path === undefined\) \{\s*module_or_path = new URL\('peervault_iroh_bg\.wasm', import\.meta\.url\);\s*\}/;
-
-      const initReplacement = `if (module_or_path === undefined) {
-        // Inlined WASM as base64
-        const b64 = "${wasmBase64}";
-        let bytes;
-        if (typeof Buffer !== 'undefined') {
-          bytes = Buffer.from(b64, 'base64');
-        } else {
-          const binary = atob(b64);
-          bytes = new Uint8Array(binary.length);
-          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-        }
-        module_or_path = bytes;
-      }`;
-
-      contents = contents.replace(initPattern, initReplacement);
       return { contents, loader: 'js' };
     });
   },
@@ -124,7 +123,7 @@ const config = {
   minify: !isWatch,
   treeShaking: true,
   logLevel: 'info',
-  plugins: [inlineWasmPlugin],
+  plugins: [loroMobilePlugin],
   define: {
     'process.env.NODE_ENV': isWatch ? '"development"' : '"production"',
   },
