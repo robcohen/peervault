@@ -42,7 +42,7 @@ enum ErrorCategory {
   /** File system operations */
   STORAGE = 'storage',
 
-  /** Automerge/CRDT operations */
+  /** Loro/CRDT operations */
   SYNC = 'sync',
 
   /** Iroh transport layer */
@@ -163,7 +163,7 @@ const StorageErrors = {
 | `SYNC_VAULT_MISMATCH` | Vault ID mismatch | ERROR | No | Check pairing |
 | `SYNC_DOC_TOO_LARGE` | Document exceeds size limit | WARNING | No | Exclude file |
 | `SYNC_INTERRUPTED` | Sync interrupted | WARNING | Yes | Resume |
-| `SYNC_MERGE_FAILED` | Automerge merge failed | ERROR | Partial | Manual review |
+| `SYNC_MERGE_FAILED` | Loro merge failed | ERROR | Partial | Manual review |
 
 ```typescript
 const SyncErrors = {
@@ -585,7 +585,515 @@ class Logger {
 └─────────────────┘
 ```
 
+## Debug/Diagnostic Mode
+
+A comprehensive diagnostic mode for troubleshooting sync issues.
+
+### Enabling Debug Mode
+
+```typescript
+interface DebugConfig {
+  /** Enable verbose logging */
+  verboseLogging: boolean;
+
+  /** Log sync operations */
+  logSyncOps: boolean;
+
+  /** Log network activity */
+  logNetwork: boolean;
+
+  /** Log CRDT operations */
+  logCrdt: boolean;
+
+  /** Store logs to file */
+  persistLogs: boolean;
+
+  /** Max log file size in MB */
+  maxLogSize: number;
+
+  /** Log retention in days */
+  logRetentionDays: number;
+}
+
+const DEFAULT_DEBUG_CONFIG: DebugConfig = {
+  verboseLogging: false,
+  logSyncOps: false,
+  logNetwork: false,
+  logCrdt: false,
+  persistLogs: false,
+  maxLogSize: 10,
+  logRetentionDays: 7,
+};
+```
+
+### Diagnostic Logger
+
+```typescript
+/**
+ * Enhanced logger for debug mode.
+ */
+class DiagnosticLogger {
+  private logs: LogEntry[] = [];
+  private fileHandle: FileHandle | null = null;
+  private config: DebugConfig;
+
+  constructor(config: DebugConfig) {
+    this.config = config;
+
+    if (config.persistLogs) {
+      this.initializeLogFile();
+    }
+  }
+
+  /**
+   * Log with category and optional data.
+   */
+  log(
+    level: 'debug' | 'info' | 'warn' | 'error',
+    category: 'sync' | 'network' | 'crdt' | 'storage' | 'ui',
+    message: string,
+    data?: Record<string, unknown>
+  ): void {
+    // Check if this category is enabled
+    if (!this.shouldLog(category)) return;
+
+    const entry: LogEntry = {
+      timestamp: new Date().toISOString(),
+      level,
+      category,
+      message,
+      data,
+    };
+
+    this.logs.push(entry);
+
+    // Trim in-memory logs
+    if (this.logs.length > 10000) {
+      this.logs = this.logs.slice(-5000);
+    }
+
+    // Console output
+    const prefix = `[PeerVault:${category}]`;
+    const logFn = console[level] || console.log;
+    logFn(prefix, message, data || '');
+
+    // Persist if enabled
+    if (this.config.persistLogs) {
+      this.appendToFile(entry);
+    }
+  }
+
+  private shouldLog(category: string): boolean {
+    if (this.config.verboseLogging) return true;
+
+    switch (category) {
+      case 'sync': return this.config.logSyncOps;
+      case 'network': return this.config.logNetwork;
+      case 'crdt': return this.config.logCrdt;
+      default: return true;
+    }
+  }
+
+  /**
+   * Export logs for support.
+   */
+  exportLogs(): string {
+    return JSON.stringify({
+      exportedAt: new Date().toISOString(),
+      pluginVersion: this.pluginVersion,
+      obsidianVersion: this.obsidianVersion,
+      platform: Platform.isMobile ? 'mobile' : 'desktop',
+      logs: this.logs,
+    }, null, 2);
+  }
+
+  /**
+   * Export anonymized logs (removes file paths, peer IDs).
+   */
+  exportAnonymizedLogs(): string {
+    const anonymized = this.logs.map(entry => ({
+      ...entry,
+      message: this.anonymize(entry.message),
+      data: entry.data ? this.anonymizeData(entry.data) : undefined,
+    }));
+
+    return JSON.stringify({
+      exportedAt: new Date().toISOString(),
+      pluginVersion: this.pluginVersion,
+      platform: Platform.isMobile ? 'mobile' : 'desktop',
+      logs: anonymized,
+    }, null, 2);
+  }
+
+  private anonymize(text: string): string {
+    // Replace file paths
+    text = text.replace(/\/[^\s]+\.(md|canvas)/g, '/[path]/[file].$1');
+
+    // Replace peer IDs
+    text = text.replace(/[a-f0-9]{32,}/gi, '[peer-id]');
+
+    // Replace vault names
+    text = text.replace(/vault:\s*\w+/gi, 'vault: [name]');
+
+    return text;
+  }
+
+  private anonymizeData(data: Record<string, unknown>): Record<string, unknown> {
+    const result: Record<string, unknown> = {};
+
+    for (const [key, value] of Object.entries(data)) {
+      if (key.includes('path') || key.includes('Path')) {
+        result[key] = '[redacted]';
+      } else if (key.includes('id') || key.includes('Id')) {
+        result[key] = '[redacted]';
+      } else if (typeof value === 'string') {
+        result[key] = this.anonymize(value);
+      } else {
+        result[key] = value;
+      }
+    }
+
+    return result;
+  }
+}
+```
+
+### Debug Panel UI
+
+```typescript
+/**
+ * Debug panel accessible via command palette.
+ */
+class DebugPanelModal extends Modal {
+  private logger: DiagnosticLogger;
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.addClass('peervault-debug-panel');
+
+    contentEl.createEl('h2', { text: 'PeerVault Diagnostics' });
+
+    // Tabs
+    const tabs = contentEl.createDiv({ cls: 'debug-tabs' });
+    const logsTab = tabs.createEl('button', { text: 'Logs', cls: 'active' });
+    const statusTab = tabs.createEl('button', { text: 'Status' });
+    const actionsTab = tabs.createEl('button', { text: 'Actions' });
+
+    const content = contentEl.createDiv({ cls: 'debug-content' });
+
+    logsTab.onclick = () => this.showLogs(content);
+    statusTab.onclick = () => this.showStatus(content);
+    actionsTab.onclick = () => this.showActions(content);
+
+    this.showLogs(content);
+  }
+
+  private showLogs(container: HTMLElement): void {
+    container.empty();
+
+    // Filter controls
+    const filters = container.createDiv({ cls: 'log-filters' });
+
+    const levelSelect = filters.createEl('select');
+    ['all', 'debug', 'info', 'warn', 'error'].forEach(level => {
+      levelSelect.createEl('option', { value: level, text: level });
+    });
+
+    const categorySelect = filters.createEl('select');
+    ['all', 'sync', 'network', 'crdt', 'storage', 'ui'].forEach(cat => {
+      categorySelect.createEl('option', { value: cat, text: cat });
+    });
+
+    const searchInput = filters.createEl('input', {
+      type: 'text',
+      placeholder: 'Search logs...',
+    });
+
+    // Log list
+    const logList = container.createDiv({ cls: 'log-list' });
+    this.renderLogs(logList, 'all', 'all', '');
+
+    // Update on filter change
+    const updateLogs = () => {
+      this.renderLogs(
+        logList,
+        levelSelect.value,
+        categorySelect.value,
+        searchInput.value
+      );
+    };
+
+    levelSelect.onchange = updateLogs;
+    categorySelect.onchange = updateLogs;
+    searchInput.oninput = updateLogs;
+  }
+
+  private renderLogs(
+    container: HTMLElement,
+    level: string,
+    category: string,
+    search: string
+  ): void {
+    container.empty();
+
+    const logs = this.logger.getLogs()
+      .filter(log => level === 'all' || log.level === level)
+      .filter(log => category === 'all' || log.category === category)
+      .filter(log => !search || log.message.toLowerCase().includes(search.toLowerCase()))
+      .slice(-200); // Show last 200
+
+    for (const log of logs) {
+      const entry = container.createDiv({ cls: `log-entry log-${log.level}` });
+      entry.createSpan({ text: log.timestamp.slice(11, 23), cls: 'log-time' });
+      entry.createSpan({ text: log.level, cls: 'log-level' });
+      entry.createSpan({ text: log.category, cls: 'log-category' });
+      entry.createSpan({ text: log.message, cls: 'log-message' });
+
+      if (log.data) {
+        const dataEl = entry.createEl('pre', { cls: 'log-data' });
+        dataEl.setText(JSON.stringify(log.data, null, 2));
+      }
+    }
+  }
+
+  private showStatus(container: HTMLElement): void {
+    container.empty();
+
+    const stats = this.plugin.getStats();
+
+    const table = container.createEl('table', { cls: 'status-table' });
+
+    const rows = [
+      ['Plugin Version', this.plugin.manifest.version],
+      ['Obsidian Version', this.app.vault.version],
+      ['Platform', Platform.isMobile ? 'Mobile' : 'Desktop'],
+      ['Connected Peers', stats.connectedPeers.toString()],
+      ['Total Peers', stats.totalPeers.toString()],
+      ['Synced Files', stats.syncedFiles.toString()],
+      ['Pending Changes', stats.pendingChanges.toString()],
+      ['Document Size', formatBytes(stats.docSize)],
+      ['Last Sync', stats.lastSync ? new Date(stats.lastSync).toLocaleString() : 'Never'],
+      ['Iroh Status', stats.transportStatus],
+      ['WASM Memory', formatBytes(stats.wasmMemory)],
+    ];
+
+    for (const [label, value] of rows) {
+      const row = table.createEl('tr');
+      row.createEl('td', { text: label });
+      row.createEl('td', { text: value });
+    }
+  }
+
+  private showActions(container: HTMLElement): void {
+    container.empty();
+
+    container.createEl('h3', { text: 'Diagnostic Actions' });
+
+    // Export logs
+    new Setting(container)
+      .setName('Export logs')
+      .setDesc('Download logs as JSON file')
+      .addButton(btn => {
+        btn.setButtonText('Export');
+        btn.onClick(() => this.exportLogs(false));
+      })
+      .addButton(btn => {
+        btn.setButtonText('Export (Anonymized)');
+        btn.onClick(() => this.exportLogs(true));
+      });
+
+    // Force sync
+    new Setting(container)
+      .setName('Force full sync')
+      .setDesc('Request full sync with all peers')
+      .addButton(btn => {
+        btn.setButtonText('Force Sync');
+        btn.setWarning();
+        btn.onClick(() => this.plugin.forceSyncAll());
+      });
+
+    // Rebuild index
+    new Setting(container)
+      .setName('Rebuild document')
+      .setDesc('Rebuild CRDT document from vault files (last resort)')
+      .addButton(btn => {
+        btn.setButtonText('Rebuild');
+        btn.setWarning();
+        btn.onClick(() => this.confirmRebuild());
+      });
+
+    // Clear logs
+    new Setting(container)
+      .setName('Clear logs')
+      .setDesc('Clear in-memory and persisted logs')
+      .addButton(btn => {
+        btn.setButtonText('Clear');
+        btn.onClick(() => {
+          this.logger.clear();
+          new Notice('Logs cleared');
+        });
+      });
+
+    // Copy support info
+    new Setting(container)
+      .setName('Copy support info')
+      .setDesc('Copy system info to clipboard for bug reports')
+      .addButton(btn => {
+        btn.setButtonText('Copy');
+        btn.onClick(() => this.copySupportInfo());
+      });
+  }
+
+  private async exportLogs(anonymized: boolean): Promise<void> {
+    const content = anonymized
+      ? this.logger.exportAnonymizedLogs()
+      : this.logger.exportLogs();
+
+    const filename = `peervault-logs-${Date.now()}.json`;
+    const blob = new Blob([content], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+
+    URL.revokeObjectURL(url);
+    new Notice(`Logs exported to ${filename}`);
+  }
+
+  private copySupportInfo(): void {
+    const stats = this.plugin.getStats();
+    const info = `
+PeerVault Support Info
+======================
+Plugin Version: ${this.plugin.manifest.version}
+Obsidian Version: ${this.app.vault.version}
+Platform: ${Platform.isMobile ? 'Mobile' : 'Desktop'}
+OS: ${Platform.isIosApp ? 'iOS' : Platform.isAndroidApp ? 'Android' : navigator.platform}
+Connected Peers: ${stats.connectedPeers}
+Document Size: ${formatBytes(stats.docSize)}
+Last Sync: ${stats.lastSync ? new Date(stats.lastSync).toISOString() : 'Never'}
+WASM Memory: ${formatBytes(stats.wasmMemory)}
+    `.trim();
+
+    navigator.clipboard.writeText(info);
+    new Notice('Support info copied to clipboard');
+  }
+}
+```
+
+### Debug Commands
+
+```typescript
+// Register debug commands
+this.addCommand({
+  id: 'open-debug-panel',
+  name: 'Open debug panel',
+  callback: () => new DebugPanelModal(this.app, this).open(),
+});
+
+this.addCommand({
+  id: 'toggle-verbose-logging',
+  name: 'Toggle verbose logging',
+  callback: () => {
+    this.settings.debug.verboseLogging = !this.settings.debug.verboseLogging;
+    new Notice(`Verbose logging ${this.settings.debug.verboseLogging ? 'enabled' : 'disabled'}`);
+  },
+});
+
+this.addCommand({
+  id: 'export-debug-logs',
+  name: 'Export debug logs',
+  callback: () => this.exportDebugLogs(),
+});
+```
+
+### Debug CSS
+
+```css
+.peervault-debug-panel {
+  min-width: 600px;
+}
+
+.debug-tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  padding-bottom: 8px;
+}
+
+.debug-tabs button {
+  padding: 8px 16px;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+.debug-tabs button.active {
+  border-bottom: 2px solid var(--interactive-accent);
+}
+
+.log-filters {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.log-list {
+  max-height: 400px;
+  overflow-y: auto;
+  font-family: monospace;
+  font-size: 12px;
+}
+
+.log-entry {
+  padding: 4px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.log-debug { opacity: 0.7; }
+.log-warn { background: var(--background-modifier-warning); }
+.log-error { background: var(--background-modifier-error); }
+
+.log-time { color: var(--text-muted); margin-right: 8px; }
+.log-level { font-weight: bold; margin-right: 8px; text-transform: uppercase; }
+.log-category { color: var(--text-accent); margin-right: 8px; }
+
+.log-data {
+  margin: 4px 0 0 20px;
+  padding: 4px;
+  background: var(--background-secondary);
+  font-size: 11px;
+  max-height: 100px;
+  overflow: auto;
+}
+
+.status-table {
+  width: 100%;
+}
+
+.status-table td {
+  padding: 8px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.status-table td:first-child {
+  font-weight: 500;
+  width: 40%;
+}
+```
+
 ## Dependencies
+
+```json
+{
+  "dependencies": {
+    "loro-crdt": "^1.0.0"
+  }
+}
+```
 
 - Obsidian Notice API for user notifications
 - Console API for development logging

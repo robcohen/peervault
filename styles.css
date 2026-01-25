@@ -1,0 +1,1072 @@
+/**
+ * PeerVault Styles
+ *
+ * Custom styles for PeerVault UI components.
+ */
+
+/* ===========================================================================
+   Status Bar
+   =========================================================================== */
+
+.peervault-status-icon {
+  font-size: 10px;
+  margin-right: 4px;
+}
+
+/* ===========================================================================
+   Status Modal
+   =========================================================================== */
+
+.peervault-status-modal {
+  padding: 0;
+}
+
+.peervault-status-section,
+.peervault-peers-section,
+.peervault-actions-section {
+  margin-bottom: 24px;
+}
+
+.peervault-status-section h3,
+.peervault-peers-section h3 {
+  margin-bottom: 12px;
+  color: var(--text-normal);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.peervault-status-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: var(--background-secondary);
+  padding: 12px;
+  border-radius: 8px;
+}
+
+.peervault-status-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.peervault-label {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.peervault-value {
+  font-family: var(--font-monospace);
+  font-size: 13px;
+  color: var(--text-normal);
+}
+
+.peervault-status-idle {
+  color: var(--color-green);
+}
+
+.peervault-status-syncing {
+  color: var(--color-blue);
+}
+
+.peervault-status-offline {
+  color: var(--text-muted);
+}
+
+.peervault-status-error {
+  color: var(--color-red);
+}
+
+/* ===========================================================================
+   Peer List
+   =========================================================================== */
+
+.peervault-no-peers {
+  color: var(--text-muted);
+  font-style: italic;
+  padding: 16px;
+  text-align: center;
+  background: var(--background-secondary);
+  border-radius: 8px;
+}
+
+.peervault-peer-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.peervault-peer-item {
+  display: flex;
+  flex-direction: column;
+  padding: 12px;
+  background: var(--background-secondary);
+  border-radius: 8px;
+  margin-bottom: 8px;
+}
+
+.peervault-peer-item:last-child {
+  margin-bottom: 0;
+}
+
+.peervault-peer-info {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.peervault-peer-name {
+  font-weight: 500;
+  color: var(--text-normal);
+}
+
+.peervault-peer-status {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 12px;
+  text-transform: capitalize;
+}
+
+.peervault-peer-synced,
+.peervault-peer-connected {
+  background: var(--background-modifier-success);
+  color: var(--text-on-accent);
+}
+
+.peervault-peer-syncing,
+.peervault-peer-connecting {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+
+.peervault-peer-offline,
+.peervault-peer-unknown {
+  background: var(--background-modifier-border);
+  color: var(--text-muted);
+}
+
+.peervault-peer-error {
+  background: var(--background-modifier-error);
+  color: var(--text-on-accent);
+}
+
+.peervault-peer-lastseen {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+
+/* ===========================================================================
+   Add Device Modal
+   =========================================================================== */
+
+.peervault-add-device-modal,
+.peervault-invite-modal {
+  padding: 0;
+}
+
+.peervault-help-text {
+  color: var(--text-muted);
+  font-size: 14px;
+  margin-bottom: 16px;
+}
+
+.peervault-add-device-modal textarea,
+.peervault-invite-modal textarea {
+  width: 100%;
+  min-height: 80px;
+  resize: vertical;
+}
+
+/* ===========================================================================
+   Invite Modal
+   =========================================================================== */
+
+.peervault-loading {
+  padding: 24px;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.peervault-qr-container {
+  display: flex;
+  justify-content: center;
+  padding: 24px;
+  background: var(--background-primary);
+  border-radius: 12px;
+  margin-bottom: 16px;
+}
+
+.peervault-qr-canvas {
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+.peervault-qr-error {
+  color: var(--text-muted);
+  font-style: italic;
+  text-align: center;
+}
+
+.peervault-ticket-header {
+  margin: 16px 0 8px 0;
+  font-size: 13px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.peervault-ticket-container {
+  margin: 16px 0;
+}
+
+.peervault-ticket {
+  width: 100%;
+  min-height: 80px;
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  padding: 12px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  resize: none;
+  word-break: break-all;
+}
+
+/* ===========================================================================
+   Settings Tab
+   =========================================================================== */
+
+.peervault-danger-header {
+  color: var(--color-red) !important;
+  border-top: 1px solid var(--background-modifier-border);
+  padding-top: 24px;
+  margin-top: 24px;
+}
+
+/* ===========================================================================
+   Pairing Modal
+   =========================================================================== */
+
+.peervault-pairing-modal {
+  padding: 0;
+}
+
+.peervault-pairing-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 20px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  padding-bottom: 12px;
+}
+
+.peervault-tab-btn {
+  padding: 8px 16px;
+  border-radius: 6px;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 14px;
+  transition: all 0.15s ease;
+}
+
+.peervault-tab-btn:hover {
+  background: var(--background-secondary);
+  color: var(--text-normal);
+}
+
+.peervault-tab-btn.active {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+
+.peervault-pairing-content {
+  min-height: 300px;
+}
+
+/* Drop Zone for QR Scanning */
+.peervault-drop-zone {
+  border: 2px dashed var(--background-modifier-border);
+  border-radius: 12px;
+  padding: 32px;
+  text-align: center;
+  margin-bottom: 16px;
+  transition: all 0.2s ease;
+}
+
+.peervault-drop-zone.dragover {
+  border-color: var(--interactive-accent);
+  background: var(--background-secondary);
+}
+
+.peervault-drop-text {
+  font-size: 15px;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+
+.peervault-drop-separator {
+  font-size: 13px;
+  color: var(--text-faint);
+  margin: 12px 0;
+}
+
+.peervault-file-input {
+  display: none;
+}
+
+.peervault-browse-btn {
+  padding: 8px 20px;
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.peervault-browse-btn:hover {
+  filter: brightness(1.1);
+}
+
+.peervault-scan-separator {
+  text-align: center;
+  color: var(--text-faint);
+  font-size: 13px;
+  margin: 16px 0;
+}
+
+.peervault-paste-container {
+  text-align: center;
+  margin-bottom: 24px;
+}
+
+.peervault-paste-btn {
+  padding: 10px 24px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+  color: var(--text-normal);
+}
+
+.peervault-paste-btn:hover {
+  background: var(--background-modifier-hover);
+}
+
+.peervault-name-section {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--background-modifier-border);
+}
+
+.peervault-ticket-section {
+  margin: 16px 0;
+}
+
+/* ===========================================================================
+   Merge Notification Modal
+   =========================================================================== */
+
+.peervault-merge-modal,
+.peervault-merge-history-modal {
+  padding: 0;
+}
+
+.merge-peer-info {
+  margin-bottom: 16px;
+}
+
+.merge-timestamp {
+  color: var(--text-muted);
+  font-size: 13px;
+  margin-top: 4px;
+}
+
+.merge-summary {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 20px;
+  flex-wrap: wrap;
+}
+
+.merge-stat {
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.merge-stat.created {
+  background: var(--background-modifier-success);
+  color: var(--text-on-accent);
+}
+
+.merge-stat.updated {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+
+.merge-stat.deleted {
+  background: var(--background-modifier-error);
+  color: var(--text-on-accent);
+}
+
+.merge-file-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.merge-file-list li {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.merge-file-list li:last-child {
+  border-bottom: none;
+}
+
+.merge-file-link {
+  color: var(--text-accent);
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.merge-file-link:hover {
+  text-decoration: underline;
+}
+
+.merge-more-files {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.merge-actions {
+  margin-top: 20px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.merge-empty {
+  color: var(--text-muted);
+  text-align: center;
+  padding: 20px;
+}
+
+.merge-history-list {
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.merge-history-item {
+  padding: 12px;
+  background: var(--background-secondary);
+  border-radius: 8px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.merge-history-item:hover {
+  background: var(--background-modifier-hover);
+}
+
+.merge-history-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+.merge-history-time {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.merge-history-stats {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+/* ===========================================================================
+   Connection Status Bar
+   =========================================================================== */
+
+.peervault-status-bar {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 6px;
+}
+
+.peervault-status-bar .peervault-status-icon {
+  font-weight: bold;
+}
+
+.peervault-status-connected {
+  color: var(--color-green);
+}
+
+.peervault-status-error {
+  color: var(--color-red);
+}
+
+.peervault-status-offline {
+  color: var(--text-muted);
+}
+
+.peervault-status-idle {
+  color: var(--text-muted);
+}
+
+.peervault-peer-count {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.peervault-status-bar .peervault-progress-bar {
+  width: 30px;
+  height: 4px;
+  background: var(--background-modifier-border);
+  border-radius: 2px;
+  overflow: hidden;
+  margin-left: 4px;
+}
+
+.peervault-progress-fill {
+  height: 100%;
+  background: var(--interactive-accent);
+  transition: width 0.3s ease;
+}
+
+/* ===========================================================================
+   Connection Status Modal
+   =========================================================================== */
+
+.peervault-connection-status-modal {
+  padding: 0;
+}
+
+.peervault-status-overview {
+  background: var(--background-secondary);
+  padding: 16px;
+  border-radius: 8px;
+  margin-bottom: 20px;
+}
+
+.peervault-overview-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 0;
+}
+
+.peervault-badge {
+  padding: 4px 12px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.peervault-badge-idle {
+  background: var(--background-modifier-success);
+  color: var(--text-on-accent);
+}
+
+.peervault-badge-syncing {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+
+.peervault-badge-offline {
+  background: var(--background-modifier-border);
+  color: var(--text-muted);
+}
+
+.peervault-badge-error {
+  background: var(--background-modifier-error);
+  color: var(--text-on-accent);
+}
+
+.peervault-progress-bar-large {
+  height: 8px;
+  background: var(--background-modifier-border);
+  border-radius: 4px;
+  overflow: hidden;
+  margin-top: 8px;
+  position: relative;
+}
+
+.peervault-progress-text {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 10px;
+  color: var(--text-on-accent);
+}
+
+.peervault-peer-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--background-secondary);
+  border-radius: 6px;
+  margin-bottom: 6px;
+}
+
+.peervault-peer-indicator {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.peervault-peer-indicator.peervault-peer-connected,
+.peervault-peer-indicator.peervault-peer-syncing {
+  background: var(--color-green);
+}
+
+.peervault-peer-indicator.peervault-peer-disconnected,
+.peervault-peer-indicator.peervault-peer-offline {
+  background: var(--text-muted);
+}
+
+.peervault-peer-indicator.peervault-peer-error {
+  background: var(--color-red);
+}
+
+.peervault-peer-row .peervault-peer-name {
+  flex: 1;
+}
+
+.peervault-peer-row .peervault-peer-state {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  text-transform: capitalize;
+}
+
+.peervault-retry-btn {
+  padding: 4px 12px;
+  font-size: 12px;
+}
+
+.peervault-errors-section {
+  margin-top: 16px;
+}
+
+.peervault-error-list {
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.peervault-error-item {
+  padding: 8px 12px;
+  background: var(--background-modifier-error-hover);
+  border-radius: 6px;
+  margin-bottom: 6px;
+  border-left: 3px solid var(--color-red);
+}
+
+.peervault-error-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+}
+
+.peervault-error-message {
+  font-weight: 500;
+  color: var(--text-normal);
+}
+
+.peervault-error-time {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.peervault-error-code {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+
+/* ===========================================================================
+   File History Modal
+   =========================================================================== */
+
+.peervault-file-history-modal {
+  padding: 0;
+}
+
+.peervault-file-selector {
+  margin-bottom: 16px;
+}
+
+.peervault-version-list {
+  max-height: 500px;
+  overflow-y: auto;
+}
+
+.peervault-version-section {
+  margin-bottom: 20px;
+}
+
+.peervault-version-section h3 {
+  font-size: 14px;
+  color: var(--text-muted);
+  margin-bottom: 12px;
+}
+
+.peervault-version-item {
+  padding: 12px;
+  background: var(--background-secondary);
+  border-radius: 8px;
+  margin-bottom: 8px;
+}
+
+.peervault-version-item.current {
+  border: 1px solid var(--interactive-accent);
+}
+
+.peervault-version-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.peervault-version-time {
+  font-weight: 500;
+}
+
+.peervault-version-badge {
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  text-transform: capitalize;
+}
+
+.peervault-badge-created {
+  background: var(--background-modifier-success);
+  color: var(--text-on-accent);
+}
+
+.peervault-badge-modified {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+}
+
+.peervault-badge-deleted {
+  background: var(--background-modifier-error);
+  color: var(--text-on-accent);
+}
+
+.peervault-version-source {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+.peervault-version-preview {
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 8px;
+  background: var(--background-primary);
+  border-radius: 4px;
+  margin: 8px 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.peervault-version-size {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.peervault-version-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.peervault-version-actions button {
+  padding: 4px 12px;
+  font-size: 12px;
+}
+
+.peervault-more-versions {
+  text-align: center;
+  color: var(--text-muted);
+  font-style: italic;
+  padding: 8px;
+}
+
+.peervault-version-view-modal .peervault-version-info {
+  margin-bottom: 16px;
+}
+
+.peervault-version-content {
+  width: 100%;
+  height: 400px;
+  font-family: var(--font-monospace);
+  font-size: 13px;
+  padding: 12px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  resize: vertical;
+}
+
+/* ===========================================================================
+   Selective Sync Modal
+   =========================================================================== */
+
+.peervault-selective-sync-modal {
+  padding: 0;
+}
+
+.peervault-quick-actions {
+  margin-bottom: 16px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.peervault-folder-tree-section h3 {
+  margin-bottom: 12px;
+}
+
+.peervault-folder-tree {
+  max-height: 350px;
+  overflow-y: auto;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  padding: 8px;
+  background: var(--background-secondary);
+}
+
+.peervault-folder-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  cursor: default;
+}
+
+.peervault-folder-item:hover {
+  background: var(--background-modifier-hover);
+}
+
+.peervault-folder-item.excluded {
+  opacity: 0.6;
+}
+
+.peervault-folder-item.parent-excluded {
+  opacity: 0.4;
+}
+
+.peervault-folder-expand {
+  width: 16px;
+  text-align: center;
+  cursor: pointer;
+  color: var(--text-muted);
+  font-family: var(--font-monospace);
+}
+
+.peervault-folder-expand:hover {
+  color: var(--text-normal);
+}
+
+.peervault-folder-expand-placeholder {
+  width: 16px;
+}
+
+.peervault-folder-checkbox {
+  cursor: pointer;
+}
+
+.peervault-folder-name {
+  flex: 1;
+  font-size: 14px;
+}
+
+.peervault-folder-status {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.peervault-folder-status.excluded {
+  color: var(--color-red);
+}
+
+.peervault-folder-count {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.peervault-sync-summary {
+  margin: 16px 0;
+  padding: 12px;
+  background: var(--background-secondary);
+  border-radius: 8px;
+}
+
+.peervault-summary-text {
+  margin-bottom: 8px;
+  font-size: 14px;
+}
+
+.peervault-sync-bar {
+  height: 8px;
+  background: var(--background-modifier-border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.peervault-sync-fill.synced {
+  background: var(--color-green);
+}
+
+.peervault-empty-state {
+  text-align: center;
+  color: var(--text-muted);
+  padding: 20px;
+  font-style: italic;
+}
+
+/* ===========================================================================
+   Encryption Modal
+   =========================================================================== */
+
+.peervault-encryption-modal {
+  padding: 0;
+}
+
+.peervault-warning {
+  padding: 12px;
+  background: var(--background-modifier-error-hover);
+  border-left: 3px solid var(--color-orange);
+  border-radius: 4px;
+  margin: 16px 0;
+}
+
+.peervault-encryption-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px;
+  background: var(--background-secondary);
+  border-radius: 8px;
+  margin-bottom: 16px;
+}
+
+.peervault-status-unlocked {
+  color: var(--color-green);
+  font-weight: 500;
+}
+
+.peervault-status-locked {
+  color: var(--color-orange);
+  font-weight: 500;
+}
+
+.peervault-recovery-phrase {
+  width: 100%;
+  min-height: 80px;
+  font-family: var(--font-monospace);
+  font-size: 14px;
+  padding: 12px;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  word-break: break-all;
+  margin: 12px 0;
+}
+
+/* ===========================================================================
+   Conflict Indicators
+   =========================================================================== */
+
+.peervault-conflict-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  background: var(--color-orange);
+  color: white;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.peervault-conflict-badge {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 8px;
+  height: 8px;
+  background: var(--color-orange);
+  border-radius: 50%;
+}
+
+.peervault-conflict-list {
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.peervault-conflict-item {
+  padding: 12px;
+  background: var(--background-secondary);
+  border-radius: 8px;
+  margin-bottom: 8px;
+  border-left: 3px solid var(--color-orange);
+}
+
+.peervault-conflict-path {
+  font-weight: 500;
+  margin-bottom: 4px;
+}
+
+.peervault-conflict-details {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.peervault-conflict-peers {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.peervault-conflict-peer {
+  padding: 2px 8px;
+  background: var(--background-modifier-border);
+  border-radius: 10px;
+  font-size: 11px;
+}
+
+/* ===========================================================================
+   Animations
+   =========================================================================== */
+
+@keyframes peervault-pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+.peervault-status-syncing {
+  animation: peervault-pulse 1.5s ease-in-out infinite;
+}

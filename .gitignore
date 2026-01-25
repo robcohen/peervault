@@ -1,0 +1,65 @@
+# Dependencies
+node_modules/
+.bun/
+
+# Build output
+dist/
+*.js
+*.js.map
+*.d.ts
+!jest.config.js
+!esbuild.config.mjs
+
+# Nix
+result
+result-*
+
+# Rust/Cargo (for WASM builds)
+.cargo/
+target/
+*.wasm
+
+# Python/uv
+.uv-cache/
+.venv/
+__pycache__/
+*.py[cod]
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Obsidian plugin development
+data.json
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Playwright
+test-results/
+playwright-report/
+playwright/.cache/

@@ -185,60 +185,79 @@ class MigrationRunner {
 
 ## Document Schema Migrations
 
-Automerge documents may need schema evolution:
+Loro documents may need schema evolution as features are added.
 
 ### Schema Version in Documents
 
 ```typescript
-interface FileDoc {
-  /** Schema version for this document */
-  _schemaVersion: number;
+import { LoroDoc, LoroMap } from 'loro-crdt';
 
-  content: Automerge.Text;
-  path: string;
-  deleted: boolean;
-  mtime: number;
-
-  // v2 additions
-  // checksum?: string;
-  // metadata?: Record<string, unknown>;
-}
-
-interface VaultIndex {
-  _schemaVersion: number;
+// Schema version is stored in the meta map
+interface VaultMeta {
   vaultId: string;
-  files: Record<string, VaultIndexEntry>;
-
-  // v2 additions
-  // lastFullSync?: number;
-  // syncSettings?: SyncSettings;
+  name: string;
+  version: number;  // Schema version
+  createdAt: number;
 }
+
+// Version history:
+// v1: Initial schema - LoroTree files, LoroText content, LoroMap frontmatter
+// v2: (future) Add tags container, binary file references
 ```
 
 ### Document Migration
 
 ```typescript
-function migrateFileDoc(doc: Automerge.Doc<any>): Automerge.Doc<FileDoc> {
-  const version = doc._schemaVersion ?? 1;
+import { LoroDoc } from 'loro-crdt';
+
+const CURRENT_SCHEMA_VERSION = 1;
+
+function migrateLoroDoc(doc: LoroDoc): LoroDoc {
+  const meta = doc.getMap('meta');
+  const version = (meta.get('version') as number) ?? 1;
 
   if (version === CURRENT_SCHEMA_VERSION) {
-    return doc as Automerge.Doc<FileDoc>;
+    return doc;
   }
 
   // Migrate through each version
-  let migrated = doc;
+  doc.transact(() => {
+    if (version < 2) {
+      // Example: v1 -> v2 migration
+      // Add new containers or transform existing data
 
-  if (version < 2) {
-    migrated = Automerge.change(migrated, (d) => {
-      d._schemaVersion = 2;
-      // Add new fields with defaults
-      d.checksum = '';
-    });
+      // Initialize new tags container if not exists
+      // const tags = doc.getList('tags');
+
+      // Update version
+      meta.set('version', 2);
+    }
+
+    // Future migrations...
+  });
+
+  return doc;
+}
+
+/**
+ * Validate document has required structure after migration.
+ */
+function validateLoroDoc(doc: LoroDoc): boolean {
+  try {
+    const meta = doc.getMap('meta');
+    const files = doc.getTree('files');
+
+    // Check required fields
+    if (!meta.get('vaultId')) return false;
+    if (!meta.get('version')) return false;
+
+    // Files tree should exist
+    if (!files) return false;
+
+    return true;
+  } catch {
+    return false;
   }
-
-  // Future migrations...
-
-  return migrated as Automerge.Doc<FileDoc>;
 }
 ```
 
@@ -481,11 +500,14 @@ class BackupManager {
 ## Testing Migrations
 
 ```typescript
+import { LoroDoc } from 'loro-crdt';
+
 describe('Storage Migrations', () => {
-  it('migrates v1 to v2', async () => {
-    // Create v1 storage
+  it('migrates v1 Loro doc to v2', async () => {
+    // Create v1 storage with Loro doc
     const storage = await createTestStorage(1);
-    await storage.saveDoc('test', createV1Doc());
+    const v1Doc = createV1LoroDoc();
+    await storage.save(v1Doc);
 
     // Run migration
     const runner = new MigrationRunner(storage, STORAGE_MIGRATIONS);
@@ -495,13 +517,19 @@ describe('Storage Migrations', () => {
     expect(await storage.getSchemaVersion()).toBe(2);
 
     // Verify data integrity
-    const doc = await storage.loadDoc('test');
-    expect(doc.content.toString()).toBe('original content');
-    expect(doc._schemaVersion).toBe(2);
+    const doc = await storage.load();
+    const meta = doc.getMap('meta');
+    expect(meta.get('version')).toBe(2);
+
+    // Original content preserved
+    const content = getFileContent(doc, 'test.md');
+    expect(content).toBe('original content');
   });
 
   it('rolls back on failure', async () => {
     const storage = await createTestStorage(1);
+    const doc = createV1LoroDoc();
+    await storage.save(doc);
 
     // Add a failing migration
     const badMigration: Migration = {
@@ -509,7 +537,7 @@ describe('Storage Migrations', () => {
       toVersion: 2,
       description: 'Failing migration',
       migrate: async () => { throw new Error('Simulated failure'); },
-      rollback: async () => { /* restore state */ },
+      rollback: async () => { /* restore from checkpoint */ },
     };
 
     const runner = new MigrationRunner(storage, [badMigration]);
@@ -520,13 +548,39 @@ describe('Storage Migrations', () => {
     expect(await storage.getSchemaVersion()).toBe(1);
   });
 
-  it('handles peer version mismatch', async () => {
+  it('handles peer version mismatch gracefully', async () => {
     const peer1 = createTestPeer({ protocolVersion: 1 });
     const peer2 = createTestPeer({ protocolVersion: 2 });
 
-    // Should negotiate to v1
+    // Should negotiate to common version (v1)
     const version = await peer1.negotiateWith(peer2);
     expect(version).toBe(1);
+  });
+
+  it('preserves Loro version vectors during migration', async () => {
+    const storage = await createTestStorage(1);
+    const doc = createV1LoroDoc();
+
+    // Record version before migration
+    const versionBefore = doc.version();
+
+    await storage.save(doc);
+    const runner = new MigrationRunner(storage, STORAGE_MIGRATIONS);
+    await runner.run();
+
+    // Load migrated doc
+    const migrated = await storage.load();
+
+    // Version vector should be compatible (can still sync with old peers)
+    // Note: Migration creates new operations, so version will advance
+    const canMerge = () => {
+      const testDoc = new LoroDoc();
+      testDoc.import(doc.export({ mode: 'snapshot' }));
+      testDoc.import(migrated.export({ mode: 'update', from: versionBefore }));
+      return true;
+    };
+
+    expect(canMerge()).toBe(true);
   });
 });
 ```
@@ -546,6 +600,14 @@ When adding a breaking change:
 
 ## Dependencies
 
+```json
+{
+  "dependencies": {
+    "loro-crdt": "^1.0.0"
+  }
+}
+```
+
 - File system operations for backup/restore
-- Automerge for document migrations
+- Loro for document migrations
 - Obsidian Modal API for user communication

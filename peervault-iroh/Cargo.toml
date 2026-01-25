@@ -1,0 +1,49 @@
+[package]
+name = "peervault-iroh"
+version = "0.1.0"
+edition = "2021"
+description = "WASM bindings for Iroh P2P networking in PeerVault"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Iroh for P2P networking - use default features (WASM compatible as of 0.34+)
+iroh = "0.34"
+
+# WASM bindings
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["console"] }
+
+# Random number generation in WASM
+# getrandom 0.2 for our code, getrandom 0.3 for iroh's dependencies (rand 0.9)
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom = { version = "0.3", features = ["wasm_js"] }
+rand = "0.8"
+
+# Async runtime for WASM
+tokio = { version = "1", features = ["sync", "io-util"] }
+
+# Error handling and panic info
+console_error_panic_hook = "0.1"
+anyhow = "1.0"
+
+# Serialization for NodeAddr
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-wasm = "0.2"
+
+# Futures utilities
+futures = "0.3"
+
+# Watcher trait from n0
+n0-watcher = "0.1"
+
+[profile.release]
+opt-level = "s"     # Optimize for size
+lto = true          # Link-time optimization

@@ -24,8 +24,8 @@ peervault/
 │   ├── main.ts                  # Plugin entry point
 │   ├── types.ts                 # Shared TypeScript interfaces
 │   ├── core/
-│   │   ├── document-manager.ts  # Automerge doc management
-│   │   ├── storage-adapter.ts   # .crdt file persistence
+│   │   ├── document-manager.ts  # Loro document management
+│   │   ├── storage-adapter.ts   # .loro file persistence
 │   │   ├── file-watcher.ts      # Vault change detection
 │   │   └── sync-engine.ts       # Sync orchestration
 │   ├── transport/
@@ -44,7 +44,7 @@ peervault/
 │   └── utils/
 │       ├── logger.ts            # Structured logging
 │       ├── errors.ts            # Error classes
-│       └── text-diff.ts         # Content diffing for Automerge
+│       └── text-diff.ts         # Content diffing for Loro (Myers diff)
 ├── styles.css                   # Plugin styles
 ├── manifest.json                # Plugin metadata
 ├── versions.json                # Version compatibility map
@@ -119,8 +119,8 @@ Maps plugin versions to minimum Obsidian versions:
     "typescript": "^5.0.0"
   },
   "dependencies": {
-    "@automerge/automerge": "^2.0.0",
-    "@aspect/iroh": "^0.1.0"
+    "loro-crdt": "^1.0.0",
+    "@aspect/iroh": "^0.34.0"
   }
 }
 ```
@@ -215,7 +215,7 @@ import {
   Platform,
 } from 'obsidian';
 
-import { DocumentManager } from './core/document-manager';
+import { LoroDocManager } from './core/document-manager';
 import { StorageAdapter } from './core/storage-adapter';
 import { FileWatcher } from './core/file-watcher';
 import { SyncEngine } from './core/sync-engine';
@@ -224,13 +224,14 @@ import { PeerManager } from './peer/peer-manager';
 import { PeerVaultSettingTab } from './ui/settings-tab';
 import { SyncStatusBar } from './ui/status-bar';
 import { DEFAULT_SETTINGS, PeerVaultSettings } from './types';
+import { LoroDoc } from 'loro-crdt';
 
 export default class PeerVaultPlugin extends Plugin {
   settings: PeerVaultSettings;
 
   // Core components
   private storage: StorageAdapter;
-  private documentManager: DocumentManager;
+  private docManager: LoroDocManager;  // Single Loro document for entire vault
   private fileWatcher: FileWatcher;
   private syncEngine: SyncEngine;
   private transport: IrohTransport;
@@ -247,10 +248,10 @@ export default class PeerVaultPlugin extends Plugin {
 
     // Initialize storage (creates directories if needed)
     this.storage = new StorageAdapter(this.app.vault, this.manifest.dir!);
-    await this.storage.initialize();
+    const doc = await this.storage.initialize();
 
-    // Initialize document manager
-    this.documentManager = new DocumentManager(this.storage);
+    // Initialize Loro document manager (single document architecture)
+    this.docManager = new LoroDocManager(doc, this.storage);
 
     // Initialize transport (loads WASM)
     this.transport = new IrohTransport(this.storage);
@@ -263,9 +264,9 @@ export default class PeerVaultPlugin extends Plugin {
       (peers) => this.updateSettings({ peers })
     );
 
-    // Initialize sync engine
+    // Initialize sync engine (uses Loro version vectors)
     this.syncEngine = new SyncEngine(
-      this.documentManager,
+      this.docManager,
       this.peerManager,
       this.storage
     );
@@ -342,13 +343,13 @@ export default class PeerVaultPlugin extends Plugin {
     // Note: registerEvent() handlers are automatically cleaned up
   }
 
-  // File event handlers
+  // File event handlers - update Loro document
   private async onFileCreate(file: TAbstractFile): Promise<void> {
     if (!(file instanceof TFile) || file.extension !== 'md') return;
     if (this.fileWatcher.isIgnored(file.path)) return;
 
     const content = await this.app.vault.read(file);
-    await this.documentManager.createDoc(file.path, content);
+    await this.docManager.createFile(file.path, content);
   }
 
   private async onFileModify(file: TAbstractFile): Promise<void> {
@@ -356,12 +357,12 @@ export default class PeerVaultPlugin extends Plugin {
     if (this.fileWatcher.isIgnored(file.path)) return;
 
     const content = await this.app.vault.read(file);
-    await this.documentManager.updateDoc(file.path, content);
+    await this.docManager.updateFile(file.path, content);
   }
 
   private async onFileDelete(file: TAbstractFile): Promise<void> {
     if (!(file instanceof TFile) || file.extension !== 'md') return;
-    await this.documentManager.deleteDoc(file.path);
+    await this.docManager.deleteFile(file.path);
   }
 
   private async onFileRename(
@@ -369,7 +370,7 @@ export default class PeerVaultPlugin extends Plugin {
     oldPath: string
   ): Promise<void> {
     if (!(file instanceof TFile) || file.extension !== 'md') return;
-    await this.documentManager.renameDoc(oldPath, file.path);
+    await this.docManager.moveFile(oldPath, file.path);
   }
 
   // Settings management
@@ -686,7 +687,7 @@ Open DevTools: `Ctrl+Shift+I` (desktop) or use remote debugging (mobile)
 | Package | Purpose | Mobile Safe |
 |---------|---------|-------------|
 | `obsidian` | Plugin API types | Yes |
-| `@automerge/automerge` | CRDT implementation | Yes (WASM) |
+| `loro-crdt` | CRDT implementation (Fugue, LoroTree) | Yes (WASM) |
 | `@aspect/iroh` | P2P transport | Yes (WASM) |
 | `esbuild` | Build tool | Dev only |
 | `typescript` | Type checking | Dev only |

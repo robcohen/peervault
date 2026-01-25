@@ -1,0 +1,473 @@
+/**
+ * Vault Sync Service
+ *
+ * Handles bidirectional sync between Obsidian vault files and the
+ * Loro document. Reads file contents on local changes and writes
+ * file contents on remote changes.
+ */
+
+import type { App, TFile, TAbstractFile, Vault } from 'obsidian';
+import type { DocumentManager, FileChangeEvent } from './document-manager';
+import type { BlobStore } from './blob-store';
+import { isBinaryFile } from './blob-store';
+import type { Logger } from '../utils/logger';
+
+/** Configuration for vault sync */
+export interface VaultSyncConfig {
+  /** Folders to exclude from sync */
+  excludedFolders: string[];
+  /** Maximum file size in bytes to sync */
+  maxFileSize: number;
+  /** Debounce delay for file changes (ms) */
+  debounceMs: number;
+}
+
+const DEFAULT_CONFIG: VaultSyncConfig = {
+  excludedFolders: ['.obsidian/plugins', '.obsidian/themes'],
+  maxFileSize: 100 * 1024 * 1024, // 100 MB
+  debounceMs: 500,
+};
+
+/**
+ * Syncs files between Obsidian vault and Loro document.
+ */
+export class VaultSync {
+  private config: VaultSyncConfig;
+  private pendingChanges = new Map<string, ReturnType<typeof setTimeout>>();
+  private unsubscribeDocChanges: (() => void) | null = null;
+  private isProcessingRemote = false;
+
+  constructor(
+    private app: App,
+    private documentManager: DocumentManager,
+    private blobStore: BlobStore,
+    private logger: Logger,
+    config?: Partial<VaultSyncConfig>
+  ) {
+    this.config = { ...DEFAULT_CONFIG, ...config };
+  }
+
+  /**
+   * Start vault sync.
+   */
+  start(): void {
+    // Subscribe to document changes (remote updates)
+    this.unsubscribeDocChanges = this.documentManager.onFileChange((event) => {
+      if (event.origin === 'remote') {
+        this.handleRemoteChange(event);
+      }
+    });
+
+    this.logger.info('VaultSync started');
+  }
+
+  /**
+   * Stop vault sync.
+   */
+  stop(): void {
+    // Clear pending changes
+    for (const timeout of this.pendingChanges.values()) {
+      clearTimeout(timeout);
+    }
+    this.pendingChanges.clear();
+
+    // Unsubscribe from document changes
+    if (this.unsubscribeDocChanges) {
+      this.unsubscribeDocChanges();
+      this.unsubscribeDocChanges = null;
+    }
+
+    this.logger.info('VaultSync stopped');
+  }
+
+  // ===========================================================================
+  // Vault -> Document (Local Changes)
+  // ===========================================================================
+
+  /**
+   * Handle a file creation in the vault.
+   */
+  async handleFileCreate(file: TAbstractFile): Promise<void> {
+    if (!this.shouldSync(file.path)) return;
+    if (this.isProcessingRemote) return;
+
+    this.debounceChange(file.path, async () => {
+      await this.documentManager.handleFileCreate(file.path);
+      await this.syncFileContent(file.path);
+    });
+  }
+
+  /**
+   * Handle a file modification in the vault.
+   */
+  async handleFileModify(file: TAbstractFile): Promise<void> {
+    if (!this.shouldSync(file.path)) return;
+    if (this.isProcessingRemote) return;
+
+    this.debounceChange(file.path, async () => {
+      await this.documentManager.handleFileModify(file.path);
+      await this.syncFileContent(file.path);
+    });
+  }
+
+  /**
+   * Handle a file deletion in the vault.
+   */
+  async handleFileDelete(file: TAbstractFile): Promise<void> {
+    if (!this.shouldSync(file.path)) return;
+    if (this.isProcessingRemote) return;
+
+    // Cancel any pending changes
+    const pending = this.pendingChanges.get(file.path);
+    if (pending) {
+      clearTimeout(pending);
+      this.pendingChanges.delete(file.path);
+    }
+
+    await this.documentManager.handleFileDelete(file.path);
+  }
+
+  /**
+   * Handle a file rename in the vault.
+   */
+  async handleFileRename(file: TAbstractFile, oldPath: string): Promise<void> {
+    const shouldSyncNew = this.shouldSync(file.path);
+    const shouldSyncOld = this.shouldSync(oldPath);
+
+    if (!shouldSyncNew && !shouldSyncOld) return;
+    if (this.isProcessingRemote) return;
+
+    // Cancel any pending changes for old path
+    const pending = this.pendingChanges.get(oldPath);
+    if (pending) {
+      clearTimeout(pending);
+      this.pendingChanges.delete(oldPath);
+    }
+
+    await this.documentManager.handleFileRename(oldPath, file.path);
+  }
+
+  /**
+   * Sync file content from vault to document.
+   */
+  private async syncFileContent(path: string): Promise<void> {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!file || !(file instanceof this.app.vault.adapter.constructor)) {
+      // Not a file (might be a folder)
+      return;
+    }
+
+    try {
+      const tfile = file as TFile;
+
+      // Check file size
+      if (tfile.stat.size > this.config.maxFileSize) {
+        this.logger.warn('File too large to sync:', path, tfile.stat.size);
+        return;
+      }
+
+      if (isBinaryFile(path)) {
+        // Binary file - read and store in blob store
+        const content = await this.app.vault.readBinary(tfile);
+        const hash = await this.blobStore.add(new Uint8Array(content));
+        this.documentManager.setBlobHash(path, hash);
+        this.logger.debug('Synced binary file to document:', path);
+      } else {
+        // Text file - read and store in document
+        const content = await this.app.vault.read(tfile);
+        this.documentManager.setTextContent(path, content);
+        this.logger.debug('Synced text file to document:', path);
+      }
+    } catch (error) {
+      this.logger.error('Failed to sync file content:', path, error);
+    }
+  }
+
+  /**
+   * Do initial sync of all vault files to document.
+   * Use this when you have local files and want to sync them to the document.
+   */
+  async initialSync(): Promise<void> {
+    this.logger.info('Starting initial vault sync (vault -> document)...');
+
+    const files = this.app.vault.getFiles();
+    let synced = 0;
+    let skipped = 0;
+
+    for (const file of files) {
+      if (!this.shouldSync(file.path)) {
+        skipped++;
+        continue;
+      }
+
+      try {
+        // Create file node if not exists
+        await this.documentManager.handleFileCreate(file.path);
+
+        // Sync content
+        await this.syncFileContent(file.path);
+        synced++;
+      } catch (error) {
+        this.logger.error('Failed to sync file:', file.path, error);
+      }
+    }
+
+    this.logger.info(`Initial sync complete: ${synced} files synced, ${skipped} skipped`);
+  }
+
+  /**
+   * Sync all files from document to vault.
+   * Use this when a new device joins and needs to receive all files.
+   */
+  async syncFromDocument(): Promise<{ created: number; updated: number; failed: number }> {
+    this.logger.info('Starting document -> vault sync...');
+    this.isProcessingRemote = true;
+
+    const stats = { created: 0, updated: 0, failed: 0 };
+
+    try {
+      // Get all file paths from the document
+      const docPaths = this.documentManager.listAllPaths();
+      this.logger.info(`Document has ${docPaths.length} files`);
+
+      // Sort paths to ensure parents are created before children
+      const sortedPaths = [...docPaths].sort((a, b) => {
+        const aDepth = a.split('/').length;
+        const bDepth = b.split('/').length;
+        return aDepth - bDepth;
+      });
+
+      for (const path of sortedPaths) {
+        if (!this.shouldSync(path)) {
+          continue;
+        }
+
+        try {
+          const content = this.documentManager.getContent(path);
+          if (!content) {
+            continue;
+          }
+
+          // Skip folders - they're created automatically when writing files
+          if (content.type === 'folder') {
+            continue;
+          }
+
+          const existingFile = this.app.vault.getAbstractFileByPath(path);
+          const isNew = !existingFile;
+
+          await this.writeFileToVault(path);
+
+          if (isNew) {
+            stats.created++;
+          } else {
+            stats.updated++;
+          }
+        } catch (error) {
+          this.logger.error('Failed to sync file from document:', path, error);
+          stats.failed++;
+        }
+      }
+
+      this.logger.info(
+        `Document sync complete: ${stats.created} created, ${stats.updated} updated, ${stats.failed} failed`
+      );
+    } finally {
+      this.isProcessingRemote = false;
+    }
+
+    return stats;
+  }
+
+  /**
+   * Check if the vault is empty (no syncable files).
+   * Used to determine if we should sync from document on first connect.
+   */
+  isVaultEmpty(): boolean {
+    const files = this.app.vault.getFiles();
+    return !files.some((f) => this.shouldSync(f.path));
+  }
+
+  /**
+   * Check if the document has files.
+   */
+  hasDocumentContent(): boolean {
+    const paths = this.documentManager.listAllPaths();
+    return paths.length > 0;
+  }
+
+  // ===========================================================================
+  // Document -> Vault (Remote Changes)
+  // ===========================================================================
+
+  /**
+   * Handle a remote file change from the document.
+   */
+  private async handleRemoteChange(event: FileChangeEvent): Promise<void> {
+    this.isProcessingRemote = true;
+
+    try {
+      switch (event.type) {
+        case 'create':
+        case 'modify':
+          await this.writeFileToVault(event.path);
+          break;
+
+        case 'delete':
+          await this.deleteFileFromVault(event.path);
+          break;
+
+        case 'rename':
+          if (event.oldPath) {
+            await this.renameFileInVault(event.oldPath, event.path);
+          }
+          break;
+      }
+    } catch (error) {
+      this.logger.error('Failed to apply remote change:', event, error);
+    } finally {
+      this.isProcessingRemote = false;
+    }
+  }
+
+  /**
+   * Write file content from document to vault.
+   */
+  private async writeFileToVault(path: string): Promise<void> {
+    const content = this.documentManager.getContent(path);
+    if (!content) {
+      this.logger.warn('No content found for remote file:', path);
+      return;
+    }
+
+    // Ensure parent folder exists
+    const parts = path.split('/');
+    if (parts.length > 1) {
+      const folderPath = parts.slice(0, -1).join('/');
+      await this.ensureFolder(folderPath);
+    }
+
+    if (content.type === 'text' && content.text !== undefined) {
+      // Write text file
+      const existing = this.app.vault.getAbstractFileByPath(path);
+      if (existing) {
+        await this.app.vault.modify(existing as TFile, content.text);
+      } else {
+        await this.app.vault.create(path, content.text);
+      }
+      this.logger.debug('Wrote text file from document:', path);
+    } else if (content.type === 'binary' && content.blobHash) {
+      // Write binary file
+      const blobData = await this.blobStore.get(content.blobHash);
+      if (!blobData) {
+        this.logger.warn('Blob not found for remote file:', path, content.blobHash);
+        return;
+      }
+
+      // Convert to ArrayBuffer (Obsidian API requires ArrayBuffer, not Uint8Array)
+      const arrayBuffer = new ArrayBuffer(blobData.length);
+      new Uint8Array(arrayBuffer).set(blobData);
+
+      const existing = this.app.vault.getAbstractFileByPath(path);
+      if (existing) {
+        await this.app.vault.modifyBinary(existing as TFile, arrayBuffer);
+      } else {
+        await this.app.vault.createBinary(path, arrayBuffer);
+      }
+      this.logger.debug('Wrote binary file from document:', path);
+    }
+  }
+
+  /**
+   * Delete file from vault.
+   */
+  private async deleteFileFromVault(path: string): Promise<void> {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (file) {
+      await this.app.vault.delete(file);
+      this.logger.debug('Deleted file from vault:', path);
+    }
+  }
+
+  /**
+   * Rename file in vault.
+   */
+  private async renameFileInVault(oldPath: string, newPath: string): Promise<void> {
+    const file = this.app.vault.getAbstractFileByPath(oldPath);
+    if (file) {
+      // Ensure new parent folder exists
+      const parts = newPath.split('/');
+      if (parts.length > 1) {
+        const folderPath = parts.slice(0, -1).join('/');
+        await this.ensureFolder(folderPath);
+      }
+
+      await this.app.vault.rename(file, newPath);
+      this.logger.debug('Renamed file in vault:', oldPath, '->', newPath);
+    }
+  }
+
+  /**
+   * Ensure a folder exists in the vault.
+   */
+  private async ensureFolder(path: string): Promise<void> {
+    const existing = this.app.vault.getAbstractFileByPath(path);
+    if (!existing) {
+      await this.app.vault.createFolder(path);
+    }
+  }
+
+  // ===========================================================================
+  // Utilities
+  // ===========================================================================
+
+  /**
+   * Check if a path should be synced.
+   */
+  private shouldSync(path: string): boolean {
+    for (const excluded of this.config.excludedFolders) {
+      if (path.startsWith(excluded + '/') || path === excluded) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Update excluded folders list.
+   */
+  updateExcludedFolders(folders: string[]): void {
+    this.config.excludedFolders = folders;
+    this.logger.info('Updated excluded folders:', folders);
+  }
+
+  /**
+   * Get current excluded folders.
+   */
+  getExcludedFolders(): string[] {
+    return [...this.config.excludedFolders];
+  }
+
+  /**
+   * Debounce a file change operation.
+   */
+  private debounceChange(path: string, fn: () => Promise<void>): void {
+    // Cancel existing timeout
+    const existing = this.pendingChanges.get(path);
+    if (existing) {
+      clearTimeout(existing);
+    }
+
+    // Set new timeout
+    const timeout = setTimeout(async () => {
+      this.pendingChanges.delete(path);
+      try {
+        await fn();
+      } catch (error) {
+        this.logger.error('Error in debounced change handler:', error);
+      }
+    }, this.config.debounceMs);
+
+    this.pendingChanges.set(path, timeout);
+  }
+}
