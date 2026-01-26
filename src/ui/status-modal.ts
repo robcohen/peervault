@@ -12,6 +12,7 @@ import { STATUS_ICONS, getStatusLabel } from "./status-icons";
 
 export class PeerVaultStatusModal extends Modal {
   plugin: PeerVaultPlugin;
+  private eventCleanup: (() => void)[] = [];
 
   constructor(app: App, plugin: PeerVaultPlugin) {
     super(app);
@@ -19,6 +20,8 @@ export class PeerVaultStatusModal extends Modal {
   }
 
   override onOpen(): void {
+    // Subscribe to peer events for auto-refresh
+    this.subscribeToEvents();
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("peervault-status-modal");
@@ -31,8 +34,72 @@ export class PeerVaultStatusModal extends Modal {
   }
 
   override onClose(): void {
+    // Clear debounce timeout
+    if (this.refreshTimeout) {
+      clearTimeout(this.refreshTimeout);
+      this.refreshTimeout = undefined;
+    }
+
+    // Unsubscribe from all events
+    for (const cleanup of this.eventCleanup) {
+      cleanup();
+    }
+    this.eventCleanup = [];
+
     const { contentEl } = this;
     contentEl.empty();
+  }
+
+  private subscribeToEvents(): void {
+    // Clean up any existing subscriptions first
+    for (const cleanup of this.eventCleanup) {
+      cleanup();
+    }
+    this.eventCleanup = [];
+
+    const peerManager = this.plugin.peerManager;
+    if (!peerManager) return;
+
+    // Refresh UI on these events
+    const events = [
+      "peer:connected",
+      "peer:disconnected",
+      "peer:pairing-request",
+      "peer:pairing-accepted",
+      "peer:pairing-denied",
+      "peer:synced",
+      "peer:sync-error",
+    ] as const;
+
+    const refresh = () => {
+      // Debounce rapid events - only refresh once per 100ms
+      if (this.refreshTimeout) {
+        clearTimeout(this.refreshTimeout);
+      }
+      this.refreshTimeout = window.setTimeout(() => {
+        this.refreshContent();
+        this.refreshTimeout = undefined;
+      }, 100);
+    };
+
+    for (const event of events) {
+      peerManager.on(event, refresh);
+      this.eventCleanup.push(() => peerManager.off(event, refresh));
+    }
+  }
+
+  private refreshTimeout?: number;
+
+  private refreshContent(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass("peervault-status-modal");
+
+    contentEl.createEl("h2", { text: "PeerVault Status" });
+
+    this.renderStatus(contentEl);
+    this.renderPeers(contentEl);
+    this.renderActions(contentEl);
   }
 
   private renderStatus(container: HTMLElement): void {
