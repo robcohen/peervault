@@ -324,18 +324,31 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       return;
     }
 
-    // Try to connect if we have a ticket
-    if (peer.ticket) {
+    // First, try to use an existing connection
+    let connection = this.transport.getConnection(nodeId);
+
+    // If no existing connection, try to create a new one with the ticket
+    if (!connection && peer.ticket) {
       try {
-        const connection = await this.transport.connectWithTicket(peer.ticket);
-        await this.startSyncSession(connection, peer);
+        this.logger.debug("No existing connection, connecting with ticket...");
+        connection = await this.transport.connectWithTicket(peer.ticket);
       } catch (error) {
-        this.logger.error("Failed to sync with peer:", nodeId, error);
+        this.logger.error("Failed to connect to peer:", nodeId, error);
         this.updatePeerState(nodeId, "error");
         throw error;
       }
-    } else {
+    }
+
+    if (!connection) {
       throw PeerErrors.notFound(nodeId);
+    }
+
+    try {
+      await this.startSyncSession(connection, peer);
+    } catch (error) {
+      this.logger.error("Failed to sync with peer:", nodeId, error);
+      this.updatePeerState(nodeId, "error");
+      throw error;
     }
   }
 
