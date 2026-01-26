@@ -854,6 +854,23 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           }),
       );
+
+    // Copy logs for debugging
+    new Setting(container)
+      .setName("Copy debug logs")
+      .setDesc("Copy recent logs to clipboard for troubleshooting")
+      .addButton((btn) =>
+        btn.setButtonText("Copy Logs").onClick(async () => {
+          const { getRecentLogs } = await import("../utils/logger");
+          const logs = getRecentLogs(200);
+          if (logs) {
+            await navigator.clipboard.writeText(logs);
+            new Notice("Logs copied to clipboard!");
+          } else {
+            new Notice("No logs available");
+          }
+        }),
+      );
   }
 
   private renderDangerZone(container: HTMLElement): void {

@@ -4,6 +4,57 @@
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
+/** Log entry for the buffer */
+export interface LogEntry {
+  timestamp: number;
+  level: LogLevel;
+  prefix: string;
+  message: string;
+}
+
+/** Global log buffer for "Copy Logs" feature */
+const LOG_BUFFER: LogEntry[] = [];
+const MAX_LOG_ENTRIES = 500;
+
+function addToBuffer(level: LogLevel, prefix: string, args: unknown[]): void {
+  const message = args.map(arg => {
+    if (arg instanceof Error) return `${arg.name}: ${arg.message}`;
+    if (typeof arg === "object") {
+      try { return JSON.stringify(arg); } catch { return String(arg); }
+    }
+    return String(arg);
+  }).join(" ");
+
+  LOG_BUFFER.push({ timestamp: Date.now(), level, prefix, message });
+
+  // Trim buffer if too large
+  if (LOG_BUFFER.length > MAX_LOG_ENTRIES) {
+    LOG_BUFFER.splice(0, LOG_BUFFER.length - MAX_LOG_ENTRIES);
+  }
+}
+
+/** Get all buffered logs as a string */
+export function getLogBuffer(): string {
+  return LOG_BUFFER.map(entry => {
+    const time = new Date(entry.timestamp).toISOString().slice(11, 23);
+    return `${time} [${entry.level.toUpperCase().padEnd(5)}] ${entry.prefix} ${entry.message}`;
+  }).join("\n");
+}
+
+/** Clear the log buffer */
+export function clearLogBuffer(): void {
+  LOG_BUFFER.length = 0;
+}
+
+/** Get recent logs (last N entries) */
+export function getRecentLogs(count = 100): string {
+  const recent = LOG_BUFFER.slice(-count);
+  return recent.map(entry => {
+    const time = new Date(entry.timestamp).toISOString().slice(11, 23);
+    return `${time} [${entry.level.toUpperCase().padEnd(5)}] ${entry.prefix} ${entry.message}`;
+  }).join("\n");
+}
+
 export class Logger {
   private readonly prefix: string;
 
@@ -28,6 +79,7 @@ export class Logger {
    * Log a debug message (only in debug mode).
    */
   debug(...args: unknown[]): void {
+    addToBuffer("debug", this.prefix, args);
     if (this.isDebugEnabled()) {
       console.debug(this.prefix, ...args);
     }
@@ -37,6 +89,7 @@ export class Logger {
    * Log an info message.
    */
   info(...args: unknown[]): void {
+    addToBuffer("info", this.prefix, args);
     console.info(this.prefix, ...args);
   }
 
@@ -44,6 +97,7 @@ export class Logger {
    * Log a warning message.
    */
   warn(...args: unknown[]): void {
+    addToBuffer("warn", this.prefix, args);
     console.warn(this.prefix, ...args);
   }
 
@@ -51,6 +105,7 @@ export class Logger {
    * Log an error message.
    */
   error(...args: unknown[]): void {
+    addToBuffer("error", this.prefix, args);
     console.error(this.prefix, ...args);
   }
 

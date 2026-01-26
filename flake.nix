@@ -62,6 +62,9 @@
             # Git
             git
             gh  # GitHub CLI
+
+            # Android debugging
+            android-tools  # adb, fastboot
           ];
 
           shellHook = ''
