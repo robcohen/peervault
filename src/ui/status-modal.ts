@@ -71,22 +71,74 @@ export class PeerVaultStatusModal extends Modal {
 
   private renderPeers(container: HTMLElement): void {
     const peersEl = container.createDiv({ cls: "peervault-peers-section" });
-    peersEl.createEl("h3", { text: "Connected Peers" });
+    peersEl.createEl("h3", { text: "Devices" });
 
+    // Show pending pairing requests first
+    const pairingRequests = this.plugin.peerManager?.getPendingPairingRequests() ?? [];
+    if (pairingRequests.length > 0) {
+      const requestsList = peersEl.createEl("ul", { cls: "peervault-peer-list" });
+      for (const request of pairingRequests) {
+        this.renderPairingRequest(requestsList, request);
+      }
+    }
+
+    // Show connected peers
     const peers = this.plugin.getConnectedPeers();
 
-    if (peers.length === 0) {
+    if (peers.length === 0 && pairingRequests.length === 0) {
       peersEl.createEl("p", {
-        text: "No peers connected. Add a device to start syncing.",
+        text: "No devices connected. Add a device to start syncing.",
         cls: "peervault-no-peers",
       });
-    } else {
+    } else if (peers.length > 0) {
       const peerList = peersEl.createEl("ul", { cls: "peervault-peer-list" });
 
       for (const peer of peers) {
         this.renderPeerItem(peerList, peer);
       }
     }
+  }
+
+  private renderPairingRequest(list: HTMLElement, request: { nodeId: string; timestamp: number }): void {
+    const item = list.createEl("li", { cls: "peervault-peer-item peervault-pairing-request" });
+
+    // Peer info
+    const info = item.createDiv({ cls: "peervault-peer-info" });
+    info.createSpan({
+      text: `Device ${request.nodeId.substring(0, 8)}...`,
+      cls: "peervault-peer-name",
+    });
+
+    // Status indicator
+    const statusEl = info.createSpan({ cls: "peervault-peer-status peervault-peer-pairing" });
+    statusEl.setText("wants to pair");
+
+    // Action buttons
+    const actions = item.createDiv({ cls: "peervault-pairing-actions" });
+
+    const acceptBtn = actions.createEl("button", {
+      text: "Accept",
+      cls: "peervault-btn peervault-btn-accept",
+    });
+    acceptBtn.onclick = async () => {
+      try {
+        await this.plugin.peerManager?.acceptPairingRequest(request.nodeId);
+        new Notice("Pairing accepted");
+        this.onOpen(); // Refresh the modal
+      } catch (error) {
+        new Notice(`Failed to accept: ${error}`);
+      }
+    };
+
+    const denyBtn = actions.createEl("button", {
+      text: "Deny",
+      cls: "peervault-btn peervault-btn-deny",
+    });
+    denyBtn.onclick = async () => {
+      await this.plugin.peerManager?.denyPairingRequest(request.nodeId);
+      new Notice("Pairing denied");
+      this.onOpen(); // Refresh the modal
+    };
   }
 
   private renderPeerItem(list: HTMLElement, peer: PeerInfo): void {

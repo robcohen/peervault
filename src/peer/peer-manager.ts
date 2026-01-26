@@ -17,6 +17,7 @@ import type {
   StoredPeerInfo,
   PeerState,
   PeerManagerConfig,
+  PairingRequest,
 } from "./types";
 import { PeerGroupManager, DEFAULT_GROUP_ID } from "./groups";
 import { PeerErrors } from "../errors";
@@ -36,6 +37,9 @@ interface PeerManagerEvents extends Record<string, unknown> {
   "peer:disconnected": { nodeId: string; reason?: string };
   "peer:synced": string;
   "peer:error": { nodeId: string; error: Error };
+  "peer:pairing-request": PairingRequest;
+  "peer:pairing-accepted": string;
+  "peer:pairing-denied": string;
   "status:change": "idle" | "syncing" | "offline" | "error";
 }
 
@@ -46,6 +50,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   private peers = new Map<string, PeerInfo>();
   private sessions = new Map<string, SyncSession>();
   private reconnectAttempts = new Map<string, number>();
+  private pendingPairingRequests = new Map<string, { request: PairingRequest; connection: PeerConnection }>();
   private config: Required<PeerManagerConfig>;
   private autoSyncTimer: ReturnType<typeof setInterval> | null = null;
   private status: "idle" | "syncing" | "offline" | "error" = "idle";
@@ -212,6 +217,71 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   }
 
   /**
+   * Get pending pairing requests.
+   */
+  getPendingPairingRequests(): PairingRequest[] {
+    return Array.from(this.pendingPairingRequests.values()).map((p) => p.request);
+  }
+
+  /**
+   * Accept a pairing request from an unknown peer.
+   */
+  async acceptPairingRequest(nodeId: string, name?: string): Promise<PeerInfo> {
+    const pending = this.pendingPairingRequests.get(nodeId);
+    if (!pending) {
+      throw PeerErrors.unknownPeer(nodeId);
+    }
+
+    const { connection } = pending;
+    this.pendingPairingRequests.delete(nodeId);
+
+    // Create peer info
+    const peer: PeerInfo = {
+      nodeId,
+      name,
+      state: "connecting",
+      firstSeen: Date.now(),
+      lastSeen: Date.now(),
+      trusted: true,
+      groupIds: [DEFAULT_GROUP_ID],
+    };
+    this.peers.set(nodeId, peer);
+    this.groupManager.addPeerToGroup(DEFAULT_GROUP_ID, nodeId);
+
+    this.logger.info("Accepted pairing request from:", nodeId);
+    this.emit("peer:pairing-accepted", nodeId);
+
+    // Now handle the sync session with the existing connection
+    try {
+      await this.handleIncomingSyncSession(connection, peer);
+      await this.savePeers();
+      this.emit("peer:connected", peer);
+      return peer;
+    } catch (error) {
+      this.logger.error("Failed to sync after accepting pairing:", error);
+      this.updatePeerState(nodeId, "error");
+      throw error;
+    }
+  }
+
+  /**
+   * Deny a pairing request.
+   */
+  async denyPairingRequest(nodeId: string): Promise<void> {
+    const pending = this.pendingPairingRequests.get(nodeId);
+    if (!pending) {
+      return; // Already handled or expired
+    }
+
+    const { connection } = pending;
+    this.pendingPairingRequests.delete(nodeId);
+
+    this.logger.info("Denied pairing request from:", nodeId);
+    await connection.close();
+    this.emit("peer:pairing-denied", nodeId);
+  }
+
+  /**
    * Set peer trust level.
    */
   async setTrusted(nodeId: string, trusted: boolean): Promise<void> {
@@ -362,11 +432,22 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     const nodeId = connection.peerId;
     this.logger.info("Incoming connection from:", nodeId);
 
-    // Get peer info - reject unknown peers per spec/06-peer-management.md
+    // Check if peer is known
     const peer = this.peers.get(nodeId);
     if (!peer) {
-      this.logger.warn("Rejected unknown peer:", nodeId);
-      await connection.close();
+      // Unknown peer - emit pairing request instead of rejecting
+      this.logger.info("Pairing request from unknown peer:", nodeId);
+
+      const request: PairingRequest = {
+        nodeId,
+        timestamp: Date.now(),
+      };
+
+      // Store the connection so we can accept/deny later
+      this.pendingPairingRequests.set(nodeId, { request, connection });
+
+      // Emit event for UI to show the request
+      this.emit("peer:pairing-request", request);
       return;
     }
 

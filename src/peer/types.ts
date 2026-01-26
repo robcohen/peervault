@@ -55,12 +55,25 @@ export interface StoredPeerInfo {
   groupIds?: string[];
 }
 
+/** Incoming pairing request from unknown peer */
+export interface PairingRequest {
+  /** Remote peer's node ID */
+  nodeId: string;
+  /** Remote peer's ticket (for reconnection if accepted) */
+  ticket?: string;
+  /** When the request was received */
+  timestamp: number;
+}
+
 /** Events from peer manager */
 export interface PeerManagerEvents {
   "peer:connected": PeerInfo;
   "peer:disconnected": { nodeId: string; reason?: string };
   "peer:synced": string; // nodeId
   "peer:error": { nodeId: string; error: Error };
+  "peer:pairing-request": PairingRequest;
+  "peer:pairing-accepted": string; // nodeId
+  "peer:pairing-denied": string; // nodeId
   "status:change": "idle" | "syncing" | "offline" | "error";
 }
 

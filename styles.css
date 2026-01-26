@@ -1168,3 +1168,52 @@
 .peervault-settings .setting-item[data-group]:hover {
   border-left-color: var(--interactive-accent);
 }
+
+/* ===========================================================================
+   Pairing Requests
+   =========================================================================== */
+
+.peervault-pairing-request {
+  border-left: 3px solid var(--color-orange);
+  background: var(--background-modifier-error-hover);
+}
+
+.peervault-peer-pairing {
+  background: var(--color-orange);
+  color: white;
+}
+
+.peervault-pairing-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.peervault-btn {
+  padding: 6px 16px;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  transition: all 0.15s ease;
+}
+
+.peervault-btn-accept {
+  background: var(--color-green);
+  color: white;
+}
+
+.peervault-btn-accept:hover {
+  filter: brightness(1.1);
+}
+
+.peervault-btn-deny {
+  background: var(--background-modifier-border);
+  color: var(--text-normal);
+}
+
+.peervault-btn-deny:hover {
+  background: var(--background-modifier-error);
+  color: white;
+}
