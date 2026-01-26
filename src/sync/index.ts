@@ -16,7 +16,7 @@ export {
   type AnySyncMessage,
   type SyncSessionState,
   type SyncSessionEvents,
-} from './types';
+} from "./types";
 
 export {
   serializeMessage,
@@ -32,6 +32,6 @@ export {
   createBlobRequestMessage,
   createBlobDataMessage,
   createBlobSyncCompleteMessage,
-} from './messages';
+} from "./messages";
 
-export { SyncSession, type SyncSessionConfig } from './sync-session';
+export { SyncSession, type SyncSessionConfig } from "./sync-session";

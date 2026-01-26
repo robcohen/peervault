@@ -7,4 +7,4 @@ export {
   importKey,
   keyToRecoveryPhrase,
   recoveryPhraseToKey,
-} from './encryption';
+} from "./encryption";

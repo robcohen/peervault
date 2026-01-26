@@ -1070,3 +1070,101 @@
 .peervault-status-syncing {
   animation: peervault-pulse 1.5s ease-in-out infinite;
 }
+
+/* ===========================================================================
+   Group Modal
+   =========================================================================== */
+
+.peervault-group-modal,
+.peervault-group-peers-modal {
+  padding: 0;
+}
+
+.peervault-group-modal h3 {
+  margin-top: 24px;
+  margin-bottom: 12px;
+  font-size: 14px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.peervault-group-modal h3:first-of-type {
+  margin-top: 0;
+}
+
+/* Icon Picker */
+.peervault-icon-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.peervault-icon-btn {
+  width: 36px;
+  height: 36px;
+  border: 2px solid var(--background-modifier-border);
+  border-radius: 8px;
+  background: var(--background-secondary);
+  font-size: 18px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.peervault-icon-btn:hover {
+  border-color: var(--interactive-accent);
+  background: var(--background-modifier-hover);
+}
+
+.peervault-icon-btn.selected {
+  border-color: var(--interactive-accent);
+  background: var(--interactive-accent);
+  box-shadow: 0 0 0 2px var(--interactive-accent-hover);
+}
+
+/* Color Picker */
+.peervault-color-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.peervault-color-btn {
+  width: 28px;
+  height: 28px;
+  border: 2px solid transparent;
+  border-radius: 50%;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.peervault-color-btn:hover {
+  transform: scale(1.1);
+}
+
+.peervault-color-btn.selected {
+  border-color: var(--text-normal);
+  box-shadow: 0 0 0 2px var(--background-primary), 0 0 0 4px var(--interactive-accent);
+}
+
+/* Group folder tree (smaller version) */
+.peervault-group-folder-tree {
+  max-height: 200px;
+}
+
+/* ===========================================================================
+   Settings Tab - Device Groups Section
+   =========================================================================== */
+
+.peervault-settings .setting-item[data-group] {
+  border-left: 3px solid var(--background-modifier-border);
+  padding-left: 12px;
+  margin-left: 0;
+}
+
+.peervault-settings .setting-item[data-group]:hover {
+  border-left-color: var(--interactive-accent);
+}

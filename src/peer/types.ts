@@ -5,7 +5,13 @@
  */
 
 /** Peer state */
-export type PeerState = 'unknown' | 'connecting' | 'syncing' | 'synced' | 'offline' | 'error';
+export type PeerState =
+  | "unknown"
+  | "connecting"
+  | "syncing"
+  | "synced"
+  | "offline"
+  | "error";
 
 /** Information about a known peer */
 export interface PeerInfo {
@@ -32,6 +38,9 @@ export interface PeerInfo {
 
   /** Whether this peer is trusted (can write) */
   trusted: boolean;
+
+  /** Groups this peer belongs to */
+  groupIds?: string[];
 }
 
 /** Serialized peer info for storage */
@@ -43,16 +52,17 @@ export interface StoredPeerInfo {
   lastSynced?: number;
   lastSeen?: number;
   trusted: boolean;
+  groupIds?: string[];
 }
 
 /** Events from peer manager */
 export interface PeerManagerEvents {
-  'peer:connected': { peer: PeerInfo };
-  'peer:disconnected': { nodeId: string; reason?: string };
-  'peer:synced': { nodeId: string };
-  'peer:error': { nodeId: string; error: Error };
-  'peer:discovered': { peer: PeerInfo };
-  'status:change': { status: 'idle' | 'syncing' | 'offline' | 'error' };
+  "peer:connected": { peer: PeerInfo };
+  "peer:disconnected": { nodeId: string; reason?: string };
+  "peer:synced": { nodeId: string };
+  "peer:error": { nodeId: string; error: Error };
+  "peer:discovered": { peer: PeerInfo };
+  "status:change": { status: "idle" | "syncing" | "offline" | "error" };
 }
 
 /** Peer manager configuration */

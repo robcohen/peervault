@@ -4,6 +4,17 @@ export type {
   PeerState,
   PeerManagerConfig,
   PeerManagerEvents,
-} from './types';
+} from "./types";
 
-export { PeerManager } from './peer-manager';
+export { PeerManager } from "./peer-manager";
+
+// Peer groups
+export {
+  PeerGroupManager,
+  DEFAULT_GROUP_ID,
+  DEFAULT_GROUP,
+  DEFAULT_SYNC_POLICY,
+  type PeerGroup,
+  type GroupSyncPolicy,
+  type PeerGroupEvents,
+} from "./groups";

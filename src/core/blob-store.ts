@@ -5,11 +5,11 @@
  * The Loro document only stores references (hashes) to blobs.
  */
 
-import type { StorageAdapter } from '../types';
-import type { Logger } from '../utils/logger';
+import type { StorageAdapter } from "../types";
+import type { Logger } from "../utils/logger";
 
-const BLOB_PREFIX = 'blob:';
-const BLOB_META_PREFIX = 'blob-meta:';
+const BLOB_PREFIX = "blob:";
+const BLOB_META_PREFIX = "blob-meta:";
 
 /** Metadata stored for each blob */
 export interface BlobMeta {
@@ -26,14 +26,17 @@ export interface BlobMeta {
 export class BlobStore {
   constructor(
     private storage: StorageAdapter,
-    private logger: Logger
+    private logger: Logger,
   ) {}
 
   /**
    * Add content to the blob store.
    * Returns the content hash.
    */
-  async add(content: Uint8Array, mimeType: string = 'application/octet-stream'): Promise<string> {
+  async add(
+    content: Uint8Array,
+    mimeType: string = "application/octet-stream",
+  ): Promise<string> {
     const hash = await this.hashContent(content);
 
     // Check if blob already exists
@@ -42,7 +45,7 @@ export class BlobStore {
       // Increment reference count
       existing.refCount++;
       await this.saveMeta(hash, existing);
-      this.logger.debug('Blob already exists, incremented ref count:', hash);
+      this.logger.debug("Blob already exists, incremented ref count:", hash);
       return hash;
     }
 
@@ -59,7 +62,7 @@ export class BlobStore {
     };
     await this.saveMeta(hash, meta);
 
-    this.logger.debug('Added blob:', hash, 'size:', content.length);
+    this.logger.debug("Added blob:", hash, "size:", content.length);
     return hash;
   }
 
@@ -112,10 +115,15 @@ export class BlobStore {
       // Remove blob and metadata
       await this.storage.delete(BLOB_PREFIX + hash);
       await this.storage.delete(BLOB_META_PREFIX + hash);
-      this.logger.debug('Removed blob (ref count 0):', hash);
+      this.logger.debug("Removed blob (ref count 0):", hash);
     } else {
       await this.saveMeta(hash, meta);
-      this.logger.debug('Decremented blob ref count:', hash, 'new count:', meta.refCount);
+      this.logger.debug(
+        "Decremented blob ref count:",
+        hash,
+        "new count:",
+        meta.refCount,
+      );
     }
   }
 
@@ -152,17 +160,83 @@ export class BlobStore {
   }
 
   /**
+   * Find orphaned blobs that are not referenced by the document.
+   *
+   * @param referencedHashes Set of hashes that are currently referenced
+   * @returns List of orphaned blob info
+   */
+  async findOrphans(
+    referencedHashes: Set<string>,
+  ): Promise<Array<{ hash: string; size: number; createdAt?: number }>> {
+    const allHashes = await this.list();
+    const orphans: Array<{ hash: string; size: number; createdAt?: number }> =
+      [];
+
+    for (const hash of allHashes) {
+      if (!referencedHashes.has(hash)) {
+        const meta = await this.getMeta(hash);
+        if (meta) {
+          orphans.push({
+            hash,
+            size: meta.size,
+            createdAt: meta.createdAt,
+          });
+        }
+      }
+    }
+
+    return orphans;
+  }
+
+  /**
+   * Remove orphaned blobs that are not referenced by the document.
+   *
+   * @param referencedHashes Set of hashes that are currently referenced
+   * @returns Number of bytes reclaimed
+   */
+  async cleanOrphans(
+    referencedHashes: Set<string>,
+  ): Promise<{ count: number; bytesReclaimed: number }> {
+    const orphans = await this.findOrphans(referencedHashes);
+    let bytesReclaimed = 0;
+
+    for (const orphan of orphans) {
+      try {
+        await this.storage.delete(BLOB_PREFIX + orphan.hash);
+        await this.storage.delete(BLOB_META_PREFIX + orphan.hash);
+        bytesReclaimed += orphan.size;
+        this.logger.debug(
+          "Removed orphan blob:",
+          orphan.hash,
+          "size:",
+          orphan.size,
+        );
+      } catch (error) {
+        this.logger.warn("Failed to remove orphan blob:", orphan.hash, error);
+      }
+    }
+
+    if (orphans.length > 0) {
+      this.logger.info(
+        `Cleaned ${orphans.length} orphan blobs, reclaimed ${bytesReclaimed} bytes`,
+      );
+    }
+
+    return { count: orphans.length, bytesReclaimed };
+  }
+
+  /**
    * Compute SHA-256 hash of content.
    */
   private async hashContent(content: Uint8Array): Promise<string> {
     // Create a new ArrayBuffer to avoid SharedArrayBuffer issues
     const buffer = new ArrayBuffer(content.length);
     new Uint8Array(buffer).set(content);
-    const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+    const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
     const hashArray = new Uint8Array(hashBuffer);
     return Array.from(hashArray)
-      .map((b) => b.toString(16).padStart(2, '0'))
-      .join('');
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
   }
 
   /**
@@ -178,58 +252,58 @@ export class BlobStore {
  * Determine if a file should be stored as a blob (binary) vs text.
  */
 export function isBinaryFile(filename: string): boolean {
-  const ext = filename.split('.').pop()?.toLowerCase() ?? '';
+  const ext = filename.split(".").pop()?.toLowerCase() ?? "";
 
   const binaryExtensions = new Set([
     // Images
-    'png',
-    'jpg',
-    'jpeg',
-    'gif',
-    'webp',
-    'svg',
-    'ico',
-    'bmp',
-    'tiff',
-    'tif',
+    "png",
+    "jpg",
+    "jpeg",
+    "gif",
+    "webp",
+    "svg",
+    "ico",
+    "bmp",
+    "tiff",
+    "tif",
     // Audio
-    'mp3',
-    'wav',
-    'm4a',
-    'ogg',
-    'flac',
-    'aac',
+    "mp3",
+    "wav",
+    "m4a",
+    "ogg",
+    "flac",
+    "aac",
     // Video
-    'mp4',
-    'webm',
-    'mov',
-    'avi',
-    'mkv',
+    "mp4",
+    "webm",
+    "mov",
+    "avi",
+    "mkv",
     // Documents
-    'pdf',
-    'doc',
-    'docx',
-    'xls',
-    'xlsx',
-    'ppt',
-    'pptx',
+    "pdf",
+    "doc",
+    "docx",
+    "xls",
+    "xlsx",
+    "ppt",
+    "pptx",
     // Archives
-    'zip',
-    'tar',
-    'gz',
-    'rar',
-    '7z',
+    "zip",
+    "tar",
+    "gz",
+    "rar",
+    "7z",
     // Other
-    'exe',
-    'dll',
-    'so',
-    'dylib',
-    'wasm',
-    'ttf',
-    'otf',
-    'woff',
-    'woff2',
-    'eot',
+    "exe",
+    "dll",
+    "so",
+    "dylib",
+    "wasm",
+    "ttf",
+    "otf",
+    "woff",
+    "woff2",
+    "eot",
   ]);
 
   return binaryExtensions.has(ext);
@@ -239,51 +313,51 @@ export function isBinaryFile(filename: string): boolean {
  * Get MIME type for a filename.
  */
 export function getMimeType(filename: string): string {
-  const ext = filename.split('.').pop()?.toLowerCase() ?? '';
+  const ext = filename.split(".").pop()?.toLowerCase() ?? "";
 
   const mimeTypes: Record<string, string> = {
     // Text
-    md: 'text/markdown',
-    txt: 'text/plain',
-    json: 'application/json',
-    css: 'text/css',
-    js: 'application/javascript',
-    ts: 'application/typescript',
-    html: 'text/html',
-    xml: 'application/xml',
-    yaml: 'application/yaml',
-    yml: 'application/yaml',
+    md: "text/markdown",
+    txt: "text/plain",
+    json: "application/json",
+    css: "text/css",
+    js: "application/javascript",
+    ts: "application/typescript",
+    html: "text/html",
+    xml: "application/xml",
+    yaml: "application/yaml",
+    yml: "application/yaml",
     // Images
-    png: 'image/png',
-    jpg: 'image/jpeg',
-    jpeg: 'image/jpeg',
-    gif: 'image/gif',
-    webp: 'image/webp',
-    svg: 'image/svg+xml',
-    ico: 'image/x-icon',
-    bmp: 'image/bmp',
+    png: "image/png",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    gif: "image/gif",
+    webp: "image/webp",
+    svg: "image/svg+xml",
+    ico: "image/x-icon",
+    bmp: "image/bmp",
     // Audio
-    mp3: 'audio/mpeg',
-    wav: 'audio/wav',
-    m4a: 'audio/mp4',
-    ogg: 'audio/ogg',
-    flac: 'audio/flac',
+    mp3: "audio/mpeg",
+    wav: "audio/wav",
+    m4a: "audio/mp4",
+    ogg: "audio/ogg",
+    flac: "audio/flac",
     // Video
-    mp4: 'video/mp4',
-    webm: 'video/webm',
-    mov: 'video/quicktime',
+    mp4: "video/mp4",
+    webm: "video/webm",
+    mov: "video/quicktime",
     // Documents
-    pdf: 'application/pdf',
+    pdf: "application/pdf",
     // Archives
-    zip: 'application/zip',
-    tar: 'application/x-tar',
-    gz: 'application/gzip',
+    zip: "application/zip",
+    tar: "application/x-tar",
+    gz: "application/gzip",
     // Fonts
-    ttf: 'font/ttf',
-    otf: 'font/otf',
-    woff: 'font/woff',
-    woff2: 'font/woff2',
+    ttf: "font/ttf",
+    otf: "font/otf",
+    woff: "font/woff",
+    woff2: "font/woff2",
   };
 
-  return mimeTypes[ext] ?? 'application/octet-stream';
+  return mimeTypes[ext] ?? "application/octet-stream";
 }

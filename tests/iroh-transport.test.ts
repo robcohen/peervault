@@ -87,7 +87,6 @@ describe('Iroh Transport', () => {
       expect(exports.IrohTransport).toBeDefined();
       expect(exports.initIrohWasm).toBeDefined();
       expect(exports.isIrohWasmReady).toBeDefined();
-      expect(exports.MockTransport).toBeDefined();
     });
   });
 });

@@ -5,18 +5,22 @@
  */
 
 /** ALPN protocol identifier for PeerVault sync */
-export const PEERVAULT_ALPN = new TextEncoder().encode('peervault/sync/1');
+export const PEERVAULT_ALPN = new TextEncoder().encode("peervault/sync/1");
 
 /** Transport connection state */
-export type ConnectionState = 'connecting' | 'connected' | 'disconnected' | 'error';
+export type ConnectionState =
+  | "connecting"
+  | "connected"
+  | "disconnected"
+  | "error";
 
 /** Transport events */
 export interface TransportEvents {
-  'connection:incoming': { connection: PeerConnection };
-  'connection:established': { peerId: string };
-  'connection:lost': { peerId: string; reason?: string };
-  'connection:error': { peerId: string; error: Error };
-  'state:change': { state: ConnectionState };
+  "connection:incoming": { connection: PeerConnection };
+  "connection:established": { peerId: string };
+  "connection:lost": { peerId: string; reason?: string };
+  "connection:error": { peerId: string; error: Error };
+  "state:change": { state: ConnectionState };
 }
 
 /**

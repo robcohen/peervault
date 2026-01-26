@@ -4,13 +4,18 @@
 
 type EventCallback<T = unknown> = (data: T) => void;
 
-export class EventEmitter<Events extends Record<string, unknown> = Record<string, unknown>> {
+export class EventEmitter<
+  Events extends Record<string, unknown> = Record<string, unknown>,
+> {
   private listeners = new Map<keyof Events, Set<EventCallback<unknown>>>();
 
   /**
    * Subscribe to an event.
    */
-  on<K extends keyof Events>(event: K, callback: EventCallback<Events[K]>): () => void {
+  on<K extends keyof Events>(
+    event: K,
+    callback: EventCallback<Events[K]>,
+  ): () => void {
     if (!this.listeners.has(event)) {
       this.listeners.set(event, new Set());
     }
@@ -24,7 +29,10 @@ export class EventEmitter<Events extends Record<string, unknown> = Record<string
   /**
    * Subscribe to an event once.
    */
-  once<K extends keyof Events>(event: K, callback: EventCallback<Events[K]>): () => void {
+  once<K extends keyof Events>(
+    event: K,
+    callback: EventCallback<Events[K]>,
+  ): () => void {
     const wrapper: EventCallback<Events[K]> = (data) => {
       this.off(event, wrapper);
       callback(data);
@@ -36,7 +44,10 @@ export class EventEmitter<Events extends Record<string, unknown> = Record<string
   /**
    * Unsubscribe from an event.
    */
-  off<K extends keyof Events>(event: K, callback: EventCallback<Events[K]>): void {
+  off<K extends keyof Events>(
+    event: K,
+    callback: EventCallback<Events[K]>,
+  ): void {
     this.listeners.get(event)?.delete(callback as EventCallback<unknown>);
   }
 
@@ -50,7 +61,10 @@ export class EventEmitter<Events extends Record<string, unknown> = Record<string
         try {
           callback(data);
         } catch (error) {
-          console.error(`Error in event handler for "${String(event)}":`, error);
+          console.error(
+            `Error in event handler for "${String(event)}":`,
+            error,
+          );
         }
       }
     }

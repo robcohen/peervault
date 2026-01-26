@@ -1,7 +1,7 @@
-export { PeerVaultSettingsTab } from './settings-tab';
-export { PeerVaultStatusModal } from './status-modal';
-export { AddDeviceModal, ShowInviteModal } from './add-device-modal';
-export { PairingModal } from './pairing-modal';
+export { PeerVaultSettingsTab } from "./settings-tab";
+export { PeerVaultStatusModal } from "./status-modal";
+export { AddDeviceModal, ShowInviteModal } from "./add-device-modal";
+export { PairingModal } from "./pairing-modal";
 export {
   MergeDetailModal,
   MergeHistoryModal,
@@ -9,7 +9,7 @@ export {
   getRecentMerges,
   clearMergeHistory,
   type MergeInfo,
-} from './merge-notification';
+} from "./merge-notification";
 export {
   ConnectionStatusManager,
   ConnectionStatusModal,
@@ -20,8 +20,9 @@ export {
   getSyncProgress,
   type SyncProgress,
   type SyncError,
-} from './connection-status';
-export { FileHistoryModal, type FileVersion } from './file-history-modal';
-export { SelectiveSyncModal } from './selective-sync-modal';
-export { EncryptionModal } from './encryption-modal';
-export { ConflictModal } from './conflict-modal';
+} from "./connection-status";
+export { FileHistoryModal, type FileVersion } from "./file-history-modal";
+export { SelectiveSyncModal } from "./selective-sync-modal";
+export { EncryptionModal } from "./encryption-modal";
+export { ConflictModal } from "./conflict-modal";
+export { GroupModal, GroupPeersModal } from "./group-modal";

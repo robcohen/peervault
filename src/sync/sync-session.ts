@@ -4,11 +4,11 @@
  * Manages the sync protocol state machine for a single peer connection.
  */
 
-import type { SyncStream } from '../transport';
-import type { DocumentManager } from '../core/document-manager';
-import type { BlobStore } from '../core/blob-store';
-import type { Logger } from '../utils/logger';
-import type { EncryptionService } from '../crypto';
+import type { SyncStream } from "../transport";
+import type { DocumentManager } from "../core/document-manager";
+import type { BlobStore } from "../core/blob-store";
+import type { Logger } from "../utils/logger";
+import type { EncryptionService } from "../crypto";
 import {
   SyncMessageType,
   SyncErrorCode,
@@ -19,7 +19,7 @@ import {
   type BlobHashesMessage,
   type BlobRequestMessage,
   type BlobDataMessage,
-} from './types';
+} from "./types";
 import {
   serializeMessage,
   deserializeMessage,
@@ -33,8 +33,8 @@ import {
   createBlobRequestMessage,
   createBlobDataMessage,
   createBlobSyncCompleteMessage,
-} from './messages';
-import { EventEmitter } from '../utils/events';
+} from "./messages";
+import { EventEmitter } from "../utils/events";
 
 /** Sync session configuration */
 export interface SyncSessionConfig {
@@ -49,18 +49,24 @@ export interface SyncSessionConfig {
 
   /** Encryption service for E2E encryption */
   encryption?: EncryptionService;
+
+  /** If true, don't import updates from this peer (they can only receive) */
+  peerIsReadOnly?: boolean;
 }
 
-const DEFAULT_CONFIG: Omit<Required<SyncSessionConfig>, 'encryption'> = {
+const DEFAULT_CONFIG: Omit<Required<SyncSessionConfig>, "encryption"> & {
+  peerIsReadOnly: boolean;
+} = {
   pingInterval: 30000,
   pingTimeout: 10000,
   maxRetries: 3,
+  peerIsReadOnly: false,
 };
 
 /** Sync session events */
 interface SyncSessionEvents extends Record<string, unknown> {
-  'state:change': SyncSessionState;
-  'sync:complete': void;
+  "state:change": SyncSessionState;
+  "sync:complete": void;
   error: Error;
 }
 
@@ -68,11 +74,13 @@ interface SyncSessionEvents extends Record<string, unknown> {
  * Manages sync protocol with a single peer.
  */
 export class SyncSession extends EventEmitter<SyncSessionEvents> {
-  private state: SyncSessionState = 'idle';
+  private state: SyncSessionState = "idle";
   private stream: SyncStream | null = null;
   private pingSeq = 0;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
-  private config: Omit<Required<SyncSessionConfig>, 'encryption'> & { encryption?: EncryptionService };
+  private config: Omit<Required<SyncSessionConfig>, "encryption"> & {
+    encryption?: EncryptionService;
+  };
   private aborted = false;
 
   constructor(
@@ -80,7 +88,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     private documentManager: DocumentManager,
     private logger: Logger,
     config?: SyncSessionConfig,
-    private blobStore?: BlobStore
+    private blobStore?: BlobStore,
   ) {
     super();
     this.config = { ...DEFAULT_CONFIG, ...config };
@@ -104,13 +112,13 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
    * Start sync with the given stream.
    */
   async startSync(stream: SyncStream): Promise<void> {
-    if (this.state !== 'idle' && this.state !== 'error') {
+    if (this.state !== "idle" && this.state !== "error") {
       throw new Error(`Cannot start sync in state: ${this.state}`);
     }
 
     this.stream = stream;
     this.aborted = false;
-    this.setState('exchanging_versions');
+    this.setState("exchanging_versions");
 
     try {
       // Step 1: Exchange version vectors
@@ -119,7 +127,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       if (this.aborted) return;
 
       // Step 2: Sync document updates
-      this.setState('syncing');
+      this.setState("syncing");
       await this.syncUpdates();
 
       if (this.aborted) return;
@@ -131,15 +139,15 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       }
 
       // Step 4: Enter live mode
-      this.setState('live');
+      this.setState("live");
       this.startPingTimer();
       this.startLiveLoop();
 
-      this.emit('sync:complete', undefined);
+      this.emit("sync:complete", undefined);
     } catch (error) {
-      this.logger.error('Sync session error:', error);
-      this.setState('error');
-      this.emit('error', error as Error);
+      this.logger.error("Sync session error:", error);
+      this.setState("error");
+      this.emit("error", error as Error);
     }
   }
 
@@ -147,13 +155,13 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
    * Handle incoming sync from a peer (we accepted their connection).
    */
   async handleIncomingSync(stream: SyncStream): Promise<void> {
-    if (this.state !== 'idle') {
+    if (this.state !== "idle") {
       throw new Error(`Cannot handle incoming sync in state: ${this.state}`);
     }
 
     this.stream = stream;
     this.aborted = false;
-    this.setState('exchanging_versions');
+    this.setState("exchanging_versions");
 
     try {
       // Wait for peer's version info first
@@ -169,20 +177,23 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       const ourVaultId = this.documentManager.getVaultId();
       if (peerVersionInfo.vaultId !== ourVaultId) {
         await this.sendMessage(
-          createErrorMessage(SyncErrorCode.VAULT_MISMATCH, 'Vault ID mismatch')
+          createErrorMessage(SyncErrorCode.VAULT_MISMATCH, "Vault ID mismatch"),
         );
-        throw new Error('Vault ID mismatch');
+        throw new Error("Vault ID mismatch");
       }
 
       // Send our version info
       await this.sendMessage(
-        createVersionInfoMessage(ourVaultId, this.documentManager.getVersionBytes())
+        createVersionInfoMessage(
+          ourVaultId,
+          this.documentManager.getVersionBytes(),
+        ),
       );
 
       if (this.aborted) return;
 
       // Step 2: Sync document updates
-      this.setState('syncing');
+      this.setState("syncing");
       await this.syncUpdatesAsReceiver(peerVersionInfo.versionBytes);
 
       if (this.aborted) return;
@@ -194,15 +205,15 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       }
 
       // Step 4: Enter live mode
-      this.setState('live');
+      this.setState("live");
       this.startPingTimer();
       this.startLiveLoop();
 
-      this.emit('sync:complete', undefined);
+      this.emit("sync:complete", undefined);
     } catch (error) {
-      this.logger.error('Incoming sync session error:', error);
-      this.setState('error');
-      this.emit('error', error as Error);
+      this.logger.error("Incoming sync session error:", error);
+      this.setState("error");
+      this.emit("error", error as Error);
     }
   }
 
@@ -210,15 +221,15 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
    * Send a local update to the peer (for live sync).
    */
   async sendUpdate(updates: Uint8Array): Promise<void> {
-    if (this.state !== 'live' || !this.stream) {
-      this.logger.warn('Cannot send update: not in live state');
+    if (this.state !== "live" || !this.stream) {
+      this.logger.warn("Cannot send update: not in live state");
       return;
     }
 
     try {
       await this.sendMessage(createUpdatesMessage(updates, 0)); // opCount unknown
     } catch (error) {
-      this.logger.error('Failed to send update:', error);
+      this.logger.error("Failed to send update:", error);
     }
   }
 
@@ -238,7 +249,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       this.stream = null;
     }
 
-    this.setState('closed');
+    this.setState("closed");
   }
 
   // ===========================================================================
@@ -250,7 +261,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
 
     this.logger.debug(`Sync session ${this.peerId}: ${this.state} -> ${state}`);
     this.state = state;
-    this.emit('state:change', state);
+    this.emit("state:change", state);
   }
 
   // ===========================================================================
@@ -275,11 +286,13 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
 
     // Validate vault ID
     if (peerVersionInfo.vaultId !== vaultId) {
-      await this.sendMessage(createErrorMessage(SyncErrorCode.VAULT_MISMATCH, 'Vault ID mismatch'));
-      throw new Error('Vault ID mismatch');
+      await this.sendMessage(
+        createErrorMessage(SyncErrorCode.VAULT_MISMATCH, "Vault ID mismatch"),
+      );
+      throw new Error("Vault ID mismatch");
     }
 
-    this.logger.debug('Version exchange complete');
+    this.logger.debug("Version exchange complete");
   }
 
   // ===========================================================================
@@ -304,11 +317,17 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     if (peerMessage.type === SyncMessageType.UPDATES) {
       const updatesMsg = peerMessage as UpdatesMessage;
       if (updatesMsg.updates.length > 0) {
-        this.documentManager.importUpdates(updatesMsg.updates);
-        this.logger.debug('Imported updates from peer');
+        if (this.config.peerIsReadOnly) {
+          this.logger.debug("Skipping updates from read-only peer");
+        } else {
+          this.documentManager.importUpdates(updatesMsg.updates);
+          this.logger.debug("Imported updates from peer");
+        }
       }
     } else if (peerMessage.type === SyncMessageType.ERROR) {
-      throw new Error(`Peer error: ${(peerMessage as { message: string }).message}`);
+      throw new Error(
+        `Peer error: ${(peerMessage as { message: string }).message}`,
+      );
     }
 
     // Send sync complete
@@ -318,28 +337,36 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     // Wait for peer's sync complete
     const completeMsg = await this.receiveMessage();
     if (completeMsg.type !== SyncMessageType.SYNC_COMPLETE) {
-      this.logger.warn('Expected SYNC_COMPLETE, got:', completeMsg.type);
+      this.logger.warn("Expected SYNC_COMPLETE, got:", completeMsg.type);
     }
 
-    this.logger.debug('Sync complete');
+    this.logger.debug("Sync complete");
   }
 
   // ===========================================================================
   // Private: Update Sync (Receiver)
   // ===========================================================================
 
-  private async syncUpdatesAsReceiver(peerVersionBytes: Uint8Array): Promise<void> {
+  private async syncUpdatesAsReceiver(
+    peerVersionBytes: Uint8Array,
+  ): Promise<void> {
     // Wait for peer's updates first
     const peerMessage = await this.receiveMessage();
 
     if (peerMessage.type === SyncMessageType.UPDATES) {
       const updatesMsg = peerMessage as UpdatesMessage;
       if (updatesMsg.updates.length > 0) {
-        this.documentManager.importUpdates(updatesMsg.updates);
-        this.logger.debug('Imported updates from peer');
+        if (this.config.peerIsReadOnly) {
+          this.logger.debug("Skipping updates from read-only peer");
+        } else {
+          this.documentManager.importUpdates(updatesMsg.updates);
+          this.logger.debug("Imported updates from peer");
+        }
       }
     } else if (peerMessage.type === SyncMessageType.ERROR) {
-      throw new Error(`Peer error: ${(peerMessage as { message: string }).message}`);
+      throw new Error(
+        `Peer error: ${(peerMessage as { message: string }).message}`,
+      );
     }
 
     // Send our updates
@@ -354,14 +381,14 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     // Wait for sync complete
     const completeMsg = await this.receiveMessage();
     if (completeMsg.type !== SyncMessageType.SYNC_COMPLETE) {
-      this.logger.warn('Expected SYNC_COMPLETE, got:', completeMsg.type);
+      this.logger.warn("Expected SYNC_COMPLETE, got:", completeMsg.type);
     }
 
     // Send our sync complete
     const finalVersion = this.documentManager.getVersionBytes();
     await this.sendMessage(createSyncCompleteMessage(finalVersion));
 
-    this.logger.debug('Sync complete (receiver)');
+    this.logger.debug("Sync complete (receiver)");
   }
 
   // ===========================================================================
@@ -381,7 +408,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
 
     // Get our blob hashes
     const ourHashes = await this.blobStore.list();
-    this.logger.debug('Syncing blobs, we have:', ourHashes.length);
+    this.logger.debug("Syncing blobs, we have:", ourHashes.length);
 
     // Send our blob hashes
     await this.sendMessage(createBlobHashesMessage(ourHashes));
@@ -393,16 +420,16 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     }
 
     const peerHashes = (peerMessage as BlobHashesMessage).hashes;
-    this.logger.debug('Peer has blobs:', peerHashes.length);
+    this.logger.debug("Peer has blobs:", peerHashes.length);
 
     // Find blobs we're missing
     const missingFromUs = await this.blobStore.getMissing(peerHashes);
-    this.logger.debug('Missing from us:', missingFromUs.length);
+    this.logger.debug("Missing from us:", missingFromUs.length);
 
     // Find blobs peer is missing
     const peerSet = new Set(peerHashes);
     const missingFromPeer = ourHashes.filter((h) => !peerSet.has(h));
-    this.logger.debug('Missing from peer:', missingFromPeer.length);
+    this.logger.debug("Missing from peer:", missingFromPeer.length);
 
     // Request blobs we're missing
     if (missingFromUs.length > 0) {
@@ -418,14 +445,16 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     }
 
     const peerWants = (peerRequest as BlobRequestMessage).hashes;
-    this.logger.debug('Peer wants:', peerWants.length);
+    this.logger.debug("Peer wants:", peerWants.length);
 
     // Send blobs peer wants
     for (const hash of peerWants) {
       const data = await this.blobStore.get(hash);
       if (data) {
         const meta = await this.blobStore.getMeta(hash);
-        await this.sendMessage(createBlobDataMessage(hash, data, meta?.mimeType));
+        await this.sendMessage(
+          createBlobDataMessage(hash, data, meta?.mimeType),
+        );
       }
     }
 
@@ -440,7 +469,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
         const blobMsg = msg as BlobDataMessage;
         await this.blobStore.add(blobMsg.data, blobMsg.mimeType);
         received++;
-        this.logger.debug('Received blob:', blobMsg.hash);
+        this.logger.debug("Received blob:", blobMsg.hash);
       } else if (msg.type === SyncMessageType.BLOB_SYNC_COMPLETE) {
         // Peer is done sending
         break;
@@ -453,11 +482,11 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     if (received === missingFromUs.length) {
       const completeMsg = await this.receiveMessage();
       if (completeMsg.type !== SyncMessageType.BLOB_SYNC_COMPLETE) {
-        this.logger.warn('Expected BLOB_SYNC_COMPLETE, got:', completeMsg.type);
+        this.logger.warn("Expected BLOB_SYNC_COMPLETE, got:", completeMsg.type);
       }
     }
 
-    this.logger.debug('Blob sync complete');
+    this.logger.debug("Blob sync complete");
   }
 
   // ===========================================================================
@@ -482,12 +511,12 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     }
 
     const peerHashes = (peerMessage as BlobHashesMessage).hashes;
-    this.logger.debug('Peer has blobs:', peerHashes.length);
+    this.logger.debug("Peer has blobs:", peerHashes.length);
 
     // Get our blob hashes and send them
     const ourHashes = await this.blobStore.list();
     await this.sendMessage(createBlobHashesMessage(ourHashes));
-    this.logger.debug('We have blobs:', ourHashes.length);
+    this.logger.debug("We have blobs:", ourHashes.length);
 
     // Wait for peer's blob request
     const peerRequest = await this.receiveMessage();
@@ -496,11 +525,11 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     }
 
     const peerWants = (peerRequest as BlobRequestMessage).hashes;
-    this.logger.debug('Peer wants:', peerWants.length);
+    this.logger.debug("Peer wants:", peerWants.length);
 
     // Find blobs we're missing and request them
     const missingFromUs = await this.blobStore.getMissing(peerHashes);
-    this.logger.debug('Missing from us:', missingFromUs.length);
+    this.logger.debug("Missing from us:", missingFromUs.length);
 
     if (missingFromUs.length > 0) {
       await this.sendMessage(createBlobRequestMessage(missingFromUs));
@@ -516,7 +545,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
         const blobMsg = msg as BlobDataMessage;
         await this.blobStore.add(blobMsg.data, blobMsg.mimeType);
         received++;
-        this.logger.debug('Received blob:', blobMsg.hash);
+        this.logger.debug("Received blob:", blobMsg.hash);
       } else if (msg.type === SyncMessageType.BLOB_SYNC_COMPLETE) {
         // Peer is done sending
         break;
@@ -529,7 +558,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     if (received === missingFromUs.length && missingFromUs.length > 0) {
       const completeMsg = await this.receiveMessage();
       if (completeMsg.type !== SyncMessageType.BLOB_SYNC_COMPLETE) {
-        this.logger.warn('Expected BLOB_SYNC_COMPLETE, got:', completeMsg.type);
+        this.logger.warn("Expected BLOB_SYNC_COMPLETE, got:", completeMsg.type);
       }
     }
 
@@ -538,14 +567,16 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       const data = await this.blobStore.get(hash);
       if (data) {
         const meta = await this.blobStore.getMeta(hash);
-        await this.sendMessage(createBlobDataMessage(hash, data, meta?.mimeType));
+        await this.sendMessage(
+          createBlobDataMessage(hash, data, meta?.mimeType),
+        );
       }
     }
 
     // Send our blob sync complete
     await this.sendMessage(createBlobSyncCompleteMessage(peerWants.length));
 
-    this.logger.debug('Blob sync complete (receiver)');
+    this.logger.debug("Blob sync complete (receiver)");
   }
 
   // ===========================================================================
@@ -553,7 +584,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
   // ===========================================================================
 
   private async startLiveLoop(): Promise<void> {
-    while (this.state === 'live' && this.stream && !this.aborted) {
+    while (this.state === "live" && this.stream && !this.aborted) {
       try {
         const message = await this.receiveMessage();
 
@@ -561,8 +592,12 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
           case SyncMessageType.UPDATES: {
             const updatesMsg = message as UpdatesMessage;
             if (updatesMsg.updates.length > 0) {
-              this.documentManager.importUpdates(updatesMsg.updates);
-              this.logger.debug('Imported live update from peer');
+              if (this.config.peerIsReadOnly) {
+                this.logger.debug("Skipping live update from read-only peer");
+              } else {
+                this.documentManager.importUpdates(updatesMsg.updates);
+                this.logger.debug("Imported live update from peer");
+              }
             }
             break;
           }
@@ -580,19 +615,19 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
 
           case SyncMessageType.ERROR: {
             const errorMsg = message as { message: string };
-            this.logger.error('Peer error:', errorMsg.message);
-            this.setState('error');
+            this.logger.error("Peer error:", errorMsg.message);
+            this.setState("error");
             return;
           }
 
           default:
-            this.logger.warn('Unexpected message in live mode:', message.type);
+            this.logger.warn("Unexpected message in live mode:", message.type);
         }
       } catch (error) {
         if (!this.aborted) {
-          this.logger.error('Live loop error:', error);
-          this.setState('error');
-          this.emit('error', error as Error);
+          this.logger.error("Live loop error:", error);
+          this.setState("error");
+          this.emit("error", error as Error);
         }
         return;
       }
@@ -605,9 +640,9 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
 
   private startPingTimer(): void {
     this.pingTimer = setInterval(() => {
-      if (this.state === 'live' && this.stream) {
+      if (this.state === "live" && this.stream) {
         this.sendMessage(createPingMessage(++this.pingSeq)).catch((err) => {
-          this.logger.error('Failed to send ping:', err);
+          this.logger.error("Failed to send ping:", err);
         });
       }
     }, this.config.pingInterval);
@@ -626,7 +661,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
 
   private async sendMessage(message: AnySyncMessage): Promise<void> {
     if (!this.stream) {
-      throw new Error('No stream available');
+      throw new Error("No stream available");
     }
 
     let bytes = serializeMessage(message);
@@ -641,7 +676,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
 
   private async receiveMessage(): Promise<AnySyncMessage> {
     if (!this.stream) {
-      throw new Error('No stream available');
+      throw new Error("No stream available");
     }
 
     let bytes = await this.stream.receive();

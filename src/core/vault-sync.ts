@@ -6,11 +6,11 @@
  * file contents on remote changes.
  */
 
-import type { App, TFile, TAbstractFile, Vault } from 'obsidian';
-import type { DocumentManager, FileChangeEvent } from './document-manager';
-import type { BlobStore } from './blob-store';
-import { isBinaryFile } from './blob-store';
-import type { Logger } from '../utils/logger';
+import type { App, TFile, TAbstractFile, Vault } from "obsidian";
+import type { DocumentManager, FileChangeEvent } from "./document-manager";
+import type { BlobStore } from "./blob-store";
+import { isBinaryFile } from "./blob-store";
+import type { Logger } from "../utils/logger";
 
 /** Configuration for vault sync */
 export interface VaultSyncConfig {
@@ -23,7 +23,7 @@ export interface VaultSyncConfig {
 }
 
 const DEFAULT_CONFIG: VaultSyncConfig = {
-  excludedFolders: ['.obsidian/plugins', '.obsidian/themes'],
+  excludedFolders: [".obsidian/plugins", ".obsidian/themes"],
   maxFileSize: 100 * 1024 * 1024, // 100 MB
   debounceMs: 500,
 };
@@ -37,12 +37,18 @@ export class VaultSync {
   private unsubscribeDocChanges: (() => void) | null = null;
   private isProcessingRemote = false;
 
+  /**
+   * Per-peer excluded folders - union of all connected peers' group exclusions.
+   * Files in these folders won't be written to vault from remote changes.
+   */
+  private peerExcludedFolders = new Set<string>();
+
   constructor(
     private app: App,
     private documentManager: DocumentManager,
     private blobStore: BlobStore,
     private logger: Logger,
-    config?: Partial<VaultSyncConfig>
+    config?: Partial<VaultSyncConfig>,
   ) {
     this.config = { ...DEFAULT_CONFIG, ...config };
   }
@@ -53,12 +59,12 @@ export class VaultSync {
   start(): void {
     // Subscribe to document changes (remote updates)
     this.unsubscribeDocChanges = this.documentManager.onFileChange((event) => {
-      if (event.origin === 'remote') {
+      if (event.origin === "remote") {
         this.handleRemoteChange(event);
       }
     });
 
-    this.logger.info('VaultSync started');
+    this.logger.info("VaultSync started");
   }
 
   /**
@@ -77,7 +83,7 @@ export class VaultSync {
       this.unsubscribeDocChanges = null;
     }
 
-    this.logger.info('VaultSync stopped');
+    this.logger.info("VaultSync stopped");
   }
 
   // ===========================================================================
@@ -162,7 +168,7 @@ export class VaultSync {
 
       // Check file size
       if (tfile.stat.size > this.config.maxFileSize) {
-        this.logger.warn('File too large to sync:', path, tfile.stat.size);
+        this.logger.warn("File too large to sync:", path, tfile.stat.size);
         return;
       }
 
@@ -171,15 +177,15 @@ export class VaultSync {
         const content = await this.app.vault.readBinary(tfile);
         const hash = await this.blobStore.add(new Uint8Array(content));
         this.documentManager.setBlobHash(path, hash);
-        this.logger.debug('Synced binary file to document:', path);
+        this.logger.debug("Synced binary file to document:", path);
       } else {
         // Text file - read and store in document
         const content = await this.app.vault.read(tfile);
         this.documentManager.setTextContent(path, content);
-        this.logger.debug('Synced text file to document:', path);
+        this.logger.debug("Synced text file to document:", path);
       }
     } catch (error) {
-      this.logger.error('Failed to sync file content:', path, error);
+      this.logger.error("Failed to sync file content:", path, error);
     }
   }
 
@@ -188,7 +194,7 @@ export class VaultSync {
    * Use this when you have local files and want to sync them to the document.
    */
   async initialSync(): Promise<void> {
-    this.logger.info('Starting initial vault sync (vault -> document)...');
+    this.logger.info("Starting initial vault sync (vault -> document)...");
 
     const files = this.app.vault.getFiles();
     let synced = 0;
@@ -208,19 +214,25 @@ export class VaultSync {
         await this.syncFileContent(file.path);
         synced++;
       } catch (error) {
-        this.logger.error('Failed to sync file:', file.path, error);
+        this.logger.error("Failed to sync file:", file.path, error);
       }
     }
 
-    this.logger.info(`Initial sync complete: ${synced} files synced, ${skipped} skipped`);
+    this.logger.info(
+      `Initial sync complete: ${synced} files synced, ${skipped} skipped`,
+    );
   }
 
   /**
    * Sync all files from document to vault.
    * Use this when a new device joins and needs to receive all files.
    */
-  async syncFromDocument(): Promise<{ created: number; updated: number; failed: number }> {
-    this.logger.info('Starting document -> vault sync...');
+  async syncFromDocument(): Promise<{
+    created: number;
+    updated: number;
+    failed: number;
+  }> {
+    this.logger.info("Starting document -> vault sync...");
     this.isProcessingRemote = true;
 
     const stats = { created: 0, updated: 0, failed: 0 };
@@ -232,8 +244,8 @@ export class VaultSync {
 
       // Sort paths to ensure parents are created before children
       const sortedPaths = [...docPaths].sort((a, b) => {
-        const aDepth = a.split('/').length;
-        const bDepth = b.split('/').length;
+        const aDepth = a.split("/").length;
+        const bDepth = b.split("/").length;
         return aDepth - bDepth;
       });
 
@@ -249,7 +261,7 @@ export class VaultSync {
           }
 
           // Skip folders - they're created automatically when writing files
-          if (content.type === 'folder') {
+          if (content.type === "folder") {
             continue;
           }
 
@@ -264,13 +276,13 @@ export class VaultSync {
             stats.updated++;
           }
         } catch (error) {
-          this.logger.error('Failed to sync file from document:', path, error);
+          this.logger.error("Failed to sync file from document:", path, error);
           stats.failed++;
         }
       }
 
       this.logger.info(
-        `Document sync complete: ${stats.created} created, ${stats.updated} updated, ${stats.failed} failed`
+        `Document sync complete: ${stats.created} created, ${stats.updated} updated, ${stats.failed} failed`,
       );
     } finally {
       this.isProcessingRemote = false;
@@ -304,30 +316,67 @@ export class VaultSync {
    * Handle a remote file change from the document.
    */
   private async handleRemoteChange(event: FileChangeEvent): Promise<void> {
+    // Check if path is excluded by peer group policies
+    if (this.isExcludedByPeers(event.path)) {
+      this.logger.debug(
+        "Skipping remote change for peer-excluded path:",
+        event.path,
+      );
+      return;
+    }
+
     this.isProcessingRemote = true;
 
     try {
       switch (event.type) {
-        case 'create':
-        case 'modify':
+        case "create":
+        case "modify":
           await this.writeFileToVault(event.path);
           break;
 
-        case 'delete':
+        case "delete":
           await this.deleteFileFromVault(event.path);
           break;
 
-        case 'rename':
+        case "rename":
           if (event.oldPath) {
-            await this.renameFileInVault(event.oldPath, event.path);
+            // For renames, check both old and new paths
+            const oldExcluded = this.isExcludedByPeers(event.oldPath);
+            const newExcluded = this.isExcludedByPeers(event.path);
+
+            if (oldExcluded && newExcluded) {
+              // Both excluded, skip entirely
+              return;
+            } else if (oldExcluded && !newExcluded) {
+              // Moving from excluded to included - treat as create
+              await this.writeFileToVault(event.path);
+            } else if (!oldExcluded && newExcluded) {
+              // Moving from included to excluded - treat as delete
+              await this.deleteFileFromVault(event.oldPath);
+            } else {
+              // Neither excluded - normal rename
+              await this.renameFileInVault(event.oldPath, event.path);
+            }
           }
           break;
       }
     } catch (error) {
-      this.logger.error('Failed to apply remote change:', event, error);
+      this.logger.error("Failed to apply remote change:", event, error);
     } finally {
       this.isProcessingRemote = false;
     }
+  }
+
+  /**
+   * Check if a path is excluded by peer group policies.
+   */
+  private isExcludedByPeers(path: string): boolean {
+    for (const excluded of this.peerExcludedFolders) {
+      if (path.startsWith(excluded + "/") || path === excluded) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -336,18 +385,18 @@ export class VaultSync {
   private async writeFileToVault(path: string): Promise<void> {
     const content = this.documentManager.getContent(path);
     if (!content) {
-      this.logger.warn('No content found for remote file:', path);
+      this.logger.warn("No content found for remote file:", path);
       return;
     }
 
     // Ensure parent folder exists
-    const parts = path.split('/');
+    const parts = path.split("/");
     if (parts.length > 1) {
-      const folderPath = parts.slice(0, -1).join('/');
+      const folderPath = parts.slice(0, -1).join("/");
       await this.ensureFolder(folderPath);
     }
 
-    if (content.type === 'text' && content.text !== undefined) {
+    if (content.type === "text" && content.text !== undefined) {
       // Write text file
       const existing = this.app.vault.getAbstractFileByPath(path);
       if (existing) {
@@ -355,12 +404,16 @@ export class VaultSync {
       } else {
         await this.app.vault.create(path, content.text);
       }
-      this.logger.debug('Wrote text file from document:', path);
-    } else if (content.type === 'binary' && content.blobHash) {
+      this.logger.debug("Wrote text file from document:", path);
+    } else if (content.type === "binary" && content.blobHash) {
       // Write binary file
       const blobData = await this.blobStore.get(content.blobHash);
       if (!blobData) {
-        this.logger.warn('Blob not found for remote file:', path, content.blobHash);
+        this.logger.warn(
+          "Blob not found for remote file:",
+          path,
+          content.blobHash,
+        );
         return;
       }
 
@@ -374,7 +427,7 @@ export class VaultSync {
       } else {
         await this.app.vault.createBinary(path, arrayBuffer);
       }
-      this.logger.debug('Wrote binary file from document:', path);
+      this.logger.debug("Wrote binary file from document:", path);
     }
   }
 
@@ -385,25 +438,28 @@ export class VaultSync {
     const file = this.app.vault.getAbstractFileByPath(path);
     if (file) {
       await this.app.vault.delete(file);
-      this.logger.debug('Deleted file from vault:', path);
+      this.logger.debug("Deleted file from vault:", path);
     }
   }
 
   /**
    * Rename file in vault.
    */
-  private async renameFileInVault(oldPath: string, newPath: string): Promise<void> {
+  private async renameFileInVault(
+    oldPath: string,
+    newPath: string,
+  ): Promise<void> {
     const file = this.app.vault.getAbstractFileByPath(oldPath);
     if (file) {
       // Ensure new parent folder exists
-      const parts = newPath.split('/');
+      const parts = newPath.split("/");
       if (parts.length > 1) {
-        const folderPath = parts.slice(0, -1).join('/');
+        const folderPath = parts.slice(0, -1).join("/");
         await this.ensureFolder(folderPath);
       }
 
       await this.app.vault.rename(file, newPath);
-      this.logger.debug('Renamed file in vault:', oldPath, '->', newPath);
+      this.logger.debug("Renamed file in vault:", oldPath, "->", newPath);
     }
   }
 
@@ -426,7 +482,7 @@ export class VaultSync {
    */
   private shouldSync(path: string): boolean {
     for (const excluded of this.config.excludedFolders) {
-      if (path.startsWith(excluded + '/') || path === excluded) {
+      if (path.startsWith(excluded + "/") || path === excluded) {
         return false;
       }
     }
@@ -434,18 +490,36 @@ export class VaultSync {
   }
 
   /**
-   * Update excluded folders list.
+   * Update excluded folders list (global exclusions).
    */
   updateExcludedFolders(folders: string[]): void {
     this.config.excludedFolders = folders;
-    this.logger.info('Updated excluded folders:', folders);
+    this.logger.info("Updated excluded folders:", folders);
   }
 
   /**
-   * Get current excluded folders.
+   * Get current excluded folders (global).
    */
   getExcludedFolders(): string[] {
     return [...this.config.excludedFolders];
+  }
+
+  /**
+   * Update peer-based excluded folders.
+   * Called by PeerManager when peer connections or group policies change.
+   *
+   * @param folders Union of excluded folders from all connected peers' groups
+   */
+  updatePeerExcludedFolders(folders: string[]): void {
+    this.peerExcludedFolders = new Set(folders);
+    this.logger.debug("Updated peer excluded folders:", folders);
+  }
+
+  /**
+   * Get current peer-based excluded folders.
+   */
+  getPeerExcludedFolders(): string[] {
+    return [...this.peerExcludedFolders];
   }
 
   /**
@@ -464,7 +538,7 @@ export class VaultSync {
       try {
         await fn();
       } catch (error) {
-        this.logger.error('Error in debounced change handler:', error);
+        this.logger.error("Error in debounced change handler:", error);
       }
     }, this.config.debounceMs);
 

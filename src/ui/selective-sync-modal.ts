@@ -4,11 +4,11 @@
  * UI for choosing which folders to include/exclude from sync.
  */
 
-import { App, Modal, Notice, Setting, TFolder } from 'obsidian';
-import type PeerVaultPlugin from '../main';
+import { App, Modal, Notice, Setting, TFolder } from "obsidian";
+import type PeerVaultPlugin from "../main";
 
 /** Sync mode for a folder */
-export type FolderSyncMode = 'include' | 'exclude' | 'inherit';
+export type FolderSyncMode = "include" | "exclude" | "inherit";
 
 /**
  * Modal for configuring selective sync rules.
@@ -19,7 +19,7 @@ export class SelectiveSyncModal extends Modal {
 
   constructor(
     app: App,
-    private plugin: PeerVaultPlugin
+    private plugin: PeerVaultPlugin,
   ) {
     super(app);
     this.excludedFolders = new Set(this.plugin.settings.excludedFolders);
@@ -27,13 +27,13 @@ export class SelectiveSyncModal extends Modal {
 
   override onOpen(): void {
     const { contentEl } = this;
-    contentEl.addClass('peervault-selective-sync-modal');
+    contentEl.addClass("peervault-selective-sync-modal");
 
-    contentEl.createEl('h2', { text: 'Selective Sync' });
+    contentEl.createEl("h2", { text: "Selective Sync" });
 
-    contentEl.createEl('p', {
-      text: 'Choose which folders to sync. Excluded folders will not be synced to other devices.',
-      cls: 'peervault-help-text',
+    contentEl.createEl("p", {
+      text: "Choose which folders to sync. Excluded folders will not be synced to other devices.",
+      cls: "peervault-help-text",
     });
 
     // Quick actions
@@ -54,57 +54,61 @@ export class SelectiveSyncModal extends Modal {
   }
 
   private renderQuickActions(container: HTMLElement): void {
-    const section = container.createDiv({ cls: 'peervault-quick-actions' });
+    const section = container.createDiv({ cls: "peervault-quick-actions" });
 
     new Setting(section)
-      .setName('Common exclusions')
-      .setDesc('Quickly exclude commonly unwanted folders')
+      .setName("Common exclusions")
+      .setDesc("Quickly exclude commonly unwanted folders")
       .addButton((btn) =>
-        btn.setButtonText('Exclude .obsidian').onClick(() => {
-          this.toggleFolder('.obsidian', true);
+        btn.setButtonText("Exclude .obsidian").onClick(() => {
+          this.toggleFolder(".obsidian", true);
           this.refresh();
-        })
+        }),
       )
       .addButton((btn) =>
-        btn.setButtonText('Exclude .git').onClick(() => {
-          this.toggleFolder('.git', true);
+        btn.setButtonText("Exclude .git").onClick(() => {
+          this.toggleFolder(".git", true);
           this.refresh();
-        })
+        }),
       );
 
     new Setting(section)
       .addButton((btn) =>
-        btn.setButtonText('Include All').onClick(() => {
+        btn.setButtonText("Include All").onClick(() => {
           this.excludedFolders.clear();
           this.refresh();
-        })
+        }),
       )
       .addButton((btn) =>
-        btn.setButtonText('Expand All').onClick(() => {
+        btn.setButtonText("Expand All").onClick(() => {
           const folders = this.getAllFolders();
           for (const folder of folders) {
             this.expandedFolders.add(folder.path);
           }
           this.refresh();
-        })
+        }),
       )
       .addButton((btn) =>
-        btn.setButtonText('Collapse All').onClick(() => {
+        btn.setButtonText("Collapse All").onClick(() => {
           this.expandedFolders.clear();
           this.refresh();
-        })
+        }),
       );
   }
 
   private renderFolderTree(container: HTMLElement): void {
-    const section = container.createDiv({ cls: 'peervault-folder-tree-section' });
-    section.createEl('h3', { text: 'Folders' });
+    const section = container.createDiv({
+      cls: "peervault-folder-tree-section",
+    });
+    section.createEl("h3", { text: "Folders" });
 
-    const tree = section.createDiv({ cls: 'peervault-folder-tree' });
+    const tree = section.createDiv({ cls: "peervault-folder-tree" });
 
     // Get root folders
     const rootFolder = this.app.vault.getRoot();
-    const rootChildren = rootFolder.children?.filter((c): c is TFolder => c instanceof TFolder) ?? [];
+    const rootChildren =
+      rootFolder.children?.filter((c): c is TFolder => c instanceof TFolder) ??
+      [];
 
     // Sort alphabetically
     rootChildren.sort((a, b) => a.name.localeCompare(b.name));
@@ -114,28 +118,33 @@ export class SelectiveSyncModal extends Modal {
     }
 
     if (rootChildren.length === 0) {
-      tree.createEl('p', {
-        text: 'No folders in vault.',
-        cls: 'peervault-empty-state',
+      tree.createEl("p", {
+        text: "No folders in vault.",
+        cls: "peervault-empty-state",
       });
     }
   }
 
-  private renderFolderItem(container: HTMLElement, folder: TFolder, depth: number): void {
+  private renderFolderItem(
+    container: HTMLElement,
+    folder: TFolder,
+    depth: number,
+  ): void {
     const isExcluded = this.isFolderExcluded(folder.path);
     const isParentExcluded = this.isParentExcluded(folder.path);
-    const hasChildren = folder.children?.some((c) => c instanceof TFolder) ?? false;
+    const hasChildren =
+      folder.children?.some((c) => c instanceof TFolder) ?? false;
     const isExpanded = this.expandedFolders.has(folder.path);
 
     const item = container.createDiv({
-      cls: `peervault-folder-item ${isExcluded ? 'excluded' : ''} ${isParentExcluded ? 'parent-excluded' : ''}`,
+      cls: `peervault-folder-item ${isExcluded ? "excluded" : ""} ${isParentExcluded ? "parent-excluded" : ""}`,
     });
     item.style.paddingLeft = `${depth * 20 + 8}px`;
 
     // Expand/collapse button
     if (hasChildren) {
-      const expandBtn = item.createSpan({ cls: 'peervault-folder-expand' });
-      expandBtn.setText(isExpanded ? 'v' : '>');
+      const expandBtn = item.createSpan({ cls: "peervault-folder-expand" });
+      expandBtn.setText(isExpanded ? "v" : ">");
       expandBtn.onclick = (e) => {
         e.stopPropagation();
         if (isExpanded) {
@@ -146,13 +155,13 @@ export class SelectiveSyncModal extends Modal {
         this.refresh();
       };
     } else {
-      item.createSpan({ cls: 'peervault-folder-expand-placeholder' });
+      item.createSpan({ cls: "peervault-folder-expand-placeholder" });
     }
 
     // Checkbox
-    const checkbox = item.createEl('input', {
-      type: 'checkbox',
-      cls: 'peervault-folder-checkbox',
+    const checkbox = item.createEl("input", {
+      type: "checkbox",
+      cls: "peervault-folder-checkbox",
     });
     checkbox.checked = !isExcluded && !isParentExcluded;
     checkbox.disabled = isParentExcluded;
@@ -163,23 +172,34 @@ export class SelectiveSyncModal extends Modal {
     };
 
     // Folder name
-    const nameEl = item.createSpan({ cls: 'peervault-folder-name' });
+    const nameEl = item.createSpan({ cls: "peervault-folder-name" });
     nameEl.setText(folder.name);
 
     // Status
     if (isExcluded) {
-      item.createSpan({ text: '(excluded)', cls: 'peervault-folder-status excluded' });
+      item.createSpan({
+        text: "(excluded)",
+        cls: "peervault-folder-status excluded",
+      });
     } else if (isParentExcluded) {
-      item.createSpan({ text: '(parent excluded)', cls: 'peervault-folder-status inherited' });
+      item.createSpan({
+        text: "(parent excluded)",
+        cls: "peervault-folder-status inherited",
+      });
     }
 
     // File count
     const fileCount = this.countFiles(folder);
-    item.createSpan({ text: `${fileCount} files`, cls: 'peervault-folder-count' });
+    item.createSpan({
+      text: `${fileCount} files`,
+      cls: "peervault-folder-count",
+    });
 
     // Render children if expanded
     if (hasChildren && isExpanded) {
-      const children = folder.children?.filter((c): c is TFolder => c instanceof TFolder) ?? [];
+      const children =
+        folder.children?.filter((c): c is TFolder => c instanceof TFolder) ??
+        [];
       children.sort((a, b) => a.name.localeCompare(b.name));
 
       for (const child of children) {
@@ -189,39 +209,39 @@ export class SelectiveSyncModal extends Modal {
   }
 
   private renderSummary(container: HTMLElement): void {
-    const section = container.createDiv({ cls: 'peervault-sync-summary' });
+    const section = container.createDiv({ cls: "peervault-sync-summary" });
 
     const totalFiles = this.countAllFiles();
     const excludedFiles = this.countExcludedFiles();
     const syncedFiles = totalFiles - excludedFiles;
 
-    section.createEl('div', {
+    section.createEl("div", {
       text: `Syncing ${syncedFiles} of ${totalFiles} files (${this.excludedFolders.size} folders excluded)`,
-      cls: 'peervault-summary-text',
+      cls: "peervault-summary-text",
     });
 
     // Visual bar
-    const bar = section.createDiv({ cls: 'peervault-sync-bar' });
+    const bar = section.createDiv({ cls: "peervault-sync-bar" });
     const syncedPct = totalFiles > 0 ? (syncedFiles / totalFiles) * 100 : 100;
-    const syncedFill = bar.createDiv({ cls: 'peervault-sync-fill synced' });
+    const syncedFill = bar.createDiv({ cls: "peervault-sync-fill synced" });
     syncedFill.style.width = `${syncedPct}%`;
   }
 
   private renderActions(container: HTMLElement): void {
-    const section = container.createDiv({ cls: 'peervault-actions-section' });
+    const section = container.createDiv({ cls: "peervault-actions-section" });
 
     new Setting(section)
       .addButton((btn) =>
-        btn.setButtonText('Cancel').onClick(() => this.close())
+        btn.setButtonText("Cancel").onClick(() => this.close()),
       )
       .addButton((btn) =>
         btn
-          .setButtonText('Save')
+          .setButtonText("Save")
           .setCta()
           .onClick(async () => {
             await this.save();
             this.close();
-          })
+          }),
       );
   }
 
@@ -238,9 +258,9 @@ export class SelectiveSyncModal extends Modal {
   }
 
   private isParentExcluded(path: string): boolean {
-    const parts = path.split('/');
+    const parts = path.split("/");
     for (let i = 1; i < parts.length; i++) {
-      const parentPath = parts.slice(0, i).join('/');
+      const parentPath = parts.slice(0, i).join("/");
       if (this.excludedFolders.has(parentPath)) {
         return true;
       }
@@ -300,7 +320,7 @@ export class SelectiveSyncModal extends Modal {
 
   private isPathExcluded(path: string): boolean {
     for (const excluded of this.excludedFolders) {
-      if (path === excluded || path.startsWith(excluded + '/')) {
+      if (path === excluded || path.startsWith(excluded + "/")) {
         return true;
       }
     }
@@ -313,17 +333,23 @@ export class SelectiveSyncModal extends Modal {
 
     // Update vault sync
     if (this.plugin.vaultSync) {
-      this.plugin.vaultSync.updateExcludedFolders(this.plugin.settings.excludedFolders);
+      this.plugin.vaultSync.updateExcludedFolders(
+        this.plugin.settings.excludedFolders,
+      );
     }
 
-    new Notice(`Selective sync updated: ${this.excludedFolders.size} folders excluded`);
+    new Notice(
+      `Selective sync updated: ${this.excludedFolders.size} folders excluded`,
+    );
   }
 
   private refresh(): void {
     this.close();
     new SelectiveSyncModal(this.app, this.plugin).open();
     // Restore expanded state
-    const modal = this.app.workspace.containerEl.querySelector('.peervault-selective-sync-modal');
+    const modal = this.app.workspace.containerEl.querySelector(
+      ".peervault-selective-sync-modal",
+    );
     if (modal) {
       // The new modal will have the same expanded state since we share the class property
     }

@@ -6,7 +6,7 @@
  * edits occurred so they can review the result.
  */
 
-import type { Logger } from '../utils/logger';
+import type { Logger } from "../utils/logger";
 
 /** A detected conflict */
 export interface ConflictInfo {
@@ -32,7 +32,10 @@ const CONCURRENT_WINDOW_MS = 60000; // 1 minute
  */
 export class ConflictTracker {
   /** Recent edits per file: path -> array of {peerId, timestamp} */
-  private recentEdits = new Map<string, Array<{ peerId: string; peerName?: string; timestamp: number }>>();
+  private recentEdits = new Map<
+    string,
+    Array<{ peerId: string; peerName?: string; timestamp: number }>
+  >();
 
   /** Detected conflicts */
   private conflicts = new Map<string, ConflictInfo>();
@@ -45,7 +48,12 @@ export class ConflictTracker {
   /**
    * Record an edit from a peer.
    */
-  recordEdit(path: string, peerId: string, peerName?: string, timestamp?: number): void {
+  recordEdit(
+    path: string,
+    peerId: string,
+    peerName?: string,
+    timestamp?: number,
+  ): void {
     const editTime = timestamp ?? Date.now();
     const edits = this.recentEdits.get(path) ?? [];
 
@@ -66,25 +74,32 @@ export class ConflictTracker {
    */
   private detectConflict(
     path: string,
-    edits: Array<{ peerId: string; peerName?: string; timestamp: number }>
+    edits: Array<{ peerId: string; peerName?: string; timestamp: number }>,
   ): void {
     // Get edits within the concurrent window
     const now = Date.now();
-    const recentEdits = edits.filter((e) => now - e.timestamp < CONCURRENT_WINDOW_MS);
+    const recentEdits = edits.filter(
+      (e) => now - e.timestamp < CONCURRENT_WINDOW_MS,
+    );
 
     // Get unique peers
     const peerMap = new Map<string, { name?: string; timestamp: number }>();
     for (const edit of recentEdits) {
       const existing = peerMap.get(edit.peerId);
       if (!existing || edit.timestamp > existing.timestamp) {
-        peerMap.set(edit.peerId, { name: edit.peerName, timestamp: edit.timestamp });
+        peerMap.set(edit.peerId, {
+          name: edit.peerName,
+          timestamp: edit.timestamp,
+        });
       }
     }
 
     // If multiple peers edited within the window, it's a conflict
     if (peerMap.size >= 2) {
       const peerIds = Array.from(peerMap.keys());
-      const peerNames = peerIds.map((id) => peerMap.get(id)?.name ?? id.substring(0, 8));
+      const peerNames = peerIds.map(
+        (id) => peerMap.get(id)?.name ?? id.substring(0, 8),
+      );
       const editTimestamps = peerIds.map((id) => peerMap.get(id)!.timestamp);
 
       const conflict: ConflictInfo = {
@@ -97,14 +112,14 @@ export class ConflictTracker {
       };
 
       this.conflicts.set(path, conflict);
-      this.logger.info('Concurrent edit detected:', path, 'peers:', peerNames);
+      this.logger.info("Concurrent edit detected:", path, "peers:", peerNames);
 
       // Notify listeners
       for (const callback of this.conflictCallbacks) {
         try {
           callback(conflict);
         } catch (err) {
-          this.logger.error('Error in conflict callback:', err);
+          this.logger.error("Error in conflict callback:", err);
         }
       }
     }
@@ -140,7 +155,7 @@ export class ConflictTracker {
     const conflict = this.conflicts.get(path);
     if (conflict) {
       conflict.resolved = true;
-      this.logger.info('Conflict resolved:', path);
+      this.logger.info("Conflict resolved:", path);
     }
   }
 
@@ -179,7 +194,7 @@ let conflictTracker: ConflictTracker | null = null;
 export function getConflictTracker(logger?: Logger): ConflictTracker {
   if (!conflictTracker) {
     if (!logger) {
-      throw new Error('ConflictTracker not initialized and no logger provided');
+      throw new Error("ConflictTracker not initialized and no logger provided");
     }
     conflictTracker = new ConflictTracker(logger);
   }

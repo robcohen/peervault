@@ -2,7 +2,14 @@
  * PeerVault shared type definitions
  */
 
-import type { LoroDoc, LoroTree, LoroMap, LoroText, LoroList, TreeID } from 'loro-crdt';
+import type {
+  LoroDoc,
+  LoroTree,
+  LoroMap,
+  LoroText,
+  LoroList,
+  TreeID,
+} from "loro-crdt";
 
 // ============================================================================
 // Document Types
@@ -89,7 +96,7 @@ export interface PeerInfo {
   /** Human-readable name */
   name: string;
   /** Device type */
-  deviceType: 'desktop' | 'mobile' | 'tablet' | 'unknown';
+  deviceType: "desktop" | "mobile" | "tablet" | "unknown";
   /** Last seen timestamp */
   lastSeen: number;
   /** Connection state */
@@ -97,11 +104,11 @@ export interface PeerInfo {
 }
 
 export type ConnectionState =
-  | 'disconnected'
-  | 'connecting'
-  | 'connected'
-  | 'syncing'
-  | 'error';
+  | "disconnected"
+  | "connecting"
+  | "connected"
+  | "syncing"
+  | "error";
 
 /**
  * Pairing ticket for device pairing.
@@ -125,16 +132,22 @@ export interface PairingTicket {
  * Sync message types for peer communication.
  */
 export type SyncMessage =
-  | { type: 'handshake'; version: Uint8Array; peerId: string; peerName: string }
-  | { type: 'sync-request'; version: Uint8Array }
-  | { type: 'sync-response'; updates: Uint8Array; version: Uint8Array }
-  | { type: 'update'; data: Uint8Array }
-  | { type: 'ack'; version: Uint8Array }
-  | { type: 'blob-request'; hashes: string[] }
-  | { type: 'blob-have'; available: string[]; missing: string[] }
-  | { type: 'blob-transfer'; hash: string; data: Uint8Array; offset: number; total: number }
-  | { type: 'blob-ack'; hash: string; received: boolean }
-  | { type: 'error'; code: string; message: string };
+  | { type: "handshake"; version: Uint8Array; peerId: string; peerName: string }
+  | { type: "sync-request"; version: Uint8Array }
+  | { type: "sync-response"; updates: Uint8Array; version: Uint8Array }
+  | { type: "update"; data: Uint8Array }
+  | { type: "ack"; version: Uint8Array }
+  | { type: "blob-request"; hashes: string[] }
+  | { type: "blob-have"; available: string[]; missing: string[] }
+  | {
+      type: "blob-transfer";
+      hash: string;
+      data: Uint8Array;
+      offset: number;
+      total: number;
+    }
+  | { type: "blob-ack"; hash: string; received: boolean }
+  | { type: "error"; code: string; message: string };
 
 /**
  * Sync session state.
@@ -157,42 +170,46 @@ export interface SyncSession {
  */
 export interface PeerVaultEvents {
   // Document events
-  'doc:change': { origin: 'local' | 'remote'; peerId?: string };
-  'doc:file-created': { path: string; nodeId: TreeID };
-  'doc:file-modified': { path: string; nodeId: TreeID };
-  'doc:file-deleted': { path: string; nodeId: TreeID };
-  'doc:file-moved': { oldPath: string; newPath: string; nodeId: TreeID };
+  "doc:change": { origin: "local" | "remote"; peerId?: string };
+  "doc:file-created": { path: string; nodeId: TreeID };
+  "doc:file-modified": { path: string; nodeId: TreeID };
+  "doc:file-deleted": { path: string; nodeId: TreeID };
+  "doc:file-moved": { oldPath: string; newPath: string; nodeId: TreeID };
 
   // Peer events
-  'peer:connected': { peer: PeerInfo };
-  'peer:disconnected': { peer: PeerInfo; reason?: string };
-  'peer:sync-start': { peer: PeerInfo };
-  'peer:sync-complete': { peer: PeerInfo; duration: number };
-  'peer:sync-error': { peer: PeerInfo; error: Error };
+  "peer:connected": { peer: PeerInfo };
+  "peer:disconnected": { peer: PeerInfo; reason?: string };
+  "peer:sync-start": { peer: PeerInfo };
+  "peer:sync-complete": { peer: PeerInfo; duration: number };
+  "peer:sync-error": { peer: PeerInfo; error: Error };
 
   // Transfer events
-  'transfer:start': { hash: string; totalBytes: number; direction: 'upload' | 'download' };
-  'transfer:progress': { hash: string; receivedBytes: number; totalBytes: number };
-  'transfer:complete': { hash: string; duration: number };
-  'transfer:error': { hash: string; error: Error };
+  "transfer:start": {
+    hash: string;
+    totalBytes: number;
+    direction: "upload" | "download";
+  };
+  "transfer:progress": {
+    hash: string;
+    receivedBytes: number;
+    totalBytes: number;
+  };
+  "transfer:complete": { hash: string; duration: number };
+  "transfer:error": { hash: string; error: Error };
 
   // Status events
-  'status:change': { status: SyncStatus };
-  'error': { error: Error; context?: string };
+  "status:change": { status: SyncStatus };
+  error: { error: Error; context?: string };
 }
 
-export type SyncStatus =
-  | 'idle'
-  | 'syncing'
-  | 'offline'
-  | 'error';
+export type SyncStatus = "idle" | "syncing" | "offline" | "error";
 
 // ============================================================================
 // Settings Types
 // ============================================================================
 
 /** Transport type for P2P connections */
-export type TransportType = 'mock' | 'iroh';
+export type TransportType = "iroh";
 
 /**
  * Plugin settings stored in Obsidian.
@@ -212,24 +229,39 @@ export interface PeerVaultSettings {
   debugMode: boolean;
   /** Relay server URLs */
   relayServers: string[];
-  /** Transport type: 'mock' for testing, 'iroh' for real P2P */
+  /** Transport type for P2P connections */
   transportType: TransportType;
-  /** Enable end-to-end encryption */
+  /** Enable end-to-end encryption for sync */
   encryptionEnabled: boolean;
+  /** Enable encryption at rest (local storage) */
+  storageEncrypted: boolean;
   /** Encrypted encryption key (encrypted with password-derived key) */
   encryptedKey?: string;
   /** Salt for password-based key derivation */
   keySalt?: string;
+  /** Garbage collection configuration */
+  gcEnabled: boolean;
+  /** Maximum document size in MB before GC runs (default: 50) */
+  gcMaxDocSizeMB: number;
+  /** Minimum history retention in days (default: 30) */
+  gcMinHistoryDays: number;
+  /** Require peer consensus before GC (default: true) */
+  gcRequirePeerConsensus: boolean;
 }
 
 export const DEFAULT_SETTINGS: PeerVaultSettings = {
   autoSync: true,
   syncInterval: 0,
-  excludedFolders: ['.obsidian/plugins', '.obsidian/themes'],
+  excludedFolders: [".obsidian/plugins", ".obsidian/themes"],
   maxFileSize: 100 * 1024 * 1024, // 100 MB
   showStatusBar: true,
   debugMode: false,
   relayServers: [],
-  transportType: 'mock', // Default to mock for safety; switch to 'iroh' when ready
+  transportType: "iroh",
   encryptionEnabled: false,
+  storageEncrypted: false,
+  gcEnabled: true,
+  gcMaxDocSizeMB: 50,
+  gcMinHistoryDays: 30,
+  gcRequirePeerConsensus: true,
 };

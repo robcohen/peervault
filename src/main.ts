@@ -4,15 +4,16 @@
  * Main plugin entry point.
  */
 
-import { Plugin, Notice } from 'obsidian';
-import type { PeerVaultSettings, SyncStatus, PeerInfo } from './types';
-import { DEFAULT_SETTINGS } from './types';
-import { DocumentManager, waitForLoroWasm } from './core/document-manager';
-import { ObsidianStorageAdapter } from './core/storage-adapter';
-import { BlobStore } from './core/blob-store';
-import { VaultSync } from './core/vault-sync';
-import { EventEmitter } from './utils/events';
-import { Logger } from './utils/logger';
+import { Plugin, Notice } from "obsidian";
+import type { PeerVaultSettings, SyncStatus, PeerInfo } from "./types";
+import { DEFAULT_SETTINGS } from "./types";
+import { DocumentManager, waitForLoroWasm } from "./core/document-manager";
+import { ObsidianStorageAdapter } from "./core/storage-adapter";
+import { EncryptedStorageAdapter } from "./core/encrypted-storage-adapter";
+import { BlobStore } from "./core/blob-store";
+import { VaultSync } from "./core/vault-sync";
+import { EventEmitter } from "./utils/events";
+import { Logger } from "./utils/logger";
 import {
   PeerVaultSettingsTab,
   PeerVaultStatusModal,
@@ -28,42 +29,89 @@ import {
   SelectiveSyncModal,
   EncryptionModal,
   ConflictModal,
-} from './ui';
-import { getEncryptionService } from './crypto';
-import { initConflictTracker, getConflictTracker } from './core/conflict-tracker';
-import { MockTransport, IrohTransport, initIrohWasm, type Transport, type TransportStorage } from './transport';
-import { PeerManager } from './peer';
+} from "./ui";
+import { getEncryptionService } from "./crypto";
+import {
+  initConflictTracker,
+  getConflictTracker,
+} from "./core/conflict-tracker";
+import {
+  IrohTransport,
+  initIrohWasm,
+  type Transport,
+  type TransportStorage,
+} from "./transport";
+import { PeerManager } from "./peer";
+import { MigrationRunner, MIGRATIONS } from "./core/migration";
+import { GarbageCollector } from "./core/gc";
 
 export default class PeerVaultPlugin extends Plugin {
   settings!: PeerVaultSettings;
   documentManager!: DocumentManager;
-  storage!: ObsidianStorageAdapter;
+  storage!: EncryptedStorageAdapter;
+  private baseStorage!: ObsidianStorageAdapter;
   blobStore!: BlobStore;
   vaultSync!: VaultSync;
   transport!: Transport;
   peerManager!: PeerManager;
+  gc!: GarbageCollector;
   events = new EventEmitter();
   logger!: Logger;
 
   private connectionStatus: ConnectionStatusManager | null = null;
-  private syncStatus: SyncStatus = 'idle';
+  private syncStatus: SyncStatus = "idle";
 
   override async onload(): Promise<void> {
     // Initialize logger
-    this.logger = new Logger('PeerVault', () => this.settings?.debugMode ?? false);
-    this.logger.info('Loading PeerVault plugin...');
+    this.logger = new Logger(
+      "PeerVault",
+      () => this.settings?.debugMode ?? false,
+    );
+    this.logger.info("Loading PeerVault plugin...");
 
     // Wait for loro-crdt WASM to initialize (required for mobile compatibility)
     // On mobile, WASM must be loaded asynchronously due to 4KB sync compilation limit
-    this.logger.debug('Waiting for WASM initialization...');
+    this.logger.debug("Waiting for WASM initialization...");
     await waitForLoroWasm();
-    this.logger.debug('WASM initialized');
+    this.logger.debug("WASM initialized");
 
     // Load settings
     await this.loadSettings();
 
-    // Initialize storage adapter
-    this.storage = new ObsidianStorageAdapter(this);
+    // Initialize storage adapters
+    this.baseStorage = new ObsidianStorageAdapter(this);
+
+    // Wrap with encrypted storage adapter
+    // The encryption service will be unlocked later via the UI if needed
+    const encryptionService = getEncryptionService();
+    this.storage = new EncryptedStorageAdapter(
+      this.baseStorage,
+      encryptionService,
+    );
+
+    // Run schema migrations if needed (uses encrypted storage)
+    const migrationRunner = new MigrationRunner(
+      this.storage,
+      MIGRATIONS,
+      this.logger,
+    );
+    const migrationResult = await migrationRunner.run((percent, message) => {
+      this.logger.debug(
+        `Migration progress: ${percent.toFixed(0)}% - ${message}`,
+      );
+    });
+
+    if (migrationResult.status === "failed") {
+      this.logger.error("Migration failed:", migrationResult.error);
+      new Notice(
+        `PeerVault: Migration failed - ${migrationResult.error}. Please check the console for details.`,
+      );
+      // Continue loading anyway to allow manual recovery
+    } else if (migrationResult.migrationsRun.length > 0) {
+      this.logger.info(
+        `Migrations completed: ${migrationResult.migrationsRun.join(", ")}`,
+      );
+    }
 
     // Initialize document manager
     this.documentManager = new DocumentManager(this.storage, this.logger);
@@ -87,17 +135,17 @@ export default class PeerVaultPlugin extends Plugin {
         excludedFolders: this.settings.excludedFolders,
         maxFileSize: 100 * 1024 * 1024, // 100 MB
         debounceMs: 500,
-      }
+      },
     );
 
     // Initialize transport based on settings
     const transportStorage: TransportStorage = {
       loadSecretKey: async () => {
-        const data = await this.storage.read('peervault-transport-key');
+        const data = await this.storage.read("peervault-transport-key");
         return data;
       },
       saveSecretKey: async (key: Uint8Array) => {
-        await this.storage.write('peervault-transport-key', key);
+        await this.storage.write("peervault-transport-key", key);
       },
     };
 
@@ -105,31 +153,29 @@ export default class PeerVaultPlugin extends Plugin {
       storage: transportStorage,
       logger: this.logger,
       debug: this.settings.debugMode,
-      relayUrls: this.settings.relayServers.length > 0 ? this.settings.relayServers : undefined,
+      relayUrls:
+        this.settings.relayServers.length > 0
+          ? this.settings.relayServers
+          : undefined,
     };
 
-    if (this.settings.transportType === 'iroh') {
-      // Initialize Iroh WASM module
-      this.logger.info('Initializing Iroh transport...');
-      try {
-        // Get paths to WASM files in the plugin directory
-        const pluginDir = this.manifest.dir;
-        const jsPath = this.app.vault.adapter.getResourcePath(`${pluginDir}/peervault_iroh.js`);
-        const wasmPath = this.app.vault.adapter.getResourcePath(`${pluginDir}/peervault_iroh_bg.wasm`);
+    // Initialize Iroh WASM module
+    this.logger.info("Initializing Iroh transport...");
+    // Get paths to WASM files in the plugin directory
+    const pluginDir = this.manifest.dir;
+    const jsPath = this.app.vault.adapter.getResourcePath(
+      `${pluginDir}/peervault_iroh.js`,
+    );
+    const wasmPath = this.app.vault.adapter.getResourcePath(
+      `${pluginDir}/peervault_iroh_bg.wasm`,
+    );
 
-        this.logger.debug('WASM JS path:', jsPath);
-        this.logger.debug('WASM binary path:', wasmPath);
+    this.logger.debug("WASM JS path:", jsPath);
+    this.logger.debug("WASM binary path:", wasmPath);
 
-        await initIrohWasm(jsPath, wasmPath);
-        this.transport = new IrohTransport(transportConfig);
-        this.logger.info('Iroh transport initialized successfully');
-      } catch (err) {
-        this.logger.error('Failed to initialize Iroh transport, falling back to mock:', err);
-        this.transport = new MockTransport(transportConfig);
-      }
-    } else {
-      this.transport = new MockTransport(transportConfig);
-    }
+    await initIrohWasm(jsPath, wasmPath);
+    this.transport = new IrohTransport(transportConfig);
+    this.logger.info("Iroh transport initialized successfully");
 
     await this.transport.initialize();
 
@@ -143,44 +189,51 @@ export default class PeerVaultPlugin extends Plugin {
         autoSyncInterval: this.settings.syncInterval * 1000,
         autoReconnect: true,
       },
-      this.blobStore
+      this.blobStore,
     );
 
     await this.peerManager.initialize();
 
     // Connect peer manager events to plugin status
-    this.peerManager.on('status:change', (status) => {
-      if (status === 'syncing') {
-        this.setSyncStatus('syncing');
-      } else if (status === 'idle') {
-        this.setSyncStatus('idle');
-      } else if (status === 'error') {
-        this.setSyncStatus('error');
-      } else if (status === 'offline') {
-        this.setSyncStatus('offline');
+    this.peerManager.on("status:change", (status) => {
+      if (status === "syncing") {
+        this.setSyncStatus("syncing");
+      } else if (status === "idle") {
+        this.setSyncStatus("idle");
+      } else if (status === "error") {
+        this.setSyncStatus("error");
+      } else if (status === "offline") {
+        this.setSyncStatus("offline");
       }
     });
 
-    this.peerManager.on('peer:synced', async (nodeId) => {
-      this.logger.info('Synced with peer:', nodeId);
+    this.peerManager.on("peer:synced", async (nodeId) => {
+      this.logger.info("Synced with peer:", nodeId);
       updateSyncProgress(null); // Clear progress
+
+      // Update vault sync with peer exclusions
+      this.updateVaultSyncPeerExclusions();
 
       // Get peer info for notification
       const peer = this.peerManager.getPeers().find((p) => p.nodeId === nodeId);
-      const peerName = peer?.name ?? 'Unknown Device';
+      const peerName = peer?.name ?? "Unknown Device";
 
       // Record edits for conflict tracking
       const tracker = getConflictTracker();
       const changedPaths = this.documentManager.listAllPaths();
-      for (const path of changedPaths.slice(0, 50)) { // Limit for performance
+      for (const path of changedPaths.slice(0, 50)) {
+        // Limit for performance
         tracker.recordEdit(path, nodeId, peerName);
       }
 
       // Check if we need to sync files from document to vault
       // This happens when a new device joins and receives files from peers
       if (this.vaultSync.hasDocumentContent()) {
-        this.logger.info('Document has content, syncing to vault...');
-        updateSyncProgress({ operation: 'Writing files to vault', progress: 0 });
+        this.logger.info("Document has content, syncing to vault...");
+        updateSyncProgress({
+          operation: "Writing files to vault",
+          progress: 0,
+        });
         try {
           const stats = await this.vaultSync.syncFromDocument();
           updateSyncProgress(null);
@@ -199,20 +252,27 @@ export default class PeerVaultPlugin extends Plugin {
             });
           }
         } catch (err) {
-          this.logger.error('Failed to sync from document:', err);
+          this.logger.error("Failed to sync from document:", err);
           updateSyncProgress(null);
         }
       }
 
       // Save document after sync
       this.documentManager.save().catch((err) => {
-        this.logger.error('Failed to save after sync:', err);
+        this.logger.error("Failed to save after sync:", err);
       });
     });
 
+    // Handle peer disconnection
+    this.peerManager.on("peer:disconnected", ({ nodeId }) => {
+      this.logger.info("Peer disconnected:", nodeId);
+      // Update vault sync exclusions when a peer disconnects
+      this.updateVaultSyncPeerExclusions();
+    });
+
     // Handle peer errors
-    this.peerManager.on('peer:error', ({ nodeId, error }) => {
-      this.logger.error('Peer error:', nodeId, error);
+    this.peerManager.on("peer:error", ({ nodeId, error }) => {
+      this.logger.error("Peer error:", nodeId, error);
       recordSyncError({
         message: error.message || String(error),
         peerId: nodeId,
@@ -220,6 +280,21 @@ export default class PeerVaultPlugin extends Plugin {
         retryable: true,
       });
     });
+
+    // Initialize garbage collector
+    this.gc = new GarbageCollector(
+      this.documentManager,
+      this.blobStore,
+      this.storage,
+      this.logger,
+      this.peerManager, // Provides getPeerSyncStates()
+      {
+        enabled: this.settings.gcEnabled,
+        maxDocSizeMB: this.settings.gcMaxDocSizeMB,
+        minHistoryDays: this.settings.gcMinHistoryDays,
+        requirePeerConsensus: this.settings.gcRequirePeerConsensus,
+      },
+    );
 
     // Set up UI
     this.setupStatusBar();
@@ -232,12 +307,12 @@ export default class PeerVaultPlugin extends Plugin {
     // Start vault sync service
     this.vaultSync.start();
 
-    this.logger.info('PeerVault plugin loaded successfully');
-    this.logger.info('Node ID:', this.transport.getNodeId());
+    this.logger.info("PeerVault plugin loaded successfully");
+    this.logger.info("Node ID:", this.transport.getNodeId());
   }
 
   override async onunload(): Promise<void> {
-    this.logger.info('Unloading PeerVault plugin...');
+    this.logger.info("Unloading PeerVault plugin...");
 
     // Stop vault sync
     if (this.vaultSync) {
@@ -260,7 +335,7 @@ export default class PeerVaultPlugin extends Plugin {
     // Clean up UI
     this.connectionStatus?.destroy();
 
-    this.logger.info('PeerVault plugin unloaded');
+    this.logger.info("PeerVault plugin unloaded");
   }
 
   // ===========================================================================
@@ -290,14 +365,14 @@ export default class PeerVaultPlugin extends Plugin {
   private setSyncStatus(status: SyncStatus): void {
     this.syncStatus = status;
     this.connectionStatus?.update();
-    this.events.emit('status:change', { status });
+    this.events.emit("status:change", { status });
   }
 
   private setupCommands(): void {
     // Force sync command
     this.addCommand({
-      id: 'force-sync',
-      name: 'Force sync now',
+      id: "force-sync",
+      name: "Force sync now",
       callback: async () => {
         await this.sync();
       },
@@ -305,8 +380,8 @@ export default class PeerVaultPlugin extends Plugin {
 
     // Unified pairing command (primary)
     this.addCommand({
-      id: 'pair-device',
-      name: 'Pair device (QR code)',
+      id: "pair-device",
+      name: "Pair device (QR code)",
       callback: () => {
         new PairingModal(this.app, this).open();
       },
@@ -314,8 +389,8 @@ export default class PeerVaultPlugin extends Plugin {
 
     // Add device command (manual ticket entry)
     this.addCommand({
-      id: 'add-device',
-      name: 'Add device (paste ticket)',
+      id: "add-device",
+      name: "Add device (paste ticket)",
       callback: () => {
         new AddDeviceModal(this.app, this).open();
       },
@@ -323,8 +398,8 @@ export default class PeerVaultPlugin extends Plugin {
 
     // Show invite command
     this.addCommand({
-      id: 'show-invite',
-      name: 'Show my connection invite',
+      id: "show-invite",
+      name: "Show my connection invite",
       callback: () => {
         new ShowInviteModal(this.app, this).open();
       },
@@ -332,8 +407,8 @@ export default class PeerVaultPlugin extends Plugin {
 
     // Show status command
     this.addCommand({
-      id: 'show-status',
-      name: 'Show sync status',
+      id: "show-status",
+      name: "Show sync status",
       callback: () => {
         new PeerVaultStatusModal(this.app, this).open();
       },
@@ -341,8 +416,8 @@ export default class PeerVaultPlugin extends Plugin {
 
     // Show sync history command
     this.addCommand({
-      id: 'show-sync-history',
-      name: 'Show sync history',
+      id: "show-sync-history",
+      name: "Show sync history",
       callback: () => {
         new MergeHistoryModal(this.app).open();
       },
@@ -350,8 +425,8 @@ export default class PeerVaultPlugin extends Plugin {
 
     // Show file history command
     this.addCommand({
-      id: 'show-history',
-      name: 'Show file history',
+      id: "show-history",
+      name: "Show file history",
       callback: () => {
         new FileHistoryModal(this.app, this).open();
       },
@@ -359,8 +434,8 @@ export default class PeerVaultPlugin extends Plugin {
 
     // Selective sync command
     this.addCommand({
-      id: 'selective-sync',
-      name: 'Configure selective sync',
+      id: "selective-sync",
+      name: "Configure selective sync",
       callback: () => {
         new SelectiveSyncModal(this.app, this).open();
       },
@@ -368,8 +443,8 @@ export default class PeerVaultPlugin extends Plugin {
 
     // Encryption settings command
     this.addCommand({
-      id: 'encryption-settings',
-      name: 'Encryption settings',
+      id: "encryption-settings",
+      name: "Encryption settings",
       callback: () => {
         new EncryptionModal(this.app, this).open();
       },
@@ -377,10 +452,36 @@ export default class PeerVaultPlugin extends Plugin {
 
     // View conflicts command
     this.addCommand({
-      id: 'view-conflicts',
-      name: 'View concurrent edits',
+      id: "view-conflicts",
+      name: "View concurrent edits",
       callback: () => {
         new ConflictModal(this.app, this).open();
+      },
+    });
+
+    // Run garbage collection command
+    this.addCommand({
+      id: "run-gc",
+      name: "Run garbage collection",
+      callback: async () => {
+        new Notice("PeerVault: Running garbage collection...");
+        try {
+          const stats = await this.gc.run((percent, message) => {
+            this.logger.debug(
+              `GC progress: ${percent.toFixed(0)}% - ${message}`,
+            );
+          });
+          const savedMB = (
+            (stats.beforeSize - stats.afterSize) /
+            (1024 * 1024)
+          ).toFixed(2);
+          new Notice(
+            `PeerVault: GC complete - saved ${savedMB} MB, removed ${stats.blobsRemoved} orphaned blobs`,
+          );
+        } catch (error) {
+          this.logger.error("GC failed:", error);
+          new Notice(`PeerVault: GC failed - ${error}`);
+        }
       },
     });
   }
@@ -396,31 +497,31 @@ export default class PeerVaultPlugin extends Plugin {
   private setupFileWatcher(): void {
     // Watch for file changes - route through VaultSync for content syncing
     this.registerEvent(
-      this.app.vault.on('create', async (file) => {
-        this.logger.debug('File created:', file.path);
+      this.app.vault.on("create", async (file) => {
+        this.logger.debug("File created:", file.path);
         await this.vaultSync.handleFileCreate(file);
-      })
+      }),
     );
 
     this.registerEvent(
-      this.app.vault.on('modify', async (file) => {
-        this.logger.debug('File modified:', file.path);
+      this.app.vault.on("modify", async (file) => {
+        this.logger.debug("File modified:", file.path);
         await this.vaultSync.handleFileModify(file);
-      })
+      }),
     );
 
     this.registerEvent(
-      this.app.vault.on('delete', async (file) => {
-        this.logger.debug('File deleted:', file.path);
+      this.app.vault.on("delete", async (file) => {
+        this.logger.debug("File deleted:", file.path);
         await this.vaultSync.handleFileDelete(file);
-      })
+      }),
     );
 
     this.registerEvent(
-      this.app.vault.on('rename', async (file, oldPath) => {
-        this.logger.debug('File renamed:', oldPath, '->', file.path);
+      this.app.vault.on("rename", async (file, oldPath) => {
+        this.logger.debug("File renamed:", oldPath, "->", file.path);
         await this.vaultSync.handleFileRename(file, oldPath);
-      })
+      }),
     );
   }
 
@@ -444,10 +545,19 @@ export default class PeerVaultPlugin extends Plugin {
     // Convert peer manager PeerInfo to types.ts PeerInfo
     return this.peerManager.getPeers().map((p) => ({
       nodeId: p.nodeId,
-      name: p.name ?? 'Unknown Device',
-      deviceType: 'unknown' as const,
+      name: p.name ?? "Unknown Device",
+      deviceType: "unknown" as const,
       lastSeen: p.lastSeen ?? p.firstSeen,
-      connectionState: p.state === 'synced' ? 'connected' : p.state === 'syncing' ? 'syncing' : p.state === 'connecting' ? 'connecting' : p.state === 'error' ? 'error' : 'disconnected',
+      connectionState:
+        p.state === "synced"
+          ? "connected"
+          : p.state === "syncing"
+            ? "syncing"
+            : p.state === "connecting"
+              ? "connecting"
+              : p.state === "error"
+                ? "error"
+                : "disconnected",
     }));
   }
 
@@ -456,20 +566,20 @@ export default class PeerVaultPlugin extends Plugin {
    */
   async sync(): Promise<void> {
     if (!this.peerManager) {
-      this.logger.warn('Peer manager not initialized');
+      this.logger.warn("Peer manager not initialized");
       return;
     }
 
-    this.setSyncStatus('syncing');
-    new Notice('PeerVault: Syncing...');
+    this.setSyncStatus("syncing");
+    new Notice("PeerVault: Syncing...");
 
     try {
       await this.peerManager.syncAll();
-      this.setSyncStatus('idle');
-      new Notice('PeerVault: Sync complete');
+      this.setSyncStatus("idle");
+      new Notice("PeerVault: Sync complete");
     } catch (error) {
-      this.logger.error('Sync failed:', error);
-      this.setSyncStatus('error');
+      this.logger.error("Sync failed:", error);
+      this.setSyncStatus("error");
       new Notice(`PeerVault: Sync failed - ${error}`);
     }
   }
@@ -479,7 +589,7 @@ export default class PeerVaultPlugin extends Plugin {
    */
   async addPeer(ticket: string, name?: string): Promise<void> {
     if (!this.peerManager) {
-      throw new Error('Peer manager not initialized');
+      throw new Error("Peer manager not initialized");
     }
 
     await this.peerManager.addPeer(ticket, name);
@@ -490,7 +600,7 @@ export default class PeerVaultPlugin extends Plugin {
    */
   async generateInvite(): Promise<string> {
     if (!this.peerManager) {
-      throw new Error('Peer manager not initialized');
+      throw new Error("Peer manager not initialized");
     }
 
     return this.peerManager.generateInvite();
@@ -501,8 +611,21 @@ export default class PeerVaultPlugin extends Plugin {
    */
   getNodeId(): string {
     if (!this.transport) {
-      return 'Not initialized';
+      return "Not initialized";
     }
     return this.transport.getNodeId();
+  }
+
+  /**
+   * Update vault sync with peer group exclusions.
+   * Called when peer connections change or group policies are updated.
+   */
+  private updateVaultSyncPeerExclusions(): void {
+    if (!this.peerManager || !this.vaultSync) {
+      return;
+    }
+
+    const excludedFolders = this.peerManager.getConnectedPeersExcludedFolders();
+    this.vaultSync.updatePeerExcludedFolders(excludedFolders);
   }
 }

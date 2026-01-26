@@ -154,18 +154,18 @@ export type AnySyncMessage =
 
 /** Sync session state */
 export type SyncSessionState =
-  | 'idle'
-  | 'connecting'
-  | 'exchanging_versions'
-  | 'syncing'
-  | 'live'
-  | 'error'
-  | 'closed';
+  | "idle"
+  | "connecting"
+  | "exchanging_versions"
+  | "syncing"
+  | "live"
+  | "error"
+  | "closed";
 
 /** Sync session events */
 export interface SyncSessionEvents {
-  'state:change': { state: SyncSessionState };
-  'sync:progress': { sent: number; received: number };
-  'sync:complete': { versionBytes: Uint8Array };
-  'error': { error: Error };
+  "state:change": { state: SyncSessionState };
+  "sync:progress": { sent: number; received: number };
+  "sync:complete": { versionBytes: Uint8Array };
+  error: { error: Error };
 }

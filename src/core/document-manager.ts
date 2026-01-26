@@ -5,11 +5,23 @@
  * content storage, and synchronization.
  */
 
-import { LoroDoc, LoroTree, LoroMap, LoroText, LoroList, LoroTreeNode, VersionVector } from 'loro-crdt';
-import type { StorageAdapter, FileNodeMeta, SerializedVersionVector } from '../types';
-import type { Logger } from '../utils/logger';
-import { isBinaryFile } from './blob-store';
-import { computeTextEdits } from '../utils/text-diff';
+import {
+  LoroDoc,
+  LoroTree,
+  LoroMap,
+  LoroText,
+  LoroList,
+  LoroTreeNode,
+  VersionVector,
+} from "loro-crdt";
+import type {
+  StorageAdapter,
+  FileNodeMeta,
+  SerializedVersionVector,
+} from "../types";
+import type { Logger } from "../utils/logger";
+import { isBinaryFile } from "./blob-store";
+import { computeTextEdits } from "../utils/text-diff";
 
 /**
  * Wait for loro-crdt WASM to be initialized.
@@ -18,19 +30,19 @@ import { computeTextEdits } from '../utils/text-diff';
  */
 export async function waitForLoroWasm(): Promise<void> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const loroModule = await import('loro-crdt') as any;
+  const loroModule = (await import("loro-crdt")) as any;
   if (loroModule.__wasmReady) {
     await loroModule.__wasmReady;
   }
 }
 
-const SNAPSHOT_KEY = 'peervault-snapshot';
+const SNAPSHOT_KEY = "peervault-snapshot";
 
 // TreeID is a string in format `${counter}@${peer}` where peer is a number
 type TreeID = `${number}@${number}`;
 
 /** Content type stored in the document */
-export type ContentType = 'text' | 'binary' | 'folder';
+export type ContentType = "text" | "binary" | "folder";
 
 /** File content info */
 export interface FileContent {
@@ -43,10 +55,10 @@ export interface FileContent {
 
 /** Change event for external listeners */
 export interface FileChangeEvent {
-  type: 'create' | 'modify' | 'delete' | 'rename';
+  type: "create" | "modify" | "delete" | "rename";
   path: string;
   oldPath?: string;
-  origin: 'local' | 'remote';
+  origin: "local" | "remote";
 }
 
 export class DocumentManager {
@@ -61,12 +73,12 @@ export class DocumentManager {
 
   constructor(
     private storage: StorageAdapter,
-    private logger: Logger
+    private logger: Logger,
   ) {
     this.doc = new LoroDoc();
-    this.tree = this.doc.getTree('files');
-    this.meta = this.doc.getMap('meta');
-    this.contents = this.doc.getMap('contents');
+    this.tree = this.doc.getTree("files");
+    this.meta = this.doc.getMap("meta");
+    this.contents = this.doc.getMap("contents");
   }
 
   // ===========================================================================
@@ -83,12 +95,12 @@ export class DocumentManager {
       // Try to load existing document
       const snapshot = await this.storage.read(SNAPSHOT_KEY);
       if (snapshot) {
-        this.logger.info('Loading document from snapshot...');
+        this.logger.info("Loading document from snapshot...");
         this.doc.import(snapshot);
         this.rebuildPathCache();
-        this.logger.info('Document loaded successfully');
+        this.logger.info("Document loaded successfully");
       } else {
-        this.logger.info('No existing document found, starting fresh');
+        this.logger.info("No existing document found, starting fresh");
         this.initializeSchema();
       }
 
@@ -99,7 +111,7 @@ export class DocumentManager {
 
       this.initialized = true;
     } catch (error) {
-      this.logger.error('Failed to initialize document:', error);
+      this.logger.error("Failed to initialize document:", error);
       throw error;
     }
   }
@@ -109,10 +121,29 @@ export class DocumentManager {
    */
   private initializeSchema(): void {
     // Set up metadata
-    this.meta.set('version', 1);
-    this.meta.set('createdAt', Date.now());
-    this.meta.set('vaultId', crypto.randomUUID());
+    this.meta.set("version", 1);
+    this.meta.set("createdAt", Date.now());
+    this.meta.set("vaultId", crypto.randomUUID());
 
+    this.doc.commit();
+  }
+
+  /**
+   * Get the schema version from the document metadata.
+   * Returns 1 for documents created before version tracking was added.
+   */
+  getSchemaVersion(): number {
+    const version = this.meta.get("version");
+    return typeof version === "number" ? version : 1;
+  }
+
+  /**
+   * Set the schema version in the document metadata.
+   * Called after successful migrations.
+   */
+  setSchemaVersion(version: number): void {
+    this.meta.set("version", version);
+    this.meta.set("versionUpdatedAt", Date.now());
     this.doc.commit();
   }
 
@@ -125,16 +156,16 @@ export class DocumentManager {
 
     const roots = this.tree.roots();
     for (const root of roots) {
-      this.cacheNodePath(root, '');
+      this.cacheNodePath(root, "");
     }
   }
 
   private cacheNodePath(node: LoroTreeNode, parentPath: string): void {
     const meta = node.data;
-    const name = meta?.get('name') as string | undefined;
+    const name = meta?.get("name") as string | undefined;
     if (!name) return;
 
-    const deleted = meta?.get('deleted') as boolean | undefined;
+    const deleted = meta?.get("deleted") as boolean | undefined;
     if (deleted) return;
 
     const path = parentPath ? `${parentPath}/${name}` : name;
@@ -166,11 +197,11 @@ export class DocumentManager {
    */
   async save(): Promise<void> {
     try {
-      const snapshot = this.doc.export({ mode: 'snapshot' });
+      const snapshot = this.doc.export({ mode: "snapshot" });
       await this.storage.write(SNAPSHOT_KEY, snapshot);
-      this.logger.debug('Document saved');
+      this.logger.debug("Document saved");
     } catch (error) {
-      this.logger.error('Failed to save document:', error);
+      this.logger.error("Failed to save document:", error);
       throw error;
     }
   }
@@ -180,9 +211,64 @@ export class DocumentManager {
    */
   exportUpdates(sinceVersion?: VersionVector): Uint8Array {
     if (sinceVersion) {
-      return this.doc.export({ mode: 'update', from: sinceVersion });
+      return this.doc.export({ mode: "update", from: sinceVersion });
     }
-    return this.doc.export({ mode: 'update' });
+    return this.doc.export({ mode: "update" });
+  }
+
+  /**
+   * Get the current document size in bytes.
+   */
+  getDocumentSize(): number {
+    const snapshot = this.doc.export({ mode: "snapshot" });
+    return snapshot.length;
+  }
+
+  /**
+   * Compact the document by creating a shallow snapshot.
+   * This discards detailed history while preserving current state.
+   *
+   * WARNING: After compaction, incremental sync with peers that haven't
+   * synced recently may require a full sync instead.
+   *
+   * @returns Size before and after compaction
+   */
+  async compact(): Promise<{ beforeSize: number; afterSize: number }> {
+    const beforeSize = this.getDocumentSize();
+
+    // Get current frontiers for shallow snapshot
+    const frontiers = this.doc.oplogFrontiers();
+
+    // Export as shallow snapshot (discards detailed operation history)
+    // Note: shallow-snapshot mode requires peers to have synced recently
+    // to be able to continue incremental sync
+    const compacted = this.doc.export({ mode: "shallow-snapshot", frontiers });
+
+    // Create a new document from the compacted export
+    const newDoc = new LoroDoc();
+    newDoc.import(compacted);
+
+    // Replace current document internals
+    this.doc = newDoc;
+    this.tree = this.doc.getTree("files");
+    this.meta = this.doc.getMap("meta");
+    this.contents = this.doc.getMap("contents");
+
+    // Rebuild caches
+    this.rebuildPathCache();
+
+    // Re-subscribe to document changes
+    this.doc.subscribe((event) => {
+      this.handleDocChange(event);
+    });
+
+    const afterSize = compacted.length;
+
+    this.logger.info(
+      `Document compacted: ${beforeSize} -> ${afterSize} bytes (${((1 - afterSize / beforeSize) * 100).toFixed(1)}% reduction)`,
+    );
+
+    return { beforeSize, afterSize };
   }
 
   /**
@@ -220,9 +306,9 @@ export class DocumentManager {
       return;
     }
 
-    const parts = path.split('/');
+    const parts = path.split("/");
     const fileName = parts.pop()!;
-    const parentPath = parts.join('/');
+    const parentPath = parts.join("/");
 
     // Ensure parent folders exist
     let parentId: TreeID | undefined;
@@ -236,17 +322,17 @@ export class DocumentManager {
     const meta = node.data;
     const now = Date.now();
 
-    meta.set('name', fileName);
-    meta.set('type', this.getMimeType(fileName));
-    meta.set('mtime', now);
-    meta.set('ctime', now);
+    meta.set("name", fileName);
+    meta.set("type", this.getMimeType(fileName));
+    meta.set("mtime", now);
+    meta.set("ctime", now);
 
     // Cache the path
     this.pathCache.set(path, nodeId);
     this.nodePathCache.set(nodeId, path);
 
     this.doc.commit();
-    this.logger.debug('Created file node:', path);
+    this.logger.debug("Created file node:", path);
   }
 
   /**
@@ -264,10 +350,10 @@ export class DocumentManager {
     if (!node) return;
 
     const meta = node.data;
-    meta.set('mtime', Date.now());
+    meta.set("mtime", Date.now());
 
     this.doc.commit();
-    this.logger.debug('Modified file node:', path);
+    this.logger.debug("Modified file node:", path);
   }
 
   /**
@@ -282,15 +368,15 @@ export class DocumentManager {
 
     // Soft delete - set deleted flag
     const meta = node.data;
-    meta.set('deleted', true);
-    meta.set('deletedAt', Date.now());
+    meta.set("deleted", true);
+    meta.set("deletedAt", Date.now());
 
     // Remove from cache
     this.pathCache.delete(path);
     this.nodePathCache.delete(nodeId);
 
     this.doc.commit();
-    this.logger.debug('Deleted file node:', path);
+    this.logger.debug("Deleted file node:", path);
   }
 
   /**
@@ -307,24 +393,26 @@ export class DocumentManager {
     const node = this.getNodeById(nodeId);
     if (!node) return;
 
-    const oldParts = oldPath.split('/');
-    const newParts = newPath.split('/');
+    const oldParts = oldPath.split("/");
+    const newParts = newPath.split("/");
     const newFileName = newParts.pop()!;
-    const newParentPath = newParts.join('/');
+    const newParentPath = newParts.join("/");
 
     // Update name
     const meta = node.data;
-    meta.set('name', newFileName);
-    meta.set('mtime', Date.now());
+    meta.set("name", newFileName);
+    meta.set("mtime", Date.now());
 
     // Move to new parent if needed
-    const oldParentPath = oldParts.slice(0, -1).join('/');
+    const oldParentPath = oldParts.slice(0, -1).join("/");
     if (oldParentPath !== newParentPath) {
       const newParentId = newParentPath
         ? await this.ensureFolderPath(newParentPath)
         : undefined;
 
-      const newParentNode = newParentId ? this.getNodeById(newParentId) : undefined;
+      const newParentNode = newParentId
+        ? this.getNodeById(newParentId)
+        : undefined;
       node.move(newParentNode);
     }
 
@@ -334,7 +422,7 @@ export class DocumentManager {
     this.nodePathCache.set(nodeId, newPath);
 
     this.doc.commit();
-    this.logger.debug('Renamed file node:', oldPath, '->', newPath);
+    this.logger.debug("Renamed file node:", oldPath, "->", newPath);
   }
 
   /**
@@ -345,8 +433,8 @@ export class DocumentManager {
     const cached = this.pathCache.get(folderPath);
     if (cached) return cached;
 
-    const parts = folderPath.split('/');
-    let currentPath = '';
+    const parts = folderPath.split("/");
+    let currentPath = "";
     let parentId: TreeID | undefined;
 
     for (const part of parts) {
@@ -361,10 +449,10 @@ export class DocumentManager {
         const meta = node.data;
         const now = Date.now();
 
-        meta.set('name', part);
-        meta.set('type', 'folder');
-        meta.set('mtime', now);
-        meta.set('ctime', now);
+        meta.set("name", part);
+        meta.set("type", "folder");
+        meta.set("mtime", now);
+        meta.set("ctime", now);
 
         this.pathCache.set(currentPath, nodeId);
         this.nodePathCache.set(nodeId, currentPath);
@@ -381,7 +469,7 @@ export class DocumentManager {
    */
   private getNodeById(nodeId: TreeID): LoroTreeNode | undefined {
     const nodes = this.tree.getNodes({ withDeleted: true });
-    return nodes.find(n => this.getNodeId(n) === nodeId);
+    return nodes.find((n) => this.getNodeId(n) === nodeId);
   }
 
   // ===========================================================================
@@ -414,12 +502,12 @@ export class DocumentManager {
 
     const meta = node.data;
     return {
-      name: meta.get('name') as string,
-      type: meta.get('type') as string,
-      mtime: meta.get('mtime') as number,
-      ctime: meta.get('ctime') as number,
-      deleted: meta.get('deleted') as boolean | undefined,
-      blobHash: meta.get('blobHash') as string | undefined,
+      name: meta.get("name") as string,
+      type: meta.get("type") as string,
+      mtime: meta.get("mtime") as number,
+      ctime: meta.get("ctime") as number,
+      deleted: meta.get("deleted") as boolean | undefined,
+      blobHash: meta.get("blobHash") as string | undefined,
     };
   }
 
@@ -434,7 +522,7 @@ export class DocumentManager {
    * Get the vault ID.
    */
   getVaultId(): string {
-    return this.meta.get('vaultId') as string;
+    return this.meta.get("vaultId") as string;
   }
 
   /**
@@ -463,7 +551,7 @@ export class DocumentManager {
    */
   checkoutVersion(version: VersionVector): LoroDoc {
     // Export current state
-    const snapshot = this.doc.export({ mode: 'snapshot' });
+    const snapshot = this.doc.export({ mode: "snapshot" });
 
     // Create a new doc and import
     const historicalDoc = new LoroDoc();
@@ -475,7 +563,7 @@ export class DocumentManager {
       const frontiers = this.doc.oplogFrontiers();
       historicalDoc.checkout(frontiers);
     } catch (err) {
-      this.logger.warn('Checkout failed, returning current state:', err);
+      this.logger.warn("Checkout failed, returning current state:", err);
     }
 
     return historicalDoc;
@@ -486,17 +574,21 @@ export class DocumentManager {
    */
   getTextContentFromDoc(doc: LoroDoc, path: string): string | undefined {
     // Rebuild path cache for the historical doc
-    const tree = doc.getTree('files');
-    const contents = doc.getMap('contents');
+    const tree = doc.getTree("files");
+    const contents = doc.getMap("contents");
 
     // Find the node by path
     const roots = tree.roots();
     for (const root of roots) {
-      const result = this.findNodeByPathInTree(root, path, '');
+      const result = this.findNodeByPathInTree(root, path, "");
       if (result) {
         const nodeId = `${result.creationId().counter}@${result.creationId().peer}`;
         const textContainer = contents.get(nodeId);
-        if (textContainer && typeof textContainer === 'object' && 'toString' in textContainer) {
+        if (
+          textContainer &&
+          typeof textContainer === "object" &&
+          "toString" in textContainer
+        ) {
           return (textContainer as { toString(): string }).toString();
         }
       }
@@ -511,13 +603,13 @@ export class DocumentManager {
   private findNodeByPathInTree(
     node: LoroTreeNode,
     targetPath: string,
-    currentPath: string
+    currentPath: string,
   ): LoroTreeNode | undefined {
     const meta = node.data;
-    const name = meta?.get('name') as string | undefined;
+    const name = meta?.get("name") as string | undefined;
     if (!name) return undefined;
 
-    const deleted = meta?.get('deleted') as boolean | undefined;
+    const deleted = meta?.get("deleted") as boolean | undefined;
     if (deleted) return undefined;
 
     const path = currentPath ? `${currentPath}/${name}` : name;
@@ -547,7 +639,7 @@ export class DocumentManager {
   setTextContent(path: string, content: string): void {
     const nodeId = this.pathCache.get(path);
     if (!nodeId) {
-      this.logger.warn('Cannot set content: file not found:', path);
+      this.logger.warn("Cannot set content: file not found:", path);
       return;
     }
 
@@ -586,12 +678,19 @@ export class DocumentManager {
     // Update metadata
     const node = this.getNodeById(nodeId);
     if (node) {
-      node.data.set('contentType', 'text');
-      node.data.set('mtime', Date.now());
+      node.data.set("contentType", "text");
+      node.data.set("mtime", Date.now());
     }
 
     this.doc.commit();
-    this.logger.debug('Set text content for:', path, 'edits:', edits.length, 'length:', content.length);
+    this.logger.debug(
+      "Set text content for:",
+      path,
+      "edits:",
+      edits.length,
+      "length:",
+      content.length,
+    );
   }
 
   /**
@@ -613,7 +712,7 @@ export class DocumentManager {
   setBlobHash(path: string, blobHash: string): void {
     const nodeId = this.pathCache.get(path);
     if (!nodeId) {
-      this.logger.warn('Cannot set blob hash: file not found:', path);
+      this.logger.warn("Cannot set blob hash: file not found:", path);
       return;
     }
 
@@ -623,13 +722,18 @@ export class DocumentManager {
     // Update metadata
     const node = this.getNodeById(nodeId);
     if (node) {
-      node.data.set('contentType', 'binary');
-      node.data.set('blobHash', blobHash);
-      node.data.set('mtime', Date.now());
+      node.data.set("contentType", "binary");
+      node.data.set("blobHash", blobHash);
+      node.data.set("mtime", Date.now());
     }
 
     this.doc.commit();
-    this.logger.debug('Set blob hash for:', path, 'hash:', blobHash.substring(0, 8));
+    this.logger.debug(
+      "Set blob hash for:",
+      path,
+      "hash:",
+      blobHash.substring(0, 8),
+    );
   }
 
   /**
@@ -643,12 +747,12 @@ export class DocumentManager {
     if (!node) return undefined;
 
     // Check metadata first
-    const metaHash = node.data.get('blobHash') as string | undefined;
+    const metaHash = node.data.get("blobHash") as string | undefined;
     if (metaHash) return metaHash;
 
     // Fall back to contents map
     const content = this.contents.get(nodeId);
-    if (typeof content === 'string') {
+    if (typeof content === "string") {
       return content;
     }
 
@@ -665,23 +769,23 @@ export class DocumentManager {
     const node = this.getNodeById(nodeId);
     if (!node) return undefined;
 
-    const contentType = node.data.get('contentType') as ContentType | undefined;
-    const mimeType = node.data.get('type') as string;
+    const contentType = node.data.get("contentType") as ContentType | undefined;
+    const mimeType = node.data.get("type") as string;
 
-    if (mimeType === 'folder') {
-      return { type: 'folder' };
+    if (mimeType === "folder") {
+      return { type: "folder" };
     }
 
-    if (contentType === 'binary') {
+    if (contentType === "binary") {
       return {
-        type: 'binary',
+        type: "binary",
         blobHash: this.getBlobHash(path),
       };
     }
 
     // Default to text
     return {
-      type: 'text',
+      type: "text",
       text: this.getTextContent(path),
     };
   }
@@ -712,7 +816,7 @@ export class DocumentManager {
       try {
         callback(event);
       } catch (err) {
-        this.logger.error('Error in file change callback:', err);
+        this.logger.error("Error in file change callback:", err);
       }
     }
   }
@@ -727,8 +831,8 @@ export class DocumentManager {
       const node = this.getNodeById(nodeId);
       if (!node) continue;
 
-      const mimeType = node.data.get('type') as string;
-      if (mimeType === 'folder') continue;
+      const mimeType = node.data.get("type") as string;
+      if (mimeType === "folder") continue;
 
       const hasContent = this.contents.get(nodeId) !== undefined;
       if (!hasContent) {
@@ -760,26 +864,26 @@ export class DocumentManager {
   // ===========================================================================
 
   private getMimeType(fileName: string): string {
-    const ext = fileName.split('.').pop()?.toLowerCase();
+    const ext = fileName.split(".").pop()?.toLowerCase();
     const mimeTypes: Record<string, string> = {
-      md: 'text/markdown',
-      txt: 'text/plain',
-      json: 'application/json',
-      canvas: 'application/json',
-      css: 'text/css',
-      js: 'application/javascript',
-      png: 'image/png',
-      jpg: 'image/jpeg',
-      jpeg: 'image/jpeg',
-      gif: 'image/gif',
-      svg: 'image/svg+xml',
-      pdf: 'application/pdf',
+      md: "text/markdown",
+      txt: "text/plain",
+      json: "application/json",
+      canvas: "application/json",
+      css: "text/css",
+      js: "application/javascript",
+      png: "image/png",
+      jpg: "image/jpeg",
+      jpeg: "image/jpeg",
+      gif: "image/gif",
+      svg: "image/svg+xml",
+      pdf: "application/pdf",
     };
-    return mimeTypes[ext ?? ''] ?? 'application/octet-stream';
+    return mimeTypes[ext ?? ""] ?? "application/octet-stream";
   }
 
   private handleDocChange(event: unknown): void {
     // Handle document changes from Loro
-    this.logger.debug('Document changed:', event);
+    this.logger.debug("Document changed:", event);
   }
 }

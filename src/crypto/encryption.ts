@@ -5,8 +5,13 @@
  * Uses XSalsa20-Poly1305 authenticated encryption.
  */
 
-import nacl from 'tweetnacl';
-import { encodeBase64, decodeBase64, encodeUTF8, decodeUTF8 } from 'tweetnacl-util';
+import nacl from "tweetnacl";
+import {
+  encodeBase64,
+  decodeBase64,
+  encodeUTF8,
+  decodeUTF8,
+} from "tweetnacl-util";
 
 /** Encryption key length in bytes (256 bits) */
 const KEY_LENGTH = nacl.secretbox.keyLength; // 32 bytes
@@ -26,7 +31,9 @@ export class EncryptionService {
    */
   setKey(key: Uint8Array): void {
     if (key.length !== KEY_LENGTH) {
-      throw new Error(`Invalid key length: expected ${KEY_LENGTH}, got ${key.length}`);
+      throw new Error(
+        `Invalid key length: expected ${KEY_LENGTH}, got ${key.length}`,
+      );
     }
     this.key = key;
     this.enabled = true;
@@ -81,7 +88,7 @@ export class EncryptionService {
    */
   encrypt(plaintext: Uint8Array): Uint8Array {
     if (!this.key) {
-      throw new Error('Encryption key not set');
+      throw new Error("Encryption key not set");
     }
 
     const nonce = nacl.randomBytes(NONCE_LENGTH);
@@ -101,11 +108,11 @@ export class EncryptionService {
    */
   decrypt(encrypted: Uint8Array): Uint8Array {
     if (!this.key) {
-      throw new Error('Encryption key not set');
+      throw new Error("Encryption key not set");
     }
 
     if (encrypted.length < NONCE_LENGTH + nacl.secretbox.overheadLength) {
-      throw new Error('Invalid encrypted data: too short');
+      throw new Error("Invalid encrypted data: too short");
     }
 
     const nonce = encrypted.slice(0, NONCE_LENGTH);
@@ -113,7 +120,7 @@ export class EncryptionService {
 
     const plaintext = nacl.secretbox.open(ciphertext, nonce, this.key);
     if (!plaintext) {
-      throw new Error('Decryption failed: invalid ciphertext or wrong key');
+      throw new Error("Decryption failed: invalid ciphertext or wrong key");
     }
 
     return plaintext;
@@ -166,10 +173,10 @@ export class EncryptionService {
 export async function deriveKeyFromPassword(
   password: string,
   salt: Uint8Array,
-  iterations: number = 100000
+  iterations: number = 100000,
 ): Promise<Uint8Array> {
   // Use SubtleCrypto for PBKDF2 if available
-  if (typeof crypto !== 'undefined' && crypto.subtle) {
+  if (typeof crypto !== "undefined" && crypto.subtle) {
     try {
       const passwordBytes = decodeUTF8(password);
       // Create new ArrayBuffer to ensure it's not SharedArrayBuffer
@@ -180,22 +187,22 @@ export async function deriveKeyFromPassword(
       new Uint8Array(saltBuffer).set(salt);
 
       const passwordKey = await crypto.subtle.importKey(
-        'raw',
+        "raw",
         passwordBuffer,
-        'PBKDF2',
+        "PBKDF2",
         false,
-        ['deriveBits']
+        ["deriveBits"],
       );
 
       const derivedBits = await crypto.subtle.deriveBits(
         {
-          name: 'PBKDF2',
+          name: "PBKDF2",
           salt: saltBuffer,
           iterations,
-          hash: 'SHA-256',
+          hash: "SHA-256",
         },
         passwordKey,
-        KEY_LENGTH * 8
+        KEY_LENGTH * 8,
       );
 
       return new Uint8Array(derivedBits);
@@ -240,8 +247,8 @@ export function importKey(base64Key: string): Uint8Array {
  */
 export function keyToRecoveryPhrase(key: Uint8Array): string {
   const hex = Array.from(key)
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 
   // Split into 8-character groups
   const groups: string[] = [];
@@ -249,16 +256,16 @@ export function keyToRecoveryPhrase(key: Uint8Array): string {
     groups.push(hex.slice(i, i + 8));
   }
 
-  return groups.join('-');
+  return groups.join("-");
 }
 
 /**
  * Recover key from recovery phrase.
  */
 export function recoveryPhraseToKey(phrase: string): Uint8Array {
-  const hex = phrase.replace(/-/g, '');
+  const hex = phrase.replace(/-/g, "");
   if (hex.length !== KEY_LENGTH * 2) {
-    throw new Error('Invalid recovery phrase length');
+    throw new Error("Invalid recovery phrase length");
   }
 
   const key = new Uint8Array(KEY_LENGTH);

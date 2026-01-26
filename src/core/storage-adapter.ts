@@ -4,10 +4,10 @@
  * Provides a unified storage interface on top of Obsidian's plugin data API.
  */
 
-import type { Plugin } from 'obsidian';
-import type { StorageAdapter } from '../types';
+import type { Plugin } from "obsidian";
+import type { StorageAdapter } from "../types";
 
-const STORAGE_PREFIX = 'peervault-storage/';
+const STORAGE_PREFIX = "peervault-storage/";
 
 /**
  * Storage adapter using Obsidian's plugin data directory.
@@ -51,7 +51,7 @@ export class ObsidianStorageAdapter implements StorageAdapter {
       const adapter = this.plugin.app.vault.adapter;
 
       // Ensure parent directory exists
-      const dir = path.substring(0, path.lastIndexOf('/'));
+      const dir = path.substring(0, path.lastIndexOf("/"));
       if (dir && !(await adapter.exists(dir))) {
         await adapter.mkdir(dir);
       }
@@ -87,7 +87,7 @@ export class ObsidianStorageAdapter implements StorageAdapter {
    */
   async list(prefix?: string): Promise<string[]> {
     try {
-      const basePath = this.getStoragePath('');
+      const basePath = this.getStoragePath("");
       const adapter = this.plugin.app.vault.adapter;
 
       if (!(await adapter.exists(basePath))) {
@@ -96,7 +96,7 @@ export class ObsidianStorageAdapter implements StorageAdapter {
 
       const listing = await adapter.list(basePath);
       let keys = listing.files.map((f) =>
-        f.substring(basePath.length).replace(/^\//, '')
+        f.substring(basePath.length).replace(/^\//, ""),
       );
 
       if (prefix) {
@@ -105,7 +105,7 @@ export class ObsidianStorageAdapter implements StorageAdapter {
 
       return keys;
     } catch (error) {
-      console.error('Failed to list storage keys:', error);
+      console.error("Failed to list storage keys:", error);
       return [];
     }
   }

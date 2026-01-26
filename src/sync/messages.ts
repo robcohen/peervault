@@ -19,7 +19,7 @@ import {
   type BlobRequestMessage,
   type BlobDataMessage,
   type BlobSyncCompleteMessage,
-} from './types';
+} from "./types";
 
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
@@ -52,7 +52,9 @@ export function serializeMessage(message: AnySyncMessage): Uint8Array {
     case SyncMessageType.BLOB_SYNC_COMPLETE:
       return serializeBlobSyncComplete(message);
     default:
-      throw new Error(`Unknown message type: ${(message as AnySyncMessage).type}`);
+      throw new Error(
+        `Unknown message type: ${(message as AnySyncMessage).type}`,
+      );
   }
 }
 
@@ -61,7 +63,7 @@ export function serializeMessage(message: AnySyncMessage): Uint8Array {
  */
 export function deserializeMessage(data: Uint8Array): AnySyncMessage {
   if (data.length < 9) {
-    throw new Error('Message too short');
+    throw new Error("Message too short");
   }
 
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
@@ -111,7 +113,8 @@ export function deserializeMessage(data: Uint8Array): AnySyncMessage {
  */
 function serializeVersionInfo(msg: VersionInfoMessage): Uint8Array {
   const vaultIdBytes = TEXT_ENCODER.encode(msg.vaultId);
-  const totalLength = 1 + 8 + 4 + vaultIdBytes.length + 4 + msg.versionBytes.length;
+  const totalLength =
+    1 + 8 + 4 + vaultIdBytes.length + 4 + msg.versionBytes.length;
 
   const buffer = new ArrayBuffer(totalLength);
   const view = new DataView(buffer);
@@ -134,7 +137,10 @@ function serializeVersionInfo(msg: VersionInfoMessage): Uint8Array {
   return bytes;
 }
 
-function deserializeVersionInfo(data: Uint8Array, timestamp: number): VersionInfoMessage {
+function deserializeVersionInfo(
+  data: Uint8Array,
+  timestamp: number,
+): VersionInfoMessage {
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   let offset = 9; // Skip type and timestamp
 
@@ -185,7 +191,10 @@ function serializeRequestUpdates(msg: RequestUpdatesMessage): Uint8Array {
   return bytes;
 }
 
-function deserializeRequestUpdates(data: Uint8Array, timestamp: number): RequestUpdatesMessage {
+function deserializeRequestUpdates(
+  data: Uint8Array,
+  timestamp: number,
+): RequestUpdatesMessage {
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   let offset = 9;
 
@@ -234,7 +243,10 @@ function serializeUpdates(msg: UpdatesMessage): Uint8Array {
   return bytes;
 }
 
-function deserializeUpdates(data: Uint8Array, timestamp: number): UpdatesMessage {
+function deserializeUpdates(
+  data: Uint8Array,
+  timestamp: number,
+): UpdatesMessage {
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   let offset = 9;
 
@@ -283,7 +295,10 @@ function serializeSyncComplete(msg: SyncCompleteMessage): Uint8Array {
   return bytes;
 }
 
-function deserializeSyncComplete(data: Uint8Array, timestamp: number): SyncCompleteMessage {
+function deserializeSyncComplete(
+  data: Uint8Array,
+  timestamp: number,
+): SyncCompleteMessage {
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   let offset = 9;
 
@@ -406,7 +421,7 @@ function deserializeError(data: Uint8Array, timestamp: number): ErrorMessage {
 
 export function createVersionInfoMessage(
   vaultId: string,
-  versionBytes: Uint8Array
+  versionBytes: Uint8Array,
 ): VersionInfoMessage {
   return {
     type: SyncMessageType.VERSION_INFO,
@@ -416,7 +431,9 @@ export function createVersionInfoMessage(
   };
 }
 
-export function createRequestUpdatesMessage(sinceVersionBytes: Uint8Array): RequestUpdatesMessage {
+export function createRequestUpdatesMessage(
+  sinceVersionBytes: Uint8Array,
+): RequestUpdatesMessage {
   return {
     type: SyncMessageType.REQUEST_UPDATES,
     timestamp: Date.now(),
@@ -424,7 +441,10 @@ export function createRequestUpdatesMessage(sinceVersionBytes: Uint8Array): Requ
   };
 }
 
-export function createUpdatesMessage(updates: Uint8Array, opCount: number): UpdatesMessage {
+export function createUpdatesMessage(
+  updates: Uint8Array,
+  opCount: number,
+): UpdatesMessage {
   return {
     type: SyncMessageType.UPDATES,
     timestamp: Date.now(),
@@ -433,7 +453,9 @@ export function createUpdatesMessage(updates: Uint8Array, opCount: number): Upda
   };
 }
 
-export function createSyncCompleteMessage(versionBytes: Uint8Array): SyncCompleteMessage {
+export function createSyncCompleteMessage(
+  versionBytes: Uint8Array,
+): SyncCompleteMessage {
   return {
     type: SyncMessageType.SYNC_COMPLETE,
     timestamp: Date.now(),
@@ -457,7 +479,10 @@ export function createPongMessage(seq: number): PongMessage {
   };
 }
 
-export function createErrorMessage(code: SyncErrorCode, message: string): ErrorMessage {
+export function createErrorMessage(
+  code: SyncErrorCode,
+  message: string,
+): ErrorMessage {
   return {
     type: SyncMessageType.ERROR,
     timestamp: Date.now(),
@@ -506,7 +531,10 @@ function serializeBlobHashes(msg: BlobHashesMessage): Uint8Array {
   return bytes;
 }
 
-function deserializeBlobHashes(data: Uint8Array, timestamp: number): BlobHashesMessage {
+function deserializeBlobHashes(
+  data: Uint8Array,
+  timestamp: number,
+): BlobHashesMessage {
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   let offset = 9;
 
@@ -569,7 +597,10 @@ function serializeBlobRequest(msg: BlobRequestMessage): Uint8Array {
   return bytes;
 }
 
-function deserializeBlobRequest(data: Uint8Array, timestamp: number): BlobRequestMessage {
+function deserializeBlobRequest(
+  data: Uint8Array,
+  timestamp: number,
+): BlobRequestMessage {
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   let offset = 9;
 
@@ -609,8 +640,18 @@ function deserializeBlobRequest(data: Uint8Array, timestamp: number): BlobReques
  */
 function serializeBlobData(msg: BlobDataMessage): Uint8Array {
   const hashBytes = TEXT_ENCODER.encode(msg.hash);
-  const mimeTypeBytes = msg.mimeType ? TEXT_ENCODER.encode(msg.mimeType) : new Uint8Array(0);
-  const totalLength = 1 + 8 + 2 + hashBytes.length + 2 + mimeTypeBytes.length + 4 + msg.data.length;
+  const mimeTypeBytes = msg.mimeType
+    ? TEXT_ENCODER.encode(msg.mimeType)
+    : new Uint8Array(0);
+  const totalLength =
+    1 +
+    8 +
+    2 +
+    hashBytes.length +
+    2 +
+    mimeTypeBytes.length +
+    4 +
+    msg.data.length;
 
   const buffer = new ArrayBuffer(totalLength);
   const view = new DataView(buffer);
@@ -640,7 +681,10 @@ function serializeBlobData(msg: BlobDataMessage): Uint8Array {
   return bytes;
 }
 
-function deserializeBlobData(data: Uint8Array, timestamp: number): BlobDataMessage {
+function deserializeBlobData(
+  data: Uint8Array,
+  timestamp: number,
+): BlobDataMessage {
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   let offset = 9;
 
@@ -651,7 +695,10 @@ function deserializeBlobData(data: Uint8Array, timestamp: number): BlobDataMessa
 
   const mimeTypeLen = view.getUint16(offset, false);
   offset += 2;
-  const mimeType = mimeTypeLen > 0 ? TEXT_DECODER.decode(data.slice(offset, offset + mimeTypeLen)) : undefined;
+  const mimeType =
+    mimeTypeLen > 0
+      ? TEXT_DECODER.decode(data.slice(offset, offset + mimeTypeLen))
+      : undefined;
   offset += mimeTypeLen;
 
   const dataLen = view.getUint32(offset, false);
@@ -688,7 +735,10 @@ function serializeBlobSyncComplete(msg: BlobSyncCompleteMessage): Uint8Array {
   return new Uint8Array(buffer);
 }
 
-function deserializeBlobSyncComplete(data: Uint8Array, timestamp: number): BlobSyncCompleteMessage {
+function deserializeBlobSyncComplete(
+  data: Uint8Array,
+  timestamp: number,
+): BlobSyncCompleteMessage {
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   return {
     type: SyncMessageType.BLOB_SYNC_COMPLETE,
@@ -717,7 +767,11 @@ export function createBlobRequestMessage(hashes: string[]): BlobRequestMessage {
   };
 }
 
-export function createBlobDataMessage(hash: string, data: Uint8Array, mimeType?: string): BlobDataMessage {
+export function createBlobDataMessage(
+  hash: string,
+  data: Uint8Array,
+  mimeType?: string,
+): BlobDataMessage {
   return {
     type: SyncMessageType.BLOB_DATA,
     timestamp: Date.now(),
@@ -727,7 +781,9 @@ export function createBlobDataMessage(hash: string, data: Uint8Array, mimeType?:
   };
 }
 
-export function createBlobSyncCompleteMessage(blobCount: number): BlobSyncCompleteMessage {
+export function createBlobSyncCompleteMessage(
+  blobCount: number,
+): BlobSyncCompleteMessage {
   return {
     type: SyncMessageType.BLOB_SYNC_COMPLETE,
     timestamp: Date.now(),

@@ -11,7 +11,7 @@ import type {
   SyncStream,
   TransportConfig,
   ConnectionState,
-} from './types';
+} from "./types";
 
 // Type definitions matching the WASM module exports
 interface WasmEndpoint {
@@ -61,7 +61,10 @@ let initPromise: Promise<void> | null = null;
  * @param jsUrl - URL or path to the peervault_iroh.js file (from getResourcePath)
  * @param wasmUrl - Optional URL or path to the .wasm file (auto-detected if not provided)
  */
-export async function initIrohWasm(jsUrl?: string, wasmUrl?: string): Promise<void> {
+export async function initIrohWasm(
+  jsUrl?: string,
+  wasmUrl?: string,
+): Promise<void> {
   // Prevent multiple initializations
   if (wasmInitialized) return;
   if (initPromise) return initPromise;
@@ -70,11 +73,11 @@ export async function initIrohWasm(jsUrl?: string, wasmUrl?: string): Promise<vo
     try {
       // Dynamic import of the WASM module
       // In Obsidian, jsUrl should be the full path from getResourcePath()
-      const modulePath = jsUrl ?? './peervault_iroh.js';
+      const modulePath = jsUrl ?? "./peervault_iroh.js";
 
       // Use Function constructor to create dynamic import (works around bundler issues)
-      const importFn = new Function('url', 'return import(url)');
-      const module = await importFn(modulePath) as IrohWasmModule;
+      const importFn = new Function("url", "return import(url)");
+      const module = (await importFn(modulePath)) as IrohWasmModule;
 
       // Initialize the WASM module
       // If wasmUrl is provided, pass it to the init function
@@ -120,14 +123,16 @@ export class IrohTransport implements Transport {
 
   async initialize(): Promise<void> {
     if (!wasmModule) {
-      throw new Error('Iroh WASM module not initialized. Call initIrohWasm() first.');
+      throw new Error(
+        "Iroh WASM module not initialized. Call initIrohWasm() first.",
+      );
     }
 
     // Load existing secret key or create new one
     const storedKey = await this.config.storage.loadSecretKey();
     const keyBytes = storedKey && storedKey.length === 32 ? storedKey : null;
 
-    this.config.logger.debug('Creating Iroh endpoint...');
+    this.config.logger.debug("Creating Iroh endpoint...");
 
     // Create the endpoint
     this.endpoint = await wasmModule.WasmEndpoint.create(keyBytes ?? undefined);
@@ -136,11 +141,14 @@ export class IrohTransport implements Transport {
     if (!keyBytes) {
       const newKey = this.endpoint.secretKeyBytes();
       await this.config.storage.saveSecretKey(newKey);
-      this.config.logger.info('Generated new Iroh identity');
+      this.config.logger.info("Generated new Iroh identity");
     }
 
     this.ready = true;
-    this.config.logger.info('IrohTransport initialized with nodeId:', this.endpoint.nodeId());
+    this.config.logger.info(
+      "IrohTransport initialized with nodeId:",
+      this.endpoint.nodeId(),
+    );
 
     // Start accepting incoming connections
     this.startAcceptLoop();
@@ -148,28 +156,28 @@ export class IrohTransport implements Transport {
 
   getNodeId(): string {
     if (!this.endpoint) {
-      throw new Error('Transport not initialized');
+      throw new Error("Transport not initialized");
     }
     return this.endpoint.nodeId();
   }
 
   async generateTicket(): Promise<string> {
     if (!this.endpoint) {
-      throw new Error('Transport not initialized');
+      throw new Error("Transport not initialized");
     }
 
-    this.config.logger.debug('Generating connection ticket...');
+    this.config.logger.debug("Generating connection ticket...");
     const ticket = await this.endpoint.generateTicket();
-    this.config.logger.debug('Ticket generated');
+    this.config.logger.debug("Ticket generated");
     return ticket;
   }
 
   async connectWithTicket(ticket: string): Promise<PeerConnection> {
     if (!this.endpoint) {
-      throw new Error('Transport not initialized');
+      throw new Error("Transport not initialized");
     }
 
-    this.config.logger.debug('Connecting with ticket...');
+    this.config.logger.debug("Connecting with ticket...");
 
     // Connect using the ticket
     const wasmConn = await this.endpoint.connectWithTicket(ticket);
@@ -185,10 +193,14 @@ export class IrohTransport implements Transport {
     }
 
     // Create wrapper
-    const connection = new IrohPeerConnection(wasmConn, peerId, this.config.logger);
+    const connection = new IrohPeerConnection(
+      wasmConn,
+      peerId,
+      this.config.logger,
+    );
     this.connections.set(peerId, connection);
 
-    this.config.logger.info('Connected to peer:', peerId);
+    this.config.logger.info("Connected to peer:", peerId);
     return connection;
   }
 
@@ -203,14 +215,18 @@ export class IrohTransport implements Transport {
     const acceptLoop = async () => {
       while (this.ready && this.endpoint) {
         try {
-          this.config.logger.debug('Waiting for incoming connection...');
+          this.config.logger.debug("Waiting for incoming connection...");
           const wasmConn = await this.endpoint.acceptConnection();
           const peerId = wasmConn.remoteNodeId();
 
-          this.config.logger.info('Incoming connection from:', peerId);
+          this.config.logger.info("Incoming connection from:", peerId);
 
           // Create wrapper
-          const connection = new IrohPeerConnection(wasmConn, peerId, this.config.logger);
+          const connection = new IrohPeerConnection(
+            wasmConn,
+            peerId,
+            this.config.logger,
+          );
           this.connections.set(peerId, connection);
 
           // Notify callbacks
@@ -218,12 +234,15 @@ export class IrohTransport implements Transport {
             try {
               callback(connection);
             } catch (err) {
-              this.config.logger.error('Error in incoming connection callback:', err);
+              this.config.logger.error(
+                "Error in incoming connection callback:",
+                err,
+              );
             }
           }
         } catch (err) {
           if (this.ready) {
-            this.config.logger.error('Error accepting connection:', err);
+            this.config.logger.error("Error accepting connection:", err);
             // Small delay before retrying
             await new Promise((resolve) => setTimeout(resolve, 1000));
           }
@@ -233,7 +252,7 @@ export class IrohTransport implements Transport {
 
     // Run accept loop in background
     acceptLoop().catch((err) => {
-      this.config.logger.error('Accept loop crashed:', err);
+      this.config.logger.error("Accept loop crashed:", err);
       this.acceptLoopRunning = false;
     });
   }
@@ -263,7 +282,7 @@ export class IrohTransport implements Transport {
       this.endpoint = null;
     }
 
-    this.config.logger.info('IrohTransport shut down');
+    this.config.logger.info("IrohTransport shut down");
   }
 
   isReady(): boolean {
@@ -276,7 +295,7 @@ export class IrohTransport implements Transport {
  */
 class IrohPeerConnection implements PeerConnection {
   readonly peerId: string;
-  state: ConnectionState = 'connected';
+  state: ConnectionState = "connected";
 
   private wasmConn: WasmConnection;
   private streams = new Map<string, IrohSyncStream>();
@@ -284,13 +303,13 @@ class IrohPeerConnection implements PeerConnection {
   private stateCallbacks: Array<(state: ConnectionState) => void> = [];
   private streamCallbacks: Array<(stream: SyncStream) => void> = [];
   private streamCounter = 0;
-  private logger: TransportConfig['logger'];
+  private logger: TransportConfig["logger"];
   private acceptStreamLoopRunning = false;
 
   constructor(
     wasmConn: WasmConnection,
     peerId: string,
-    logger: TransportConfig['logger']
+    logger: TransportConfig["logger"],
   ) {
     this.wasmConn = wasmConn;
     this.peerId = peerId;
@@ -305,13 +324,13 @@ class IrohPeerConnection implements PeerConnection {
     this.acceptStreamLoopRunning = true;
 
     const loop = async () => {
-      while (this.state === 'connected') {
+      while (this.state === "connected") {
         try {
           const wasmStream = await this.wasmConn.acceptStream();
           const streamId = `${this.peerId}-in-${++this.streamCounter}`;
           const stream = new IrohSyncStream(wasmStream, streamId);
 
-          this.logger.debug('Accepted incoming stream:', streamId);
+          this.logger.debug("Accepted incoming stream:", streamId);
 
           // Add to pending or notify callbacks
           if (this.streamCallbacks.length > 0) {
@@ -319,15 +338,15 @@ class IrohPeerConnection implements PeerConnection {
               try {
                 callback(stream);
               } catch (err) {
-                this.logger.error('Error in stream callback:', err);
+                this.logger.error("Error in stream callback:", err);
               }
             }
           } else {
             this.pendingStreams.push(stream);
           }
         } catch (err) {
-          if (this.state === 'connected') {
-            this.logger.error('Error accepting stream:', err);
+          if (this.state === "connected") {
+            this.logger.error("Error accepting stream:", err);
             // Connection may have been lost
             this.handleDisconnect();
           }
@@ -337,27 +356,27 @@ class IrohPeerConnection implements PeerConnection {
     };
 
     loop().catch((err) => {
-      this.logger.error('Stream accept loop crashed:', err);
+      this.logger.error("Stream accept loop crashed:", err);
       this.acceptStreamLoopRunning = false;
     });
   }
 
   private handleDisconnect(): void {
-    if (this.state === 'disconnected') return;
+    if (this.state === "disconnected") return;
 
-    this.state = 'disconnected';
+    this.state = "disconnected";
     for (const callback of this.stateCallbacks) {
       try {
-        callback('disconnected');
+        callback("disconnected");
       } catch (err) {
-        this.logger.error('Error in state change callback:', err);
+        this.logger.error("Error in state change callback:", err);
       }
     }
   }
 
   async openStream(): Promise<SyncStream> {
-    if (this.state !== 'connected') {
-      throw new Error('Connection not active');
+    if (this.state !== "connected") {
+      throw new Error("Connection not active");
     }
 
     const wasmStream = await this.wasmConn.openStream();
@@ -365,7 +384,7 @@ class IrohPeerConnection implements PeerConnection {
     const stream = new IrohSyncStream(wasmStream, streamId);
 
     this.streams.set(streamId, stream);
-    this.logger.debug('Opened stream:', streamId);
+    this.logger.debug("Opened stream:", streamId);
 
     return stream;
   }
@@ -378,8 +397,8 @@ class IrohPeerConnection implements PeerConnection {
 
     // Wait for incoming stream
     return new Promise((resolve, reject) => {
-      if (this.state !== 'connected') {
-        reject(new Error('Connection not active'));
+      if (this.state !== "connected") {
+        reject(new Error("Connection not active"));
         return;
       }
 
@@ -394,9 +413,9 @@ class IrohPeerConnection implements PeerConnection {
   }
 
   async close(): Promise<void> {
-    if (this.state === 'disconnected') return;
+    if (this.state === "disconnected") return;
 
-    this.state = 'disconnected';
+    this.state = "disconnected";
 
     // Close all streams
     for (const stream of this.streams.values()) {
@@ -411,15 +430,15 @@ class IrohPeerConnection implements PeerConnection {
     // Notify state change
     for (const callback of this.stateCallbacks) {
       try {
-        callback('disconnected');
+        callback("disconnected");
       } catch (err) {
-        this.logger.error('Error in state change callback:', err);
+        this.logger.error("Error in state change callback:", err);
       }
     }
   }
 
   isConnected(): boolean {
-    return this.state === 'connected' && this.wasmConn.isConnected();
+    return this.state === "connected" && this.wasmConn.isConnected();
   }
 
   onStateChange(callback: (state: ConnectionState) => void): void {
@@ -447,14 +466,14 @@ class IrohSyncStream implements SyncStream {
 
   async send(data: Uint8Array): Promise<void> {
     if (!this.open) {
-      throw new Error('Stream is closed');
+      throw new Error("Stream is closed");
     }
     await this.wasmStream.send(data);
   }
 
   async receive(): Promise<Uint8Array> {
     if (!this.open) {
-      throw new Error('Stream is closed');
+      throw new Error("Stream is closed");
     }
     return await this.wasmStream.receive();
   }

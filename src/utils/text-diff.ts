@@ -33,7 +33,7 @@ export function computeTextEdits(oldText: string, newText: string): TextEdit[] {
 
   // Fast path: non-empty to empty (pure delete)
   if (newText.length === 0) {
-    return [{ position: 0, deleteCount: oldText.length, insertText: '' }];
+    return [{ position: 0, deleteCount: oldText.length, insertText: "" }];
   }
 
   // Find common prefix
@@ -48,7 +48,8 @@ export function computeTextEdits(oldText: string, newText: string): TextEdit[] {
   const maxSuffixLen = minLen - prefixLen;
   while (
     suffixLen < maxSuffixLen &&
-    oldText[oldText.length - 1 - suffixLen] === newText[newText.length - 1 - suffixLen]
+    oldText[oldText.length - 1 - suffixLen] ===
+      newText[newText.length - 1 - suffixLen]
   ) {
     suffixLen++;
   }
@@ -108,7 +109,10 @@ export function mergeAdjacentEdits(edits: TextEdit[]): TextEdit[] {
     // Check if edits are adjacent or overlapping
     if (next.position <= currentEnd) {
       // Merge: extend delete count and append insert text
-      const newDeleteEnd = Math.max(currentEnd, next.position + next.deleteCount);
+      const newDeleteEnd = Math.max(
+        currentEnd,
+        next.position + next.deleteCount,
+      );
       current = {
         position: current.position,
         deleteCount: newDeleteEnd - current.position,

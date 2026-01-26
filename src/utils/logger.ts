@@ -2,14 +2,14 @@
  * Logger - Structured logging with debug mode support
  */
 
-export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+export type LogLevel = "debug" | "info" | "warn" | "error";
 
 export class Logger {
   private readonly prefix: string;
 
   constructor(
     name: string,
-    private isDebugEnabled: () => boolean = () => false
+    private isDebugEnabled: () => boolean = () => false,
   ) {
     this.prefix = `[${name}]`;
   }
@@ -18,7 +18,10 @@ export class Logger {
    * Create a child logger with a sub-prefix.
    */
   child(name: string): Logger {
-    return new Logger(`${this.prefix.slice(1, -1)}:${name}`, this.isDebugEnabled);
+    return new Logger(
+      `${this.prefix.slice(1, -1)}:${name}`,
+      this.isDebugEnabled,
+    );
   }
 
   /**
@@ -56,16 +59,16 @@ export class Logger {
    */
   log(level: LogLevel, ...args: unknown[]): void {
     switch (level) {
-      case 'debug':
+      case "debug":
         this.debug(...args);
         break;
-      case 'info':
+      case "info":
         this.info(...args);
         break;
-      case 'warn':
+      case "warn":
         this.warn(...args);
         break;
-      case 'error':
+      case "error":
         this.error(...args);
         break;
     }

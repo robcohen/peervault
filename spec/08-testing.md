@@ -185,8 +185,8 @@ Test component interactions with mocked dependencies.
 **Mocking Strategy:**
 
 ```typescript
-// Mock Obsidian Vault API
-class MockVault {
+// Test Obsidian Vault API
+class TestVault {
   private files = new Map<string, string>();
   private eventHandlers = new Map<string, Function[]>();
 
@@ -221,21 +221,22 @@ class MockVault {
 ```
 
 ```typescript
-// Mock Iroh Transport
-class MockTransport implements IrohTransport {
-  private connections = new Map<string, MockConnection>();
+// Test Transport - implements Transport interface for testing
+// Uses in-memory connections instead of real networking
+class TestTransport implements Transport {
+  private connections = new Map<string, TestConnection>();
   private incomingHandlers: ((conn: PeerConnection) => void)[] = [];
 
   async connectWithTicket(ticket: string): Promise<PeerConnection> {
     const peerId = this.extractPeerId(ticket);
-    const conn = new MockConnection(peerId);
+    const conn = new TestConnection(peerId);
     this.connections.set(peerId, conn);
     return conn;
   }
 
   // Test helper: simulate incoming connection
-  simulateIncomingConnection(peerId: string): MockConnection {
-    const conn = new MockConnection(peerId);
+  simulateIncomingConnection(peerId: string): TestConnection {
+    const conn = new TestConnection(peerId);
     this.incomingHandlers.forEach(h => h(conn));
     return conn;
   }
@@ -251,14 +252,14 @@ class MockTransport implements IrohTransport {
 ```typescript
 // Integration test example
 describe('FileWatcher + DocumentManager', () => {
-  let vault: MockVault;
-  let storage: MockStorage;
+  let vault: TestVault;
+  let storage: MemoryStorage;
   let watcher: FileWatcher;
   let docManager: DocumentManager;
 
   beforeEach(() => {
-    vault = new MockVault();
-    storage = new MockStorage();
+    vault = new TestVault();
+    storage = new MemoryStorage();
     watcher = new ObsidianFileWatcher(vault);
     docManager = new DocumentManager(storage);
 
@@ -517,7 +518,7 @@ test/fixtures/
 └── binary-vault/             # Vault with attachments
 ```
 
-### Mock Data Generators
+### Test Data Generators
 
 ```typescript
 import { LoroDoc } from 'loro-crdt';
@@ -579,7 +580,7 @@ Test behavior under various network conditions:
 
 ```typescript
 class NetworkSimulator {
-  constructor(private connection: MockConnection) {}
+  constructor(private connection: TestConnection) {}
 
   // Add latency to all messages
   setLatency(ms: number): void {
@@ -1482,4 +1483,4 @@ describe('Filesystem behavior verification', () => {
 - Vitest (unit/integration tests)
 - fast-check (property-based testing)
 - Playwright (E2E tests)
-- Mock libraries for Obsidian APIs
+- Test doubles for Obsidian APIs

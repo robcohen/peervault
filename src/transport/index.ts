@@ -7,8 +7,7 @@ export type {
   TransportLogger,
   TransportEvents,
   ConnectionState,
-} from './types';
+} from "./types";
 
-export { PEERVAULT_ALPN } from './types';
-export { MockTransport, clearMockRegistry } from './mock-transport';
-export { IrohTransport, initIrohWasm, isIrohWasmReady } from './iroh-transport';
+export { PEERVAULT_ALPN } from "./types";
+export { IrohTransport, initIrohWasm, isIrohWasmReady } from "./iroh-transport";
