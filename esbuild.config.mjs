@@ -6,14 +6,14 @@ import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const isWatch = process.argv.includes('--watch');
 
-// Iroh WASM files that need to be copied (loaded dynamically at runtime)
+// Plugin files to copy to dist
+const pluginFiles = ['manifest.json', 'styles.css'];
+
+// Iroh WASM files - now inlined, but still copy for local dev
 const irohWasmFiles = [
   { src: 'peervault-iroh/pkg/peervault_iroh.js', dest: 'peervault_iroh.js' },
   { src: 'peervault-iroh/pkg/peervault_iroh_bg.wasm', dest: 'peervault_iroh_bg.wasm' },
 ];
-
-// Plugin files to copy to dist
-const pluginFiles = ['manifest.json', 'styles.css'];
 
 function copyFilesToDist() {
   const distDir = 'dist';
@@ -28,6 +28,7 @@ function copyFilesToDist() {
     }
   }
 
+  // Copy WASM files for local development (inlined in production bundle)
   for (const { src, dest } of irohWasmFiles) {
     if (fs.existsSync(src)) {
       fs.copyFileSync(src, path.join(distDir, dest));
@@ -131,6 +132,81 @@ module.exports.__wasmReady = __wasmReady;
   },
 };
 
+/**
+ * Plugin to transform peervault-iroh WASM for bundling.
+ *
+ * Inlines the WASM as base64 so BRAT can download a single main.js file.
+ * Similar to the loro transform but for wasm-bindgen output.
+ */
+const irohTransformPlugin = {
+  name: 'iroh-transform',
+  setup(build) {
+    // Handle "env" imports - these are WASM internal imports, not real modules
+    // They're used in the imports object passed to WebAssembly.instantiate
+    build.onResolve({ filter: /^env$/ }, () => {
+      return { path: 'env', namespace: 'wasm-env' };
+    });
+
+    build.onLoad({ filter: /.*/, namespace: 'wasm-env' }, () => {
+      // Return an empty module - the actual values come from __wbg_get_imports()
+      return { contents: 'export default {};', loader: 'js' };
+    });
+
+    // Intercept the peervault_iroh.js import
+    build.onResolve({ filter: /peervault_iroh\.js$/ }, (args) => {
+      // Resolve to the pkg file
+      const pkgPath = path.resolve('peervault-iroh/pkg/peervault_iroh.js');
+      if (fs.existsSync(pkgPath)) {
+        return { path: pkgPath, namespace: 'iroh-wasm' };
+      }
+      return null;
+    });
+
+    // Transform the JS file to inline the WASM
+    build.onLoad({ filter: /.*/, namespace: 'iroh-wasm' }, async (args) => {
+      let code = await fs.promises.readFile(args.path, 'utf8');
+      const dir = path.dirname(args.path);
+
+      // Read and inline the WASM file as base64
+      const wasmPath = path.join(dir, 'peervault_iroh_bg.wasm');
+      const wasmBin = await fs.promises.readFile(wasmPath);
+      const wasmBase64 = wasmBin.toString('base64');
+
+      // Add the inlined WASM at the top of the file
+      const wasmInlineCode = `
+// Iroh WASM inlined as base64 (for BRAT compatibility)
+const __irohWasmBase64 = "${wasmBase64}";
+
+function __irohDecodeBase64(b64) {
+  if (typeof Buffer !== 'undefined') {
+    return Buffer.from(b64, 'base64');
+  }
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+const __irohWasmBytes = __irohDecodeBase64(__irohWasmBase64);
+`;
+
+      // Replace the default URL-based loading with our inlined bytes
+      // Original: module_or_path = new URL('peervault_iroh_bg.wasm', import.meta.url);
+      code = code.replace(
+        /module_or_path = new URL\('peervault_iroh_bg\.wasm', import\.meta\.url\);/,
+        'module_or_path = __irohWasmBytes;'
+      );
+
+      // Prepend the inline code
+      code = wasmInlineCode + code;
+
+      console.log(`[iroh-transform] Inlined ${(wasmBin.length / 1024 / 1024).toFixed(2)}MB WASM`);
+
+      return { contents: code, loader: 'js' };
+    });
+  },
+};
+
 const config = {
   entryPoints: ['src/main.ts'],
   bundle: true,
@@ -143,7 +219,7 @@ const config = {
   minify: !isWatch,
   treeShaking: true,
   logLevel: 'info',
-  plugins: [loroTransformPlugin],
+  plugins: [loroTransformPlugin, irohTransformPlugin],
   define: {
     'process.env.NODE_ENV': isWatch ? '"development"' : '"production"',
     'global': 'globalThis',

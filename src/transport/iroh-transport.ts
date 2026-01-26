@@ -14,6 +14,10 @@ import type {
 } from "./types";
 import { TransportErrors } from "../errors";
 
+// Import the bundled Iroh WASM module (inlined by esbuild plugin)
+// @ts-ignore - This is resolved by esbuild to the transformed module
+import * as irohWasm from "../../peervault-iroh/pkg/peervault_iroh.js";
+
 // Type definitions matching the WASM module exports
 interface WasmEndpoint {
   nodeId(): string;
@@ -68,12 +72,12 @@ let initPromise: Promise<void> | null = null;
  * Initialize the Iroh WASM module.
  * Call this once before creating any IrohTransport instances.
  *
- * @param jsUrl - URL or path to the peervault_iroh.js file (from getResourcePath)
- * @param wasmUrl - Optional URL or path to the .wasm file (auto-detected if not provided)
+ * The WASM is now bundled inline, so no file paths are needed.
+ * Parameters are kept for backwards compatibility but ignored.
  */
 export async function initIrohWasm(
-  jsUrl?: string,
-  wasmUrl?: string,
+  _jsUrl?: string,
+  _wasmUrl?: string,
 ): Promise<void> {
   // Prevent multiple initializations
   if (wasmInitialized) return;
@@ -81,22 +85,11 @@ export async function initIrohWasm(
 
   initPromise = (async () => {
     try {
-      // Dynamic import of the WASM module
-      // In Obsidian, jsUrl should be the full path from getResourcePath()
-      const modulePath = jsUrl ?? "./peervault_iroh.js";
+      // WASM is bundled inline - just initialize it
+      const module = irohWasm as unknown as IrohWasmModule;
 
-      // Use Function constructor to create dynamic import (works around bundler issues)
-      const importFn = new Function("url", "return import(url)");
-      const module = (await importFn(modulePath)) as IrohWasmModule;
-
-      // Initialize the WASM module
-      // If wasmUrl is provided, pass it to the init function
-      if (wasmUrl) {
-        await module.default({ module_or_path: wasmUrl });
-      } else {
-        // Let it auto-detect the wasm file location (same directory as JS)
-        await module.default();
-      }
+      // Initialize the WASM module (uses inlined bytes)
+      await module.default();
 
       wasmModule = module;
       wasmInitialized = true;

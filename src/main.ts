@@ -158,21 +158,9 @@ export default class PeerVaultPlugin extends Plugin {
           : undefined,
     };
 
-    // Initialize Iroh WASM module
+    // Initialize Iroh WASM module (bundled inline)
     this.logger.info("Initializing Iroh transport...");
-    // Get paths to WASM files in the plugin directory
-    const pluginDir = this.manifest.dir;
-    const jsPath = this.app.vault.adapter.getResourcePath(
-      `${pluginDir}/peervault_iroh.js`,
-    );
-    const wasmPath = this.app.vault.adapter.getResourcePath(
-      `${pluginDir}/peervault_iroh_bg.wasm`,
-    );
-
-    this.logger.debug("WASM JS path:", jsPath);
-    this.logger.debug("WASM binary path:", wasmPath);
-
-    await initIrohWasm(jsPath, wasmPath);
+    await initIrohWasm();
     this.transport = new IrohTransport(transportConfig);
     this.logger.info("Iroh transport initialized successfully");
 
