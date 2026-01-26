@@ -1,6 +1,6 @@
 {
   "name": "peervault",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "P2P sync for Obsidian using Loro CRDT and Iroh transport",
   "type": "module",
   "private": true,
