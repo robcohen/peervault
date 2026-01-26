@@ -16,6 +16,7 @@
 
 import type { StorageAdapter } from "../types";
 import type { EncryptionService } from "../crypto/encryption";
+import { CryptoErrors, StorageErrors } from "../errors";
 
 /** Magic number for encrypted files: 'PVE1' */
 const MAGIC = new Uint8Array([0x50, 0x56, 0x45, 0x31]); // 'P', 'V', 'E', '1'
@@ -84,7 +85,8 @@ export class EncryptedStorageAdapter implements StorageAdapter {
       // Verify format version
       const version = data[4];
       if (version !== FORMAT_VERSION) {
-        throw new Error(
+        throw StorageErrors.corrupt(
+          key,
           `Unsupported encrypted file format version: ${version}`,
         );
       }
@@ -94,13 +96,13 @@ export class EncryptedStorageAdapter implements StorageAdapter {
 
       // Decrypt
       if (!this.encryption.isEnabled()) {
-        throw new Error("Cannot read encrypted file: encryption not unlocked");
+        throw CryptoErrors.passwordRequired();
       }
 
       try {
         return await this.encryption.decrypt(encryptedPayload);
       } catch (error) {
-        throw new Error(`Failed to decrypt file "${key}": ${error}`);
+        throw CryptoErrors.decryptionFailed(`file "${key}": ${error}`);
       }
     }
 

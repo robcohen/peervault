@@ -9,6 +9,7 @@ import type { DocumentManager } from "../core/document-manager";
 import type { BlobStore } from "../core/blob-store";
 import type { Logger } from "../utils/logger";
 import type { EncryptionService } from "../crypto";
+import { SyncErrors, TransportErrors } from "../errors";
 import {
   SyncMessageType,
   SyncErrorCode,
@@ -114,7 +115,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
    */
   async startSync(stream: SyncStream): Promise<void> {
     if (this.state !== "idle" && this.state !== "error") {
-      throw new Error(`Cannot start sync in state: ${this.state}`);
+      throw SyncErrors.protocolError(`Cannot start sync in state: ${this.state}`);
     }
 
     this.stream = stream;
@@ -158,7 +159,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
    */
   async handleIncomingSync(stream: SyncStream): Promise<void> {
     if (this.state !== "idle") {
-      throw new Error(`Cannot handle incoming sync in state: ${this.state}`);
+      throw SyncErrors.protocolError(`Cannot handle incoming sync in state: ${this.state}`);
     }
 
     this.stream = stream;
@@ -170,7 +171,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       const peerMessage = await this.receiveMessage();
 
       if (peerMessage.type !== SyncMessageType.VERSION_INFO) {
-        throw new Error(`Expected VERSION_INFO, got: ${peerMessage.type}`);
+        throw SyncErrors.protocolError(`Expected VERSION_INFO, got: ${peerMessage.type}`);
       }
 
       const peerVersionInfo = peerMessage as VersionInfoMessage;
@@ -181,7 +182,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
         await this.sendMessage(
           createErrorMessage(SyncErrorCode.VAULT_MISMATCH, "Vault ID mismatch"),
         );
-        throw new Error("Vault ID mismatch");
+        throw SyncErrors.vaultMismatch(ourVaultId, peerVersionInfo.vaultId);
       }
 
       // Send our version info
@@ -283,7 +284,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     const peerMessage = await this.receiveMessage();
 
     if (peerMessage.type !== SyncMessageType.VERSION_INFO) {
-      throw new Error(`Expected VERSION_INFO, got: ${peerMessage.type}`);
+      throw SyncErrors.protocolError(`Expected VERSION_INFO, got: ${peerMessage.type}`);
     }
 
     const peerVersionInfo = peerMessage as VersionInfoMessage;
@@ -293,7 +294,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       await this.sendMessage(
         createErrorMessage(SyncErrorCode.VAULT_MISMATCH, "Vault ID mismatch"),
       );
-      throw new Error("Vault ID mismatch");
+      throw SyncErrors.vaultMismatch(vaultId, peerVersionInfo.vaultId);
     }
 
     this.logger.debug("Version exchange complete");
@@ -329,7 +330,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
         }
       }
     } else if (peerMessage.type === SyncMessageType.ERROR) {
-      throw new Error(
+      throw SyncErrors.protocolError(
         `Peer error: ${(peerMessage as { message: string }).message}`,
       );
     }
@@ -368,7 +369,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
         }
       }
     } else if (peerMessage.type === SyncMessageType.ERROR) {
-      throw new Error(
+      throw SyncErrors.protocolError(
         `Peer error: ${(peerMessage as { message: string }).message}`,
       );
     }
@@ -420,7 +421,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     // Receive peer's blob hashes
     const peerMessage = await this.receiveMessage();
     if (peerMessage.type !== SyncMessageType.BLOB_HASHES) {
-      throw new Error(`Expected BLOB_HASHES, got: ${peerMessage.type}`);
+      throw SyncErrors.protocolError(`Expected BLOB_HASHES, got: ${peerMessage.type}`);
     }
 
     const peerHashes = (peerMessage as BlobHashesMessage).hashes;
@@ -445,7 +446,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     // Wait for peer's blob request
     const peerRequest = await this.receiveMessage();
     if (peerRequest.type !== SyncMessageType.BLOB_REQUEST) {
-      throw new Error(`Expected BLOB_REQUEST, got: ${peerRequest.type}`);
+      throw SyncErrors.protocolError(`Expected BLOB_REQUEST, got: ${peerRequest.type}`);
     }
 
     const peerWants = (peerRequest as BlobRequestMessage).hashes;
@@ -478,7 +479,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
         // Peer is done sending
         break;
       } else {
-        throw new Error(`Unexpected message during blob sync: ${msg.type}`);
+        throw SyncErrors.protocolError(`Unexpected message during blob sync: ${msg.type}`);
       }
     }
 
@@ -511,7 +512,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     // Wait for peer's blob hashes
     const peerMessage = await this.receiveMessage();
     if (peerMessage.type !== SyncMessageType.BLOB_HASHES) {
-      throw new Error(`Expected BLOB_HASHES, got: ${peerMessage.type}`);
+      throw SyncErrors.protocolError(`Expected BLOB_HASHES, got: ${peerMessage.type}`);
     }
 
     const peerHashes = (peerMessage as BlobHashesMessage).hashes;
@@ -525,7 +526,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     // Wait for peer's blob request
     const peerRequest = await this.receiveMessage();
     if (peerRequest.type !== SyncMessageType.BLOB_REQUEST) {
-      throw new Error(`Expected BLOB_REQUEST, got: ${peerRequest.type}`);
+      throw SyncErrors.protocolError(`Expected BLOB_REQUEST, got: ${peerRequest.type}`);
     }
 
     const peerWants = (peerRequest as BlobRequestMessage).hashes;
@@ -554,7 +555,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
         // Peer is done sending
         break;
       } else {
-        throw new Error(`Unexpected message during blob sync: ${msg.type}`);
+        throw SyncErrors.protocolError(`Unexpected message during blob sync: ${msg.type}`);
       }
     }
 
@@ -693,7 +694,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
 
   private async sendMessage(message: AnySyncMessage): Promise<void> {
     if (!this.stream) {
-      throw new Error("No stream available");
+      throw TransportErrors.streamClosed("sync-session");
     }
 
     let bytes = serializeMessage(message);
@@ -708,7 +709,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
 
   private async receiveMessage(): Promise<AnySyncMessage> {
     if (!this.stream) {
-      throw new Error("No stream available");
+      throw TransportErrors.streamClosed("sync-session");
     }
 
     let bytes = await this.stream.receive();

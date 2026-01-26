@@ -12,6 +12,7 @@ import type {
   TransportConfig,
   ConnectionState,
 } from "./types";
+import { TransportErrors } from "../errors";
 
 // Type definitions matching the WASM module exports
 interface WasmEndpoint {
@@ -29,10 +30,9 @@ interface WasmEndpointStatic {
    * Create a new Iroh endpoint.
    *
    * @param keyBytes - Optional 32-byte secret key for identity persistence
-   * @param relayUrls - Optional custom relay server URLs (TODO: implement in Rust wrapper)
+   * @param relayUrls - Optional custom relay server URLs (e.g., ["https://relay.example.com"])
+   *                    If not provided, uses Iroh's default public relays.
    *
-   * NOTE: Custom relay support requires updating the Rust WASM wrapper to accept
-   * RelayMode::Custom. Currently uses RelayMode::Default (Iroh's public relays).
    * See spec/05-transport-iroh.md for details on self-hosted relay setup.
    */
   create(keyBytes?: Uint8Array | null, relayUrls?: string[]): Promise<WasmEndpoint>;
@@ -133,7 +133,7 @@ export class IrohTransport implements Transport {
 
   async initialize(): Promise<void> {
     if (!wasmModule) {
-      throw new Error(
+      throw TransportErrors.wasmLoadFailed(
         "Iroh WASM module not initialized. Call initIrohWasm() first.",
       );
     }
@@ -170,14 +170,14 @@ export class IrohTransport implements Transport {
 
   getNodeId(): string {
     if (!this.endpoint) {
-      throw new Error("Transport not initialized");
+      throw TransportErrors.notInitialized();
     }
     return this.endpoint.nodeId();
   }
 
   async generateTicket(): Promise<string> {
     if (!this.endpoint) {
-      throw new Error("Transport not initialized");
+      throw TransportErrors.notInitialized();
     }
 
     this.config.logger.debug("Generating connection ticket...");
@@ -188,7 +188,7 @@ export class IrohTransport implements Transport {
 
   async connectWithTicket(ticket: string): Promise<PeerConnection> {
     if (!this.endpoint) {
-      throw new Error("Transport not initialized");
+      throw TransportErrors.notInitialized();
     }
 
     this.config.logger.debug("Connecting with ticket...");
@@ -400,7 +400,7 @@ class IrohPeerConnection implements PeerConnection {
 
   async openStream(): Promise<SyncStream> {
     if (this.state !== "connected") {
-      throw new Error("Connection not active");
+      throw TransportErrors.connectionFailed(this.peerId, "Connection not active");
     }
 
     const wasmStream = await this.wasmConn.openStream();
@@ -422,7 +422,7 @@ class IrohPeerConnection implements PeerConnection {
     // Wait for incoming stream
     return new Promise((resolve, reject) => {
       if (this.state !== "connected") {
-        reject(new Error("Connection not active"));
+        reject(TransportErrors.connectionFailed(this.peerId, "Connection not active"));
         return;
       }
 
@@ -490,14 +490,14 @@ class IrohSyncStream implements SyncStream {
 
   async send(data: Uint8Array): Promise<void> {
     if (!this.open) {
-      throw new Error("Stream is closed");
+      throw TransportErrors.streamClosed(this.id);
     }
     await this.wasmStream.send(data);
   }
 
   async receive(): Promise<Uint8Array> {
     if (!this.open) {
-      throw new Error("Stream is closed");
+      throw TransportErrors.streamClosed(this.id);
     }
     return await this.wasmStream.receive();
   }

@@ -3,14 +3,18 @@
 //! WASM bindings for Iroh P2P networking in PeerVault.
 //! Exposes Iroh's Endpoint, Connection, and Stream to JavaScript.
 
-use iroh::{Endpoint, NodeAddr, SecretKey};
-use js_sys::Uint8Array;
+use iroh::endpoint::RelayMode;
+use iroh::{Endpoint, NodeAddr, RelayMap, RelayNode, RelayUrl, SecretKey};
+use js_sys::{Array, Uint8Array};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use wasm_bindgen::prelude::*;
 
 /// Protocol identifier for PeerVault sync
 const PEERVAULT_ALPN: &[u8] = b"peervault/sync/1";
+
+/// Default STUN port per RFC 8489
+const DEFAULT_STUN_PORT: u16 = 3478;
 
 /// Initialize the WASM module. Call this once before using any other functions.
 #[wasm_bindgen(start)]
@@ -29,10 +33,16 @@ pub struct WasmEndpoint {
 #[wasm_bindgen]
 impl WasmEndpoint {
     /// Create a new endpoint.
-    /// If key_bytes is provided, uses that key for persistence.
-    /// Otherwise generates a new key.
+    ///
+    /// # Arguments
+    /// * `key_bytes` - Optional 32-byte secret key for identity persistence
+    /// * `relay_urls` - Optional array of relay server URLs (e.g., ["https://relay.example.com"])
+    ///                  If not provided, uses Iroh's default public relays.
     #[wasm_bindgen]
-    pub async fn create(key_bytes: Option<Uint8Array>) -> Result<WasmEndpoint, JsValue> {
+    pub async fn create(
+        key_bytes: Option<Uint8Array>,
+        relay_urls: Option<Array>,
+    ) -> Result<WasmEndpoint, JsValue> {
         let secret_key = match key_bytes {
             Some(bytes) => {
                 let vec: Vec<u8> = bytes.to_vec();
@@ -44,9 +54,40 @@ impl WasmEndpoint {
             None => SecretKey::generate(rand::rngs::OsRng),
         };
 
+        // Determine relay mode based on provided URLs
+        let relay_mode = match relay_urls {
+            Some(urls) if urls.length() > 0 => {
+                let mut relay_nodes = Vec::new();
+                for i in 0..urls.length() {
+                    let url_str = urls
+                        .get(i)
+                        .as_string()
+                        .ok_or_else(|| JsValue::from_str("Relay URL must be a string"))?;
+
+                    let url: RelayUrl = url_str
+                        .parse()
+                        .map_err(|e| JsValue::from_str(&format!("Invalid relay URL '{}': {}", url_str, e)))?;
+
+                    relay_nodes.push(RelayNode {
+                        url,
+                        stun_only: false,
+                        stun_port: DEFAULT_STUN_PORT,
+                        quic: None, // No QUIC-based address discovery
+                    });
+                }
+
+                let relay_map = RelayMap::from_nodes(relay_nodes)
+                    .map_err(|e| JsValue::from_str(&format!("Invalid relay configuration: {}", e)))?;
+
+                RelayMode::Custom(relay_map)
+            }
+            _ => RelayMode::Default,
+        };
+
         let endpoint = Endpoint::builder()
             .secret_key(secret_key.clone())
             .alpns(vec![PEERVAULT_ALPN.to_vec()])
+            .relay_mode(relay_mode)
             .bind()
             .await
             .map_err(|e| JsValue::from_str(&format!("Endpoint bind failed: {}", e)))?;

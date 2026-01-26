@@ -7,6 +7,7 @@
  */
 
 import type { Logger } from "../utils/logger";
+import { ConfigErrors } from "../errors";
 
 /** A detected conflict */
 export interface ConflictInfo {
@@ -194,7 +195,7 @@ let conflictTracker: ConflictTracker | null = null;
 export function getConflictTracker(logger?: Logger): ConflictTracker {
   if (!conflictTracker) {
     if (!logger) {
-      throw new Error("ConflictTracker not initialized and no logger provided");
+      throw ConfigErrors.invalid("logger", "ConflictTracker not initialized and no logger provided");
     }
     conflictTracker = new ConflictTracker(logger);
   }

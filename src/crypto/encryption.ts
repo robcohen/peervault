@@ -5,6 +5,8 @@
  * Uses Web Crypto API for authenticated encryption.
  */
 
+import { CryptoErrors } from "../errors";
+
 /** Encryption key length in bytes (256 bits) */
 const KEY_LENGTH = 32;
 
@@ -28,8 +30,8 @@ export class EncryptionService {
    */
   async setKey(key: Uint8Array): Promise<void> {
     if (key.length !== KEY_LENGTH) {
-      throw new Error(
-        `Invalid key length: expected ${KEY_LENGTH}, got ${key.length}`,
+      throw CryptoErrors.invalidKey(
+        `expected ${KEY_LENGTH} bytes, got ${key.length}`,
       );
     }
 
@@ -98,7 +100,7 @@ export class EncryptionService {
    */
   async encrypt(plaintext: Uint8Array): Promise<Uint8Array> {
     if (!this.key) {
-      throw new Error("Encryption key not set");
+      throw CryptoErrors.keyNotSet();
     }
 
     // Generate random IV
@@ -133,11 +135,11 @@ export class EncryptionService {
    */
   async decrypt(encrypted: Uint8Array): Promise<Uint8Array> {
     if (!this.key) {
-      throw new Error("Encryption key not set");
+      throw CryptoErrors.keyNotSet();
     }
 
     if (encrypted.length < IV_LENGTH + TAG_LENGTH) {
-      throw new Error("Invalid encrypted data: too short");
+      throw CryptoErrors.decryptionFailed("data too short");
     }
 
     const iv = encrypted.slice(0, IV_LENGTH);
@@ -160,7 +162,7 @@ export class EncryptionService {
 
       return new Uint8Array(plaintext);
     } catch {
-      throw new Error("Decryption failed: invalid ciphertext or wrong key");
+      throw CryptoErrors.decryptionFailed("invalid ciphertext or wrong key");
     }
   }
 
@@ -287,7 +289,7 @@ export function keyToRecoveryPhrase(key: Uint8Array): string {
 export function recoveryPhraseToKey(phrase: string): Uint8Array {
   const hex = phrase.replace(/-/g, "");
   if (hex.length !== KEY_LENGTH * 2) {
-    throw new Error("Invalid recovery phrase length");
+    throw CryptoErrors.invalidKey("invalid recovery phrase length");
   }
 
   const key = new Uint8Array(KEY_LENGTH);

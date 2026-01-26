@@ -22,6 +22,7 @@ import {
   type BlobDataMessage,
   type BlobSyncCompleteMessage,
 } from "./types";
+import { SyncErrors } from "../errors";
 
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
@@ -58,8 +59,8 @@ export function serializeMessage(message: AnySyncMessage): Uint8Array {
     case SyncMessageType.BLOB_SYNC_COMPLETE:
       return serializeBlobSyncComplete(message);
     default:
-      throw new Error(
-        `Unknown message type: ${(message as AnySyncMessage).type}`,
+      throw SyncErrors.invalidMessage(
+        (message as AnySyncMessage).type,
       );
   }
 }
@@ -69,7 +70,7 @@ export function serializeMessage(message: AnySyncMessage): Uint8Array {
  */
 export function deserializeMessage(data: Uint8Array): AnySyncMessage {
   if (data.length < 9) {
-    throw new Error("Message too short");
+    throw SyncErrors.protocolError("Message too short");
   }
 
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
@@ -104,7 +105,7 @@ export function deserializeMessage(data: Uint8Array): AnySyncMessage {
     case SyncMessageType.BLOB_SYNC_COMPLETE:
       return deserializeBlobSyncComplete(data, timestamp);
     default:
-      throw new Error(`Unknown message type: ${type}`);
+      throw SyncErrors.invalidMessage(type);
   }
 }
 

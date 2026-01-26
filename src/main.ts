@@ -42,6 +42,7 @@ import {
 import { PeerManager } from "./peer";
 import { MigrationRunner, MIGRATIONS } from "./core/migration";
 import { GarbageCollector } from "./core/gc";
+import { ConfigErrors } from "./errors";
 
 export default class PeerVaultPlugin extends Plugin {
   settings!: PeerVaultSettings;
@@ -602,7 +603,7 @@ export default class PeerVaultPlugin extends Plugin {
    */
   async addPeer(ticket: string, name?: string): Promise<void> {
     if (!this.peerManager) {
-      throw new Error("Peer manager not initialized");
+      throw ConfigErrors.invalid("peerManager", "Peer manager not initialized");
     }
 
     await this.peerManager.addPeer(ticket, name);
@@ -613,7 +614,7 @@ export default class PeerVaultPlugin extends Plugin {
    */
   async generateInvite(): Promise<string> {
     if (!this.peerManager) {
-      throw new Error("Peer manager not initialized");
+      throw ConfigErrors.invalid("peerManager", "Peer manager not initialized");
     }
 
     return this.peerManager.generateInvite();

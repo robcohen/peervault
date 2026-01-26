@@ -19,6 +19,7 @@ import type {
   PeerManagerConfig,
 } from "./types";
 import { PeerGroupManager, DEFAULT_GROUP_ID } from "./groups";
+import { PeerErrors } from "../errors";
 
 const PEERS_STORAGE_KEY = "peervault-peers";
 
@@ -313,7 +314,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   async syncPeer(nodeId: string): Promise<void> {
     const peer = this.peers.get(nodeId);
     if (!peer) {
-      throw new Error(`Unknown peer: ${nodeId}`);
+      throw PeerErrors.unknownPeer(nodeId);
     }
 
     // Check for existing session
@@ -334,7 +335,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
         throw error;
       }
     } else {
-      throw new Error(`No ticket for peer: ${nodeId}`);
+      throw PeerErrors.notFound(nodeId);
     }
   }
 

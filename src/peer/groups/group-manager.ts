@@ -11,6 +11,7 @@ import type { Logger } from "../../utils/logger";
 import { EventEmitter } from "../../utils/events";
 import type { PeerGroup, GroupSyncPolicy, PeerGroupEvents } from "./types";
 import { DEFAULT_GROUP_ID, DEFAULT_GROUP, DEFAULT_SYNC_POLICY } from "./types";
+import { PeerErrors, ConfigErrors } from "../../errors";
 
 /**
  * PeerGroupManager handles peer group CRUD and policy enforcement.
@@ -220,7 +221,7 @@ export class PeerGroupManager extends EventEmitter<PeerGroupEvents> {
   ): void {
     const groupMap = this.groupsMap.get(groupId) as LoroMap | undefined;
     if (!groupMap) {
-      throw new Error(`Group not found: ${groupId}`);
+      throw PeerErrors.groupNotFound(groupId);
     }
 
     if (updates.name !== undefined) {
@@ -290,12 +291,12 @@ export class PeerGroupManager extends EventEmitter<PeerGroupEvents> {
    */
   deleteGroup(groupId: string): void {
     if (groupId === DEFAULT_GROUP_ID) {
-      throw new Error("Cannot delete the default group");
+      throw ConfigErrors.invalid("groupId", "Cannot delete the default group");
     }
 
     const group = this.getGroup(groupId);
     if (!group) {
-      throw new Error(`Group not found: ${groupId}`);
+      throw PeerErrors.groupNotFound(groupId);
     }
 
     // Move all peers to the default group before deletion
@@ -316,7 +317,7 @@ export class PeerGroupManager extends EventEmitter<PeerGroupEvents> {
   addPeerToGroup(groupId: string, peerId: string): void {
     const group = this.getGroup(groupId);
     if (!group) {
-      throw new Error(`Group not found: ${groupId}`);
+      throw PeerErrors.groupNotFound(groupId);
     }
 
     if (group.peerIds.includes(peerId)) {
@@ -336,7 +337,7 @@ export class PeerGroupManager extends EventEmitter<PeerGroupEvents> {
   removePeerFromGroup(groupId: string, peerId: string): void {
     const group = this.getGroup(groupId);
     if (!group) {
-      throw new Error(`Group not found: ${groupId}`);
+      throw PeerErrors.groupNotFound(groupId);
     }
 
     const newPeerIds = group.peerIds.filter((id) => id !== peerId);

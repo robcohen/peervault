@@ -160,7 +160,7 @@ describe('Sync Messages', () => {
       view.setUint8(0, 0x99); // Invalid type
       view.setBigUint64(1, BigInt(Date.now()), false);
 
-      expect(() => deserializeMessage(new Uint8Array(buffer))).toThrow('Unknown message type');
+      expect(() => deserializeMessage(new Uint8Array(buffer))).toThrow('Invalid sync message type');
     });
   });
 

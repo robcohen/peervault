@@ -7,6 +7,7 @@
 
 import type { Migration } from "../types";
 import { DEFAULT_GROUP_ID } from "../../../peer/groups";
+import { ConfigErrors } from "../../../errors";
 
 const PEERS_STORAGE_KEY = "peervault-peers";
 
@@ -86,7 +87,7 @@ export const migration002AddPeerGroups: Migration = {
       ctx.onProgress(100, "Peer groups migration complete");
     } catch (error) {
       ctx.logger.error("Migration 002: Failed to parse/update peers", error);
-      throw new Error(`Failed to migrate peers: ${error}`);
+      throw ConfigErrors.migrationFailed(1, 2, `Failed to migrate peers: ${error}`);
     }
   },
 };
