@@ -20,6 +20,8 @@ import { DEFAULT_GROUP_ID } from "../peer/groups";
 
 export class PeerVaultSettingsTab extends PluginSettingTab {
   plugin: PeerVaultPlugin;
+  private eventCleanup: (() => void)[] = [];
+  private refreshTimeout?: number;
 
   constructor(app: App, plugin: PeerVaultPlugin) {
     super(app, plugin);
@@ -27,6 +29,8 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
   }
 
   display(): void {
+    // Subscribe to peer events for auto-refresh
+    this.subscribeToEvents();
     const { containerEl } = this;
     containerEl.empty();
     containerEl.addClass("peervault-settings");
@@ -59,6 +63,58 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
 
     // Danger Zone
     this.renderDangerZone(containerEl);
+  }
+
+  override hide(): void {
+    // Clear debounce timeout
+    if (this.refreshTimeout) {
+      clearTimeout(this.refreshTimeout);
+      this.refreshTimeout = undefined;
+    }
+
+    // Unsubscribe from all events
+    for (const cleanup of this.eventCleanup) {
+      cleanup();
+    }
+    this.eventCleanup = [];
+  }
+
+  private subscribeToEvents(): void {
+    // Clean up any existing subscriptions first
+    for (const cleanup of this.eventCleanup) {
+      cleanup();
+    }
+    this.eventCleanup = [];
+
+    const peerManager = this.plugin.peerManager;
+    if (!peerManager) return;
+
+    // Refresh UI on these events
+    const events = [
+      "peer:connected",
+      "peer:disconnected",
+      "peer:pairing-request",
+      "peer:pairing-accepted",
+      "peer:pairing-denied",
+      "peer:synced",
+      "peer:sync-error",
+    ] as const;
+
+    const refresh = () => {
+      // Debounce rapid events - only refresh once per 200ms
+      if (this.refreshTimeout) {
+        clearTimeout(this.refreshTimeout);
+      }
+      this.refreshTimeout = window.setTimeout(() => {
+        this.display();
+        this.refreshTimeout = undefined;
+      }, 200);
+    };
+
+    for (const event of events) {
+      peerManager.on(event, refresh);
+      this.eventCleanup.push(() => peerManager.off(event, refresh));
+    }
   }
 
   private renderQuickActions(container: HTMLElement): void {
