@@ -10,7 +10,6 @@ import { getEncryptionService } from "../crypto";
 import { getConflictTracker } from "../core/conflict-tracker";
 import { EncryptionModal } from "./encryption-modal";
 import { SelectiveSyncModal } from "./selective-sync-modal";
-import { PairingModal } from "./pairing-modal";
 import { ConflictModal } from "./conflict-modal";
 import { FileHistoryModal } from "./file-history-modal";
 import { GroupModal, GroupPeersModal } from "./group-modal";
@@ -22,6 +21,13 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
   plugin: PeerVaultPlugin;
   private eventCleanup: (() => void)[] = [];
   private refreshTimeout?: number;
+
+  // Pairing state
+  private showMyQR = false;
+  private showAddDevice = false;
+  private myTicket = "";
+  private ticketInput = "";
+  private nameInput = "";
 
   constructor(app: App, plugin: PeerVaultPlugin) {
     super(app, plugin);
@@ -127,21 +133,16 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
       .setDesc("Common tasks")
       .addButton((btn) =>
         btn
-          .setButtonText("Pair Device")
+          .setButtonText("Sync Now")
           .setCta()
-          .onClick(() => {
-            new PairingModal(this.app, this.plugin).open();
+          .onClick(async () => {
+            try {
+              await this.plugin.sync();
+              new Notice("Sync completed");
+            } catch (error) {
+              new Notice(`Sync failed: ${error}`);
+            }
           }),
-      )
-      .addButton((btn) =>
-        btn.setButtonText("Sync Now").onClick(async () => {
-          try {
-            await this.plugin.sync();
-            new Notice("Sync completed");
-          } catch (error) {
-            new Notice(`Sync failed: ${error}`);
-          }
-        }),
       );
   }
 
@@ -226,21 +227,44 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
   private renderDevicesSection(container: HTMLElement): void {
     container.createEl("h3", { text: "Devices" });
 
-    const peers = this.plugin.getConnectedPeers();
+    // 1. Pending pairing requests (most important - show first)
+    const pairingRequests = this.plugin.peerManager?.getPendingPairingRequests() ?? [];
+    if (pairingRequests.length > 0) {
+      const requestsSection = container.createDiv({ cls: "peervault-pairing-requests" });
+      requestsSection.createEl("h4", { text: "Pairing Requests", cls: "peervault-subsection-header" });
 
-    if (peers.length === 0) {
-      new Setting(container)
-        .setName("No devices paired")
-        .setDesc("Pair a device to start syncing")
-        .addButton((btn) =>
+      for (const request of pairingRequests) {
+        const setting = new Setting(requestsSection)
+          .setName(`Device ${request.nodeId.substring(0, 8)}...`)
+          .setDesc("Wants to pair with this vault")
+          .setClass("peervault-pairing-request-item");
+
+        setting.addButton((btn) =>
           btn
-            .setButtonText("Pair Device")
+            .setButtonText("Accept")
             .setCta()
-            .onClick(() => {
-              new PairingModal(this.app, this.plugin).open();
+            .onClick(async () => {
+              try {
+                await this.plugin.peerManager?.acceptPairingRequest(request.nodeId);
+                new Notice("Device paired successfully!");
+              } catch (error) {
+                new Notice(`Failed to accept: ${error}`);
+              }
             }),
         );
-    } else {
+
+        setting.addButton((btn) =>
+          btn.setButtonText("Deny").onClick(async () => {
+            await this.plugin.peerManager?.denyPairingRequest(request.nodeId);
+            new Notice("Pairing denied");
+          }),
+        );
+      }
+    }
+
+    // 2. Connected devices
+    const peers = this.plugin.getConnectedPeers();
+    if (peers.length > 0) {
       for (const peer of peers) {
         const stateIcon = this.getStateIcon(peer.connectionState);
         const stateText =
@@ -269,13 +293,219 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
               }),
           );
       }
+    }
 
-      new Setting(container).addButton((btn) =>
-        btn.setButtonText("Add Another Device").onClick(() => {
-          new PairingModal(this.app, this.plugin).open();
+    // 3. Add Device section (collapsible)
+    const addDeviceHeader = new Setting(container)
+      .setName("Add Device")
+      .setDesc(this.showAddDevice ? "Pair a new device" : "Click to expand")
+      .addExtraButton((btn) =>
+        btn
+          .setIcon(this.showAddDevice ? "chevron-up" : "chevron-down")
+          .setTooltip(this.showAddDevice ? "Collapse" : "Expand")
+          .onClick(() => {
+            this.showAddDevice = !this.showAddDevice;
+            this.display();
+          }),
+      );
+
+    if (peers.length === 0 && pairingRequests.length === 0) {
+      addDeviceHeader.setDesc("No devices paired yet. Expand to add one.");
+    }
+
+    if (this.showAddDevice) {
+      this.renderAddDeviceSection(container);
+    }
+  }
+
+  private renderAddDeviceSection(container: HTMLElement): void {
+    const section = container.createDiv({ cls: "peervault-add-device-section" });
+
+    // --- Show My Invite (for others to scan) ---
+    const myInviteHeader = new Setting(section)
+      .setName("My Invite Code")
+      .setDesc(this.showMyQR ? "Others scan this to connect" : "Show QR code for other devices")
+      .addExtraButton((btn) =>
+        btn
+          .setIcon(this.showMyQR ? "chevron-up" : "qr-code")
+          .setTooltip(this.showMyQR ? "Hide" : "Show QR")
+          .onClick(async () => {
+            this.showMyQR = !this.showMyQR;
+            if (this.showMyQR && !this.myTicket) {
+              try {
+                this.myTicket = await this.plugin.generateInvite();
+              } catch (error) {
+                new Notice(`Failed to generate invite: ${error}`);
+                this.showMyQR = false;
+              }
+            }
+            this.display();
+          }),
+      );
+
+    if (this.showMyQR && this.myTicket) {
+      const qrSection = section.createDiv({ cls: "peervault-qr-section" });
+
+      // QR Code
+      const qrContainer = qrSection.createDiv({ cls: "peervault-qr-container-small" });
+      this.generateQRCode(qrContainer, this.myTicket);
+
+      // Copy ticket button
+      new Setting(qrSection)
+        .addButton((btn) =>
+          btn.setButtonText("Copy Ticket").onClick(() => {
+            navigator.clipboard.writeText(this.myTicket);
+            new Notice("Ticket copied!");
+          }),
+        );
+    }
+
+    // --- Connect to Another Device ---
+    section.createEl("div", { cls: "peervault-section-divider" });
+
+    new Setting(section)
+      .setName("Connect to Device")
+      .setDesc("Paste their invite ticket");
+
+    // Ticket input
+    const ticketSetting = new Setting(section);
+    ticketSetting.controlEl.style.flexDirection = "column";
+    ticketSetting.controlEl.style.alignItems = "stretch";
+
+    const ticketInput = ticketSetting.controlEl.createEl("textarea", {
+      cls: "peervault-ticket-input",
+      attr: { placeholder: "Paste ticket here...", rows: "2" },
+    });
+    ticketInput.value = this.ticketInput;
+    ticketInput.oninput = () => {
+      this.ticketInput = ticketInput.value.trim();
+    };
+
+    // Name input + Connect button
+    new Setting(section)
+      .setName("Device name (optional)")
+      .addText((text) =>
+        text.setPlaceholder("e.g., Phone").onChange((value) => {
+          this.nameInput = value.trim();
+        }),
+      )
+      .addButton((btn) =>
+        btn
+          .setButtonText("Connect")
+          .setCta()
+          .onClick(async () => {
+            if (!this.ticketInput) {
+              new Notice("Please paste a ticket first");
+              return;
+            }
+            try {
+              btn.setButtonText("Connecting...");
+              btn.setDisabled(true);
+              await this.plugin.addPeer(this.ticketInput, this.nameInput || undefined);
+              new Notice("Device connected!");
+              this.ticketInput = "";
+              this.nameInput = "";
+              this.showAddDevice = false;
+              this.display();
+            } catch (error) {
+              new Notice(`Connection failed: ${error}`);
+              btn.setButtonText("Connect");
+              btn.setDisabled(false);
+            }
+          }),
+      );
+
+    // Scan QR option
+    section.createEl("div", { cls: "peervault-section-divider" });
+
+    new Setting(section)
+      .setName("Scan QR Code")
+      .setDesc("Upload an image containing a QR code")
+      .addButton((btn) =>
+        btn.setButtonText("Choose Image").onClick(() => {
+          this.openQRScanner();
         }),
       );
+  }
+
+  private async generateQRCode(container: HTMLElement, data: string): Promise<void> {
+    try {
+      const QRCode = await import("qrcode");
+      const canvas = container.createEl("canvas", { cls: "peervault-qr-canvas-small" });
+
+      const isDark = document.body.classList.contains("theme-dark");
+      await QRCode.toCanvas(canvas, data, {
+        width: 160,
+        margin: 2,
+        color: {
+          dark: isDark ? "#ffffff" : "#000000",
+          light: isDark ? "#1e1e1e" : "#ffffff",
+        },
+        errorCorrectionLevel: "M",
+      });
+    } catch (error) {
+      container.createEl("p", {
+        text: "QR code generation failed",
+        cls: "peervault-error-text",
+      });
     }
+  }
+
+  private openQRScanner(): void {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "image/*";
+    input.onchange = async () => {
+      const file = input.files?.[0];
+      if (file) {
+        await this.processQRImage(file);
+      }
+    };
+    input.click();
+  }
+
+  private async processQRImage(file: File): Promise<void> {
+    try {
+      const imageData = await this.loadImageData(file);
+      const jsQR = (await import("jsqr")).default;
+      const code = jsQR(imageData.data, imageData.width, imageData.height);
+
+      if (code) {
+        this.ticketInput = code.data;
+        this.showAddDevice = true;
+        new Notice("QR code detected!");
+        this.display();
+      } else {
+        new Notice("No QR code found in image");
+      }
+    } catch (error) {
+      new Notice(`Failed to process image: ${error}`);
+    }
+  }
+
+  private async loadImageData(file: File): Promise<ImageData> {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      const objectUrl = URL.createObjectURL(file);
+      img.onload = () => {
+        URL.revokeObjectURL(objectUrl);
+        const canvas = document.createElement("canvas");
+        canvas.width = img.width;
+        canvas.height = img.height;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) {
+          reject(new Error("Could not get canvas context"));
+          return;
+        }
+        ctx.drawImage(img, 0, 0);
+        resolve(ctx.getImageData(0, 0, canvas.width, canvas.height));
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(objectUrl);
+        reject(new Error("Failed to load image"));
+      };
+      img.src = objectUrl;
+    });
   }
 
   private renderPeerGroupsSection(container: HTMLElement): void {

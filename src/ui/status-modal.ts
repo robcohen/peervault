@@ -7,7 +7,6 @@
 import { App, Modal, Notice, Setting } from "obsidian";
 import type PeerVaultPlugin from "../main";
 import type { PeerInfo } from "../types";
-import { PairingModal } from "./pairing-modal";
 import { STATUS_ICONS, getStatusLabel } from "./status-icons";
 
 export class PeerVaultStatusModal extends Modal {
@@ -236,22 +235,14 @@ export class PeerVaultStatusModal extends Modal {
     const actionsEl = container.createDiv({ cls: "peervault-actions-section" });
 
     new Setting(actionsEl)
-      .setName("Add Device")
-      .setDesc("Pair a new device by scanning QR code or entering ticket")
+      .setName("Manage Devices")
+      .setDesc("Add, remove, or configure devices")
       .addButton((btn) =>
-        btn.setButtonText("Add Device").onClick(() => {
+        btn.setButtonText("Open Settings").onClick(() => {
           this.close();
-          new PairingModal(this.app, this.plugin, "scan").open();
-        }),
-      );
-
-    new Setting(actionsEl)
-      .setName("Show My Invite")
-      .setDesc("Generate a ticket or QR code for other devices to connect")
-      .addButton((btn) =>
-        btn.setButtonText("Show Invite").onClick(() => {
-          this.close();
-          new PairingModal(this.app, this.plugin, "show").open();
+          // Open settings tab
+          (this.app as any).setting.open();
+          (this.app as any).setting.openTabById("peervault");
         }),
       );
 

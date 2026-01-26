@@ -17,7 +17,6 @@ import { Logger } from "./utils/logger";
 import {
   PeerVaultSettingsTab,
   PeerVaultStatusModal,
-  PairingModal,
   MergeHistoryModal,
   recordMerge,
   ConnectionStatusManager,
@@ -380,30 +379,14 @@ export default class PeerVaultPlugin extends Plugin {
       },
     });
 
-    // Unified pairing command (primary)
+    // Device management command - opens settings
     this.addCommand({
       id: "pair-device",
-      name: "Pair device (QR code)",
+      name: "Manage devices (add/remove)",
       callback: () => {
-        new PairingModal(this.app, this).open();
-      },
-    });
-
-    // Add device command (manual ticket entry)
-    this.addCommand({
-      id: "add-device",
-      name: "Add device (paste ticket)",
-      callback: () => {
-        new PairingModal(this.app, this, "manual").open();
-      },
-    });
-
-    // Show invite command
-    this.addCommand({
-      id: "show-invite",
-      name: "Show my connection invite",
-      callback: () => {
-        new PairingModal(this.app, this, "show").open();
+        // Open settings tab
+        (this.app as any).setting.open();
+        (this.app as any).setting.openTabById("peervault");
       },
     });
 

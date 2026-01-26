@@ -1217,3 +1217,81 @@
   background: var(--background-modifier-error);
   color: white;
 }
+
+/* ===========================================================================
+   Settings Tab - Add Device Section
+   =========================================================================== */
+
+.peervault-pairing-requests {
+  margin-bottom: 16px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.peervault-subsection-header {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-orange);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin: 0 0 8px 0;
+}
+
+.peervault-pairing-request-item {
+  border-left: 3px solid var(--color-orange) !important;
+  background: var(--background-modifier-error-hover);
+  border-radius: 4px;
+}
+
+.peervault-add-device-section {
+  margin-top: 8px;
+  padding: 16px;
+  background: var(--background-secondary);
+  border-radius: 8px;
+}
+
+.peervault-qr-section {
+  text-align: center;
+  padding: 16px 0;
+}
+
+.peervault-qr-container-small {
+  display: inline-block;
+  padding: 12px;
+  background: var(--background-primary);
+  border-radius: 8px;
+  margin-bottom: 12px;
+}
+
+.peervault-qr-canvas-small {
+  display: block;
+  border-radius: 4px;
+}
+
+.peervault-section-divider {
+  height: 1px;
+  background: var(--background-modifier-border);
+  margin: 16px 0;
+}
+
+.peervault-ticket-input {
+  width: 100%;
+  font-family: var(--font-monospace);
+  font-size: 12px;
+  padding: 8px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  background: var(--background-primary);
+  resize: vertical;
+  margin-bottom: 8px;
+}
+
+.peervault-ticket-input:focus {
+  border-color: var(--interactive-accent);
+  outline: none;
+}
+
+.peervault-error-text {
+  color: var(--color-red);
+  font-size: 12px;
+}
