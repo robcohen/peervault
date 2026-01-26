@@ -251,16 +251,21 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     this.logger.info("Accepted pairing request from:", nodeId);
     this.emit("peer:pairing-accepted", nodeId);
 
-    // Now handle the sync session with the existing connection
+    // Save the peer first
+    await this.savePeers();
+    this.emit("peer:connected", peer);
+
+    // Start sync session - WE initiate (open stream) rather than waiting
+    // This is because the other side may have already timed out waiting
+    // while we were showing the pairing request to the user
     try {
-      await this.handleIncomingSyncSession(connection, peer);
-      await this.savePeers();
-      this.emit("peer:connected", peer);
+      await this.startSyncSession(connection, peer);
       return peer;
     } catch (error) {
       this.logger.error("Failed to sync after accepting pairing:", error);
       this.updatePeerState(nodeId, "error");
-      throw error;
+      // Don't throw - peer is already saved, sync can retry later
+      return peer;
     }
   }
 
