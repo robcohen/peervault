@@ -142,7 +142,7 @@ impl WasmEndpoint {
             .map_err(|e| JsValue::from_str(&format!("Connection failed: {}", e)))?;
 
         Ok(WasmConnection {
-            connection: Arc::new(Mutex::new(connection)),
+            connection,
             remote_node_id: remote_endpoint_id,
         })
     }
@@ -163,7 +163,7 @@ impl WasmEndpoint {
         let remote_node_id = connection.remote_id().to_string();
 
         Ok(WasmConnection {
-            connection: Arc::new(Mutex::new(connection)),
+            connection,
             remote_node_id,
         })
     }
@@ -177,9 +177,10 @@ impl WasmEndpoint {
 }
 
 /// WASM-exposed connection wrapper.
+/// Connection is Clone + Send + Sync, so no Mutex needed.
 #[wasm_bindgen]
 pub struct WasmConnection {
-    connection: Arc<Mutex<iroh::endpoint::Connection>>,
+    connection: iroh::endpoint::Connection,
     remote_node_id: String,
 }
 
@@ -194,7 +195,8 @@ impl WasmConnection {
     /// Open a new bidirectional stream.
     #[wasm_bindgen(js_name = openStream)]
     pub async fn open_stream(&self) -> Result<WasmStream, JsValue> {
-        let conn = self.connection.lock().await;
+        // Clone the connection to avoid holding any lock during the async operation
+        let conn = self.connection.clone();
         let (send, recv) = conn
             .open_bi()
             .await
@@ -209,7 +211,8 @@ impl WasmConnection {
     /// Accept an incoming stream.
     #[wasm_bindgen(js_name = acceptStream)]
     pub async fn accept_stream(&self) -> Result<WasmStream, JsValue> {
-        let conn = self.connection.lock().await;
+        // Clone the connection to avoid holding any lock during the async operation
+        let conn = self.connection.clone();
         let (send, recv) = conn
             .accept_bi()
             .await
@@ -231,8 +234,7 @@ impl WasmConnection {
     /// Close the connection.
     #[wasm_bindgen]
     pub async fn close(&self) -> Result<(), JsValue> {
-        let conn = self.connection.lock().await;
-        conn.close(0u32.into(), b"close");
+        self.connection.close(0u32.into(), b"close");
         Ok(())
     }
 }
