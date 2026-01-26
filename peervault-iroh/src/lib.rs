@@ -16,7 +16,20 @@ const PEERVAULT_ALPN: &[u8] = b"peervault/sync/1";
 #[wasm_bindgen(start)]
 pub fn init() {
     console_error_panic_hook::set_once();
-    tracing_wasm::set_as_global_default();
+
+    // Set up tracing-subscriber for WASM
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber_wasm::MakeConsoleWriter;
+
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .without_time()
+                .with_writer(MakeConsoleWriter::default().map_trace_level_to(tracing::Level::DEBUG))
+        )
+        .init();
 }
 
 /// WASM-exposed Iroh endpoint wrapper.

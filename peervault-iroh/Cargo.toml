@@ -1,18 +1,18 @@
 [package]
 name = "peervault-iroh"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "WASM bindings for Iroh P2P networking in PeerVault"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-# Iroh for P2P networking
-iroh = "0.95"
+# Iroh for P2P networking (default-features = false for WASM compatibility)
+iroh = { version = "0.95", default-features = false }
 
-# WASM bindings
-wasm-bindgen = "0.2"
+# WASM bindings - pin exact version to match iroh-examples/browser-echo
+wasm-bindgen = "=0.2.105"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = ["console"] }
@@ -21,8 +21,9 @@ web-sys = { version = "0.3", features = ["console"] }
 getrandom = { version = "0.3", features = ["wasm_js"] }
 rand = "0.9"
 
-# Async runtime for WASM
-tokio = { version = "1", features = ["sync", "io-util"] }
+# Async runtime for WASM (minimal features for browser)
+tokio = { version = "1", default-features = false, features = ["sync"] }
+n0-future = "0.3"
 
 # Error handling and panic info
 console_error_panic_hook = "0.1"
@@ -30,11 +31,17 @@ console_error_panic_hook = "0.1"
 # Serialization for NodeAddr
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde-wasm-bindgen = "0.6"
 
 # Logging
 tracing = "0.1"
-tracing-wasm = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber-wasm = "0.1"
 
 [profile.release]
-opt-level = "s"     # Optimize for size
-lto = true          # Link-time optimization
+codegen-units = 1
+strip = "symbols"
+debug = false
+lto = true
+opt-level = "z"
+panic = "abort"
