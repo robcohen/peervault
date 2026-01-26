@@ -19,13 +19,23 @@ interface WasmEndpoint {
   secretKeyBytes(): Uint8Array;
   generateTicket(): Promise<string>;
   connectWithTicket(ticket: string): Promise<WasmConnection>;
-  acceptConnection(): Promise<WasmConnection>;
+  acceptConnection(): Promise<WasmConnection | null>;
   close(): Promise<void>;
   free(): void;
 }
 
 interface WasmEndpointStatic {
-  create(keyBytes?: Uint8Array | null): Promise<WasmEndpoint>;
+  /**
+   * Create a new Iroh endpoint.
+   *
+   * @param keyBytes - Optional 32-byte secret key for identity persistence
+   * @param relayUrls - Optional custom relay server URLs (TODO: implement in Rust wrapper)
+   *
+   * NOTE: Custom relay support requires updating the Rust WASM wrapper to accept
+   * RelayMode::Custom. Currently uses RelayMode::Default (Iroh's public relays).
+   * See spec/05-transport-iroh.md for details on self-hosted relay setup.
+   */
+  create(keyBytes?: Uint8Array | null, relayUrls?: string[]): Promise<WasmEndpoint>;
 }
 
 interface WasmConnection {
@@ -135,7 +145,11 @@ export class IrohTransport implements Transport {
     this.config.logger.debug("Creating Iroh endpoint...");
 
     // Create the endpoint
-    this.endpoint = await wasmModule.WasmEndpoint.create(keyBytes ?? undefined);
+    // Pass relay URLs for when WASM wrapper supports custom relays
+    this.endpoint = await wasmModule.WasmEndpoint.create(
+      keyBytes ?? undefined,
+      this.config.relayUrls,
+    );
 
     // Save the key if we generated a new one
     if (!keyBytes) {
@@ -217,6 +231,16 @@ export class IrohTransport implements Transport {
         try {
           this.config.logger.debug("Waiting for incoming connection...");
           const wasmConn = await this.endpoint.acceptConnection();
+
+          // acceptConnection can return null (e.g., endpoint closing)
+          if (!wasmConn) {
+            if (this.ready) {
+              this.config.logger.debug("acceptConnection returned null, retrying...");
+              continue;
+            }
+            break;
+          }
+
           const peerId = wasmConn.remoteNodeId();
 
           this.config.logger.info("Incoming connection from:", peerId);

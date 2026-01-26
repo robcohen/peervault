@@ -5,7 +5,8 @@
  * Groups are stored in the Loro document for cross-device sync.
  */
 
-import type { LoroDoc, LoroMap, LoroList } from "loro-crdt";
+import { LoroList } from "loro-crdt";
+import type { LoroDoc, LoroMap } from "loro-crdt";
 import type { Logger } from "../../utils/logger";
 import { EventEmitter } from "../../utils/events";
 import type { PeerGroup, GroupSyncPolicy, PeerGroupEvents } from "./types";
@@ -178,6 +179,7 @@ export class PeerGroupManager extends EventEmitter<PeerGroupEvents> {
 
   /**
    * Internal method to create a group in the Loro map.
+   * Uses LoroList for arrays to maintain proper CRDT merge semantics.
    */
   private createGroupInternal(group: PeerGroup): void {
     const groupMap = this.groupsMap.setContainer(
@@ -193,16 +195,24 @@ export class PeerGroupManager extends EventEmitter<PeerGroupEvents> {
     groupMap.set("autoConnect", group.syncPolicy.autoConnect);
     groupMap.set("priority", group.syncPolicy.priority);
 
-    // Store arrays as JSON strings for simplicity
-    groupMap.set("peerIds", JSON.stringify(group.peerIds));
-    groupMap.set(
+    // Use LoroList for arrays to maintain CRDT merge semantics
+    const peerIdsList = groupMap.setContainer("peerIds", new LoroList());
+    for (const peerId of group.peerIds) {
+      peerIdsList.push(peerId);
+    }
+
+    const excludedFoldersList = groupMap.setContainer(
       "excludedFolders",
-      JSON.stringify(group.syncPolicy.excludedFolders),
+      new LoroList(),
     );
+    for (const folder of group.syncPolicy.excludedFolders) {
+      excludedFoldersList.push(folder);
+    }
   }
 
   /**
    * Update a peer group.
+   * Uses LoroList for arrays to maintain proper CRDT merge semantics.
    */
   updateGroup(
     groupId: string,
@@ -223,16 +233,45 @@ export class PeerGroupManager extends EventEmitter<PeerGroupEvents> {
       groupMap.set("color", updates.color);
     }
     if (updates.peerIds !== undefined) {
-      groupMap.set("peerIds", JSON.stringify(updates.peerIds));
+      // Clear and repopulate the LoroList
+      let peerIdsList = groupMap.get("peerIds") as LoroList | undefined;
+      if (!peerIdsList || !(peerIdsList instanceof LoroList)) {
+        // Create new list if doesn't exist or is legacy JSON string
+        peerIdsList = groupMap.setContainer("peerIds", new LoroList());
+      } else {
+        // Clear existing list
+        const len = peerIdsList.length;
+        if (len > 0) {
+          peerIdsList.delete(0, len);
+        }
+      }
+      for (const peerId of updates.peerIds) {
+        peerIdsList.push(peerId);
+      }
     }
     if (updates.syncPolicy !== undefined) {
       groupMap.set("readOnly", updates.syncPolicy.readOnly);
       groupMap.set("autoConnect", updates.syncPolicy.autoConnect);
       groupMap.set("priority", updates.syncPolicy.priority);
-      groupMap.set(
-        "excludedFolders",
-        JSON.stringify(updates.syncPolicy.excludedFolders),
-      );
+
+      // Clear and repopulate the excludedFolders LoroList
+      let excludedFoldersList = groupMap.get("excludedFolders") as
+        | LoroList
+        | undefined;
+      if (!excludedFoldersList || !(excludedFoldersList instanceof LoroList)) {
+        excludedFoldersList = groupMap.setContainer(
+          "excludedFolders",
+          new LoroList(),
+        );
+      } else {
+        const len = excludedFoldersList.length;
+        if (len > 0) {
+          excludedFoldersList.delete(0, len);
+        }
+      }
+      for (const folder of updates.syncPolicy.excludedFolders) {
+        excludedFoldersList.push(folder);
+      }
     }
 
     this.doc.commit();
@@ -247,6 +286,7 @@ export class PeerGroupManager extends EventEmitter<PeerGroupEvents> {
   /**
    * Delete a peer group.
    * Cannot delete the default group.
+   * Peers in the deleted group are automatically moved to the default group.
    */
   deleteGroup(groupId: string): void {
     if (groupId === DEFAULT_GROUP_ID) {
@@ -256,6 +296,11 @@ export class PeerGroupManager extends EventEmitter<PeerGroupEvents> {
     const group = this.getGroup(groupId);
     if (!group) {
       throw new Error(`Group not found: ${groupId}`);
+    }
+
+    // Move all peers to the default group before deletion
+    for (const peerId of group.peerIds) {
+      this.addPeerToGroup(DEFAULT_GROUP_ID, peerId);
     }
 
     this.groupsMap.delete(groupId);
@@ -320,26 +365,37 @@ export class PeerGroupManager extends EventEmitter<PeerGroupEvents> {
 
   /**
    * Parse a group from Loro map data.
+   * Handles both LoroList (new format) and JSON string (legacy format) for arrays.
    */
   private parseGroup(
     id: string,
     data: Record<string, unknown>,
   ): PeerGroup | undefined {
     try {
-      // Parse peerIds (stored as JSON string)
+      // Parse peerIds - can be LoroList, array, or legacy JSON string
       let peerIds: string[] = [];
-      if (typeof data.peerIds === "string") {
-        peerIds = JSON.parse(data.peerIds);
-      } else if (Array.isArray(data.peerIds)) {
-        peerIds = data.peerIds;
+      if (Array.isArray(data.peerIds)) {
+        peerIds = data.peerIds.map(String);
+      } else if (typeof data.peerIds === "string") {
+        // Legacy: JSON string format
+        try {
+          peerIds = JSON.parse(data.peerIds);
+        } catch {
+          peerIds = [];
+        }
       }
 
-      // Parse excludedFolders (stored as JSON string)
+      // Parse excludedFolders - can be LoroList, array, or legacy JSON string
       let excludedFolders: string[] = [];
-      if (typeof data.excludedFolders === "string") {
-        excludedFolders = JSON.parse(data.excludedFolders);
-      } else if (Array.isArray(data.excludedFolders)) {
-        excludedFolders = data.excludedFolders;
+      if (Array.isArray(data.excludedFolders)) {
+        excludedFolders = data.excludedFolders.map(String);
+      } else if (typeof data.excludedFolders === "string") {
+        // Legacy: JSON string format
+        try {
+          excludedFolders = JSON.parse(data.excludedFolders);
+        } catch {
+          excludedFolders = [];
+        }
       }
 
       return {

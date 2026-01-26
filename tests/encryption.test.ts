@@ -17,8 +17,8 @@ describe('EncryptionService', () => {
   });
 
   describe('Key Management', () => {
-    it('should generate a 32-byte key', () => {
-      const key = encryption.generateKey();
+    it('should generate a 32-byte key', async () => {
+      const key = await encryption.generateKey();
       expect(key).toBeInstanceOf(Uint8Array);
       expect(key.length).toBe(32);
     });
@@ -27,22 +27,19 @@ describe('EncryptionService', () => {
       expect(encryption.isEnabled()).toBe(false);
     });
 
-    it('should be enabled after setting a key', () => {
-      const key = encryption.generateKey();
-      encryption.setKey(key);
+    it('should be enabled after setting a key', async () => {
+      const key = await encryption.generateKey();
       expect(encryption.isEnabled()).toBe(true);
     });
 
-    it('should get the key after setting', () => {
-      const key = encryption.generateKey();
-      encryption.setKey(key);
+    it('should get the key after setting', async () => {
+      const key = await encryption.generateKey();
       const retrieved = encryption.getKey();
       expect(retrieved).toEqual(key);
     });
 
-    it('should clear the key', () => {
-      const key = encryption.generateKey();
-      encryption.setKey(key);
+    it('should clear the key', async () => {
+      const key = await encryption.generateKey();
       expect(encryption.isEnabled()).toBe(true);
 
       encryption.clearKey();
@@ -52,88 +49,83 @@ describe('EncryptionService', () => {
   });
 
   describe('Encryption/Decryption', () => {
-    beforeEach(() => {
-      const key = encryption.generateKey();
-      encryption.setKey(key);
+    beforeEach(async () => {
+      await encryption.generateKey();
     });
 
-    it('should encrypt and decrypt text data', () => {
+    it('should encrypt and decrypt text data', async () => {
       const plaintext = new TextEncoder().encode('Hello, World!');
 
-      const ciphertext = encryption.encrypt(plaintext);
+      const ciphertext = await encryption.encrypt(plaintext);
       expect(ciphertext).toBeInstanceOf(Uint8Array);
       expect(ciphertext.length).toBeGreaterThan(plaintext.length);
 
-      const decrypted = encryption.decrypt(ciphertext);
+      const decrypted = await encryption.decrypt(ciphertext);
       expect(new TextDecoder().decode(decrypted)).toBe('Hello, World!');
     });
 
-    it('should encrypt and decrypt binary data', () => {
+    it('should encrypt and decrypt binary data', async () => {
       const plaintext = new Uint8Array([0x00, 0xff, 0x42, 0x13, 0x37]);
 
-      const ciphertext = encryption.encrypt(plaintext);
-      const decrypted = encryption.decrypt(ciphertext);
+      const ciphertext = await encryption.encrypt(plaintext);
+      const decrypted = await encryption.decrypt(ciphertext);
 
       expect(decrypted).toEqual(plaintext);
     });
 
-    it('should produce different ciphertext for same plaintext (random nonce)', () => {
+    it('should produce different ciphertext for same plaintext (random nonce)', async () => {
       const plaintext = new TextEncoder().encode('Same message');
 
-      const ciphertext1 = encryption.encrypt(plaintext);
-      const ciphertext2 = encryption.encrypt(plaintext);
+      const ciphertext1 = await encryption.encrypt(plaintext);
+      const ciphertext2 = await encryption.encrypt(plaintext);
 
       // Ciphertexts should differ due to random nonce
       expect(ciphertext1).not.toEqual(ciphertext2);
 
       // Both should decrypt to the same plaintext
-      expect(encryption.decrypt(ciphertext1)).toEqual(plaintext);
-      expect(encryption.decrypt(ciphertext2)).toEqual(plaintext);
+      expect(await encryption.decrypt(ciphertext1)).toEqual(plaintext);
+      expect(await encryption.decrypt(ciphertext2)).toEqual(plaintext);
     });
 
-    it('should handle empty data', () => {
+    it('should handle empty data', async () => {
       const plaintext = new Uint8Array(0);
 
-      const ciphertext = encryption.encrypt(plaintext);
-      const decrypted = encryption.decrypt(ciphertext);
+      const ciphertext = await encryption.encrypt(plaintext);
+      const decrypted = await encryption.decrypt(ciphertext);
 
       expect(decrypted).toEqual(plaintext);
     });
 
-    it('should handle large data', () => {
+    it('should handle large data', async () => {
       // 1MB of random-ish data
       const plaintext = new Uint8Array(1024 * 1024);
       for (let i = 0; i < plaintext.length; i++) {
         plaintext[i] = i % 256;
       }
 
-      const ciphertext = encryption.encrypt(plaintext);
-      const decrypted = encryption.decrypt(ciphertext);
+      const ciphertext = await encryption.encrypt(plaintext);
+      const decrypted = await encryption.decrypt(ciphertext);
 
       expect(decrypted).toEqual(plaintext);
     });
 
-    it('should throw on tampered ciphertext', () => {
+    it('should throw on tampered ciphertext', async () => {
       const plaintext = new TextEncoder().encode('Sensitive data');
-      const ciphertext = encryption.encrypt(plaintext);
+      const ciphertext = await encryption.encrypt(plaintext);
 
       // Tamper with the ciphertext
       ciphertext[30]++;
 
-      expect(() => {
-        encryption.decrypt(ciphertext);
-      }).toThrow();
+      await expect(encryption.decrypt(ciphertext)).rejects.toThrow();
     });
 
-    it('should throw when decrypting without key', () => {
+    it('should throw when decrypting without key', async () => {
       const plaintext = new TextEncoder().encode('Test');
-      const ciphertext = encryption.encrypt(plaintext);
+      const ciphertext = await encryption.encrypt(plaintext);
 
       encryption.clearKey();
 
-      expect(() => {
-        encryption.decrypt(ciphertext);
-      }).toThrow();
+      await expect(encryption.decrypt(ciphertext)).rejects.toThrow();
     });
   });
 });
@@ -171,9 +163,8 @@ describe('EncryptedStorageAdapter', () => {
   });
 
   describe('With Encryption', () => {
-    beforeEach(() => {
-      const key = encryption.generateKey();
-      encryption.setKey(key);
+    beforeEach(async () => {
+      await encryption.generateKey();
       encryptedStorage = new EncryptedStorageAdapter(innerStorage, encryption);
     });
 
@@ -221,8 +212,7 @@ describe('EncryptedStorageAdapter', () => {
       await innerStorage.write('old-file', plaintext);
 
       // Enable encryption
-      const key = encryption.generateKey();
-      encryption.setKey(key);
+      await encryption.generateKey();
       encryptedStorage = new EncryptedStorageAdapter(innerStorage, encryption);
 
       // Should still read the plaintext
@@ -232,8 +222,7 @@ describe('EncryptedStorageAdapter', () => {
 
     it('should read encrypted files when encryption is disabled', async () => {
       // Write encrypted data
-      const key = encryption.generateKey();
-      encryption.setKey(key);
+      await encryption.generateKey();
       encryptedStorage = new EncryptedStorageAdapter(innerStorage, encryption);
 
       const data = new TextEncoder().encode('Encrypted data');
@@ -248,8 +237,7 @@ describe('EncryptedStorageAdapter', () => {
 
   describe('Re-encryption', () => {
     it('should re-encrypt all files', async () => {
-      const key = encryption.generateKey();
-      encryption.setKey(key);
+      await encryption.generateKey();
       encryptedStorage = new EncryptedStorageAdapter(innerStorage, encryption);
 
       // Write some files
@@ -273,8 +261,7 @@ describe('EncryptedStorageAdapter', () => {
       await innerStorage.write('plain', new TextEncoder().encode('Plain'));
 
       // Enable encryption
-      const key = encryption.generateKey();
-      encryption.setKey(key);
+      await encryption.generateKey();
       encryptedStorage = new EncryptedStorageAdapter(innerStorage, encryption);
 
       await encryptedStorage.reencryptAll();
@@ -291,8 +278,7 @@ describe('EncryptedStorageAdapter', () => {
 
   describe('Decryption (Disable Encryption)', () => {
     it('should decrypt all files', async () => {
-      const key = encryption.generateKey();
-      encryption.setKey(key);
+      await encryption.generateKey();
       encryptedStorage = new EncryptedStorageAdapter(innerStorage, encryption);
 
       // Write encrypted files
@@ -315,8 +301,7 @@ describe('EncryptedStorageAdapter', () => {
 
   describe('isFileEncrypted', () => {
     it('should detect encrypted files', async () => {
-      const key = encryption.generateKey();
-      encryption.setKey(key);
+      await encryption.generateKey();
       encryptedStorage = new EncryptedStorageAdapter(innerStorage, encryption);
 
       await encryptedStorage.write('encrypted', new TextEncoder().encode('Data'));

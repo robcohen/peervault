@@ -969,8 +969,9 @@ class PeerRevocationManager {
 
   /**
    * Sign a revocation for verification.
+   * Uses TweetNaCl for Ed25519 signatures.
    */
-  private async signRevocation(revocation: PeerRevocation): Promise<string> {
+  private signRevocation(revocation: PeerRevocation, secretKey: Uint8Array): string {
     const data = JSON.stringify({
       revokedNodeId: revocation.revokedNodeId,
       revokedAt: revocation.revokedAt,
@@ -979,14 +980,16 @@ class PeerRevocationManager {
       reason: revocation.reason,
     });
 
-    const signature = await this.crypto.sign(data);
-    return signature;
+    const messageBytes = new TextEncoder().encode(data);
+    const signature = nacl.sign.detached(messageBytes, secretKey);
+    return nacl.util.encodeBase64(signature);
   }
 
   /**
    * Verify a revocation signature.
+   * Uses TweetNaCl for Ed25519 verification.
    */
-  private async verifyRevocationSignature(revocation: PeerRevocation): Promise<boolean> {
+  private verifyRevocationSignature(revocation: PeerRevocation): boolean {
     const data = JSON.stringify({
       revokedNodeId: revocation.revokedNodeId,
       revokedAt: revocation.revokedAt,
@@ -995,7 +998,11 @@ class PeerRevocationManager {
       reason: revocation.reason,
     });
 
-    return await this.crypto.verify(data, revocation.signature, revocation.revokedBy);
+    const messageBytes = new TextEncoder().encode(data);
+    const signatureBytes = nacl.util.decodeBase64(revocation.signature);
+    const publicKeyBytes = nacl.util.decodeBase64(revocation.revokedBy);
+
+    return nacl.sign.detached.verify(messageBytes, signatureBytes, publicKeyBytes);
   }
 }
 ```

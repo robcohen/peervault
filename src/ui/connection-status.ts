@@ -7,6 +7,7 @@
 import { App, Modal, Notice, Setting } from "obsidian";
 import type PeerVaultPlugin from "../main";
 import type { SyncStatus } from "../types";
+import { STATUS_ICONS } from "./status-icons";
 
 /** Sync progress info */
 export interface SyncProgress {
@@ -36,49 +37,75 @@ export interface SyncError {
   retryable: boolean;
 }
 
-/** Recent error history */
-const recentErrors: SyncError[] = [];
-const MAX_RECENT_ERRORS = 10;
+/** State management for connection status (encapsulated) */
+class ConnectionState {
+  private recentErrors: SyncError[] = [];
+  private currentProgress: SyncProgress | null = null;
+  private readonly MAX_RECENT_ERRORS = 10;
 
-/** Current sync progress */
-let currentProgress: SyncProgress | null = null;
+  recordError(error: SyncError): void {
+    this.recentErrors.unshift(error);
+    while (this.recentErrors.length > this.MAX_RECENT_ERRORS) {
+      this.recentErrors.pop();
+    }
+  }
+
+  getErrors(): SyncError[] {
+    return [...this.recentErrors];
+  }
+
+  getLatestError(): SyncError | undefined {
+    return this.recentErrors[0];
+  }
+
+  clearErrors(): void {
+    this.recentErrors.length = 0;
+  }
+
+  setProgress(progress: SyncProgress | null): void {
+    this.currentProgress = progress;
+  }
+
+  getProgress(): SyncProgress | null {
+    return this.currentProgress;
+  }
+}
+
+const connectionState = new ConnectionState();
 
 /**
  * Record a sync error.
  */
 export function recordSyncError(error: SyncError): void {
-  recentErrors.unshift(error);
-  while (recentErrors.length > MAX_RECENT_ERRORS) {
-    recentErrors.pop();
-  }
+  connectionState.recordError(error);
 }
 
 /**
  * Get recent errors.
  */
 export function getRecentErrors(): SyncError[] {
-  return [...recentErrors];
+  return connectionState.getErrors();
 }
 
 /**
  * Clear recent errors.
  */
 export function clearErrors(): void {
-  recentErrors.length = 0;
+  connectionState.clearErrors();
 }
 
 /**
  * Update current sync progress.
  */
 export function updateSyncProgress(progress: SyncProgress | null): void {
-  currentProgress = progress;
+  connectionState.setProgress(progress);
 }
 
 /**
  * Get current sync progress.
  */
 export function getSyncProgress(): SyncProgress | null {
-  return currentProgress;
+  return connectionState.getProgress();
 }
 
 /**
@@ -137,9 +164,9 @@ export class ConnectionStatusManager {
         p.connectionState === "connected" || p.connectionState === "syncing",
     );
     const progress = getSyncProgress();
-    const errors = getRecentErrors();
+    const latestError = connectionState.getLatestError();
     const hasRecentError =
-      errors.length > 0 && Date.now() - errors[0]!.timestamp < 60000;
+      latestError !== undefined && Date.now() - latestError.timestamp < 60000;
 
     this.statusBarItem.empty();
 
@@ -149,29 +176,34 @@ export class ConnectionStatusManager {
     });
 
     // Determine what to show
-    if (hasRecentError && status === "error") {
-      iconEl.setText("!");
+    if (hasRecentError && status === "error" && latestError) {
+      iconEl.setText(STATUS_ICONS.error);
       iconEl.addClass("peervault-status-error");
-      this.statusBarItem.title = `Error: ${errors[0]!.message}`;
+      iconEl.ariaLabel = "Error";
+      this.statusBarItem.title = `Error: ${latestError.message}`;
     } else if (status === "syncing") {
-      iconEl.setText("~");
+      iconEl.setText(STATUS_ICONS.syncing);
       iconEl.addClass("peervault-status-syncing");
+      iconEl.ariaLabel = "Syncing";
       if (progress) {
         this.statusBarItem.title = `${progress.operation}: ${progress.progress}%`;
       } else {
         this.statusBarItem.title = "Syncing...";
       }
     } else if (connectedPeers.length > 0) {
-      iconEl.setText("*");
+      iconEl.setText(STATUS_ICONS.connected);
       iconEl.addClass("peervault-status-connected");
+      iconEl.ariaLabel = "Connected";
       this.statusBarItem.title = `Connected to ${connectedPeers.length} peer(s)`;
     } else if (peers.length > 0) {
-      iconEl.setText("o");
+      iconEl.setText(STATUS_ICONS.offline);
       iconEl.addClass("peervault-status-offline");
+      iconEl.ariaLabel = "Offline";
       this.statusBarItem.title = `${peers.length} peer(s) offline`;
     } else {
-      iconEl.setText("-");
+      iconEl.setText(STATUS_ICONS.idle);
       iconEl.addClass("peervault-status-idle");
+      iconEl.ariaLabel = "Idle";
       this.statusBarItem.title = "No peers configured";
     }
 
@@ -316,13 +348,21 @@ export class ConnectionStatusModal extends Modal {
           text: "Retry",
           cls: "peervault-retry-btn",
         });
+        let isRetrying = false;
         retryBtn.onclick = async () => {
+          if (isRetrying) return; // Debounce
+          isRetrying = true;
+          retryBtn.disabled = true;
+          retryBtn.setText("Retrying...");
           try {
             await this.plugin.peerManager.syncPeer(peer.nodeId);
             new Notice("Reconnecting to peer...");
             this.close();
           } catch (err) {
             new Notice(`Failed to reconnect: ${err}`);
+            retryBtn.setText("Retry");
+            retryBtn.disabled = false;
+            isRetrying = false;
           }
         };
       }

@@ -61,8 +61,8 @@ PeerVault is an Obsidian plugin that enables peer-to-peer synchronization of mar
 | Component | Library | Purpose |
 |-----------|---------|---------|
 | CRDT Engine | `loro-crdt` | Conflict-free data structures (Fugue, LoroTree) |
-| P2P Transport | `@aspect/iroh` (WASM) | NAT traversal, encrypted streams |
-| Binary Sync | `iroh-blobs` | Large file/attachment sync |
+| P2P Transport | `@number0/iroh` (WASM) | NAT traversal, encrypted streams (planned) |
+| Binary Sync | `@number0/iroh-blobs` | Large file/attachment sync (planned) |
 | Plugin Host | Obsidian Plugin API | File access, UI integration |
 
 ## Component Dependencies

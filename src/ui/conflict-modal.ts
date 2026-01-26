@@ -79,8 +79,12 @@ export class ConflictModal extends Modal {
     const link = pathEl.createEl("a", { text: conflict.path });
     link.onclick = async (e) => {
       e.preventDefault();
-      await this.app.workspace.openLinkText(conflict.path, "");
-      this.close();
+      try {
+        await this.app.workspace.openLinkText(conflict.path, "");
+        this.close();
+      } catch (error) {
+        new Notice(`Could not open file: ${error}`);
+      }
     };
 
     // Details
@@ -100,8 +104,12 @@ export class ConflictModal extends Modal {
 
     const openBtn = actions.createEl("button", { text: "Open File" });
     openBtn.onclick = async () => {
-      await this.app.workspace.openLinkText(conflict.path, "");
-      this.close();
+      try {
+        await this.app.workspace.openLinkText(conflict.path, "");
+        this.close();
+      } catch (error) {
+        new Notice(`Could not open file: ${error}`);
+      }
     };
 
     const resolveBtn = actions.createEl("button", { text: "Mark Resolved" });
@@ -109,10 +117,32 @@ export class ConflictModal extends Modal {
       const tracker = getConflictTracker();
       tracker.resolveConflict(conflict.path);
       new Notice(`Marked "${conflict.path}" as resolved`);
-      // Refresh
-      this.close();
-      new ConflictModal(this.app, this.plugin).open();
+      this.refresh();
     };
+  }
+
+  private refresh(): void {
+    // Re-render in place
+    const { contentEl } = this;
+    contentEl.empty();
+
+    contentEl.createEl("h2", { text: "Concurrent Edits" });
+
+    contentEl.createEl("p", {
+      text: "These files were edited by multiple devices at the same time. The changes were automatically merged, but you may want to review the results.",
+      cls: "peervault-help-text",
+    });
+
+    const tracker = getConflictTracker();
+    const conflicts = tracker.getConflicts();
+
+    if (conflicts.length === 0) {
+      this.renderEmpty(contentEl);
+    } else {
+      this.renderConflicts(contentEl, conflicts);
+    }
+
+    this.renderActions(contentEl, conflicts);
   }
 
   private renderActions(

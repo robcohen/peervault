@@ -15,60 +15,92 @@ Define how peers are discovered, paired, stored, and managed throughout the life
 ## Peer Data Model
 
 ```typescript
-interface Peer {
+/**
+ * Current state of a peer connection.
+ */
+type PeerState =
+  | 'unknown'      // Initial state
+  | 'connecting'   // Connection in progress
+  | 'syncing'      // Connected and syncing
+  | 'synced'       // Connected and up-to-date
+  | 'offline'      // Disconnected
+  | 'error';       // Connection error
+
+/**
+ * Information about a known peer.
+ */
+interface PeerInfo {
   /** Iroh NodeId (public key) */
   nodeId: string;
 
-  /** User-assigned name for this peer */
-  name: string;
+  /** User-assigned name for this peer (optional) */
+  name?: string;
 
-  /** Last known connection ticket */
-  ticket: string;
+  /** Current connection state */
+  state: PeerState;
 
-  /** When this peer was added */
-  addedAt: string;
+  /** Last known connection ticket (optional) */
+  ticket?: string;
 
-  /** Last successful sync timestamp */
-  lastSyncAt: string | null;
+  /** When this peer was first seen (ms since epoch) */
+  firstSeen: number;
 
-  /** Whether to auto-connect on startup */
-  autoConnect: boolean;
-}
+  /** Last successful sync timestamp (ms since epoch) */
+  lastSynced?: number;
 
-interface PeerState {
-  /** Static peer info */
-  peer: Peer;
+  /** Last time we saw this peer online (ms since epoch) */
+  lastSeen?: number;
 
-  /** Current connection status */
-  status: 'disconnected' | 'connecting' | 'connected' | 'syncing';
+  /** Whether this peer is trusted for sync */
+  trusted: boolean;
 
-  /** Active connection if connected */
-  connection: PeerConnection | null;
-
-  /** Last error if any */
-  lastError: string | null;
+  /** Group IDs this peer belongs to */
+  groupIds?: string[];
 }
 ```
 
 ## Interface
 
 ```typescript
+/**
+ * Events emitted by the PeerManager.
+ */
+interface PeerManagerEvents {
+  'peer:connected': PeerInfo;
+  'peer:disconnected': { nodeId: string; reason?: string };
+  'peer:synced': string;  // nodeId
+  'peer:error': { nodeId: string; error: Error };
+  'status:change': 'idle' | 'syncing' | 'offline' | 'error';
+}
+
 interface PeerManager {
+  /**
+   * Initialize the peer manager.
+   */
+  initialize(): Promise<void>;
+
+  /**
+   * Graceful shutdown.
+   */
+  shutdown(): Promise<void>;
+
   /**
    * Get all known peers.
    */
-  getPeers(): Peer[];
+  getPeers(): PeerInfo[];
 
   /**
-   * Get current state of all peers.
+   * Get a specific peer by node ID.
    */
-  getPeerStates(): PeerState[];
+  getPeer(nodeId: string): PeerInfo | undefined;
 
   /**
    * Add a new peer via their ticket.
-   * @returns The new peer, or existing peer if already known
+   * @param ticket - Iroh connection ticket
+   * @param name - Optional display name
+   * @returns The new peer info
    */
-  addPeer(ticket: string, name: string): Promise<Peer>;
+  addPeer(ticket: string, name?: string): Promise<PeerInfo>;
 
   /**
    * Remove a peer and disconnect.
@@ -76,29 +108,47 @@ interface PeerManager {
   removePeer(nodeId: string): Promise<void>;
 
   /**
-   * Update peer settings.
+   * Rename a peer.
    */
-  updatePeer(nodeId: string, updates: Partial<Pick<Peer, 'name' | 'autoConnect'>>): Promise<void>;
+  renamePeer(nodeId: string, newName: string): Promise<void>;
 
   /**
-   * Manually trigger connection to a peer.
+   * Set peer trust status.
    */
-  connectToPeer(nodeId: string): Promise<void>;
+  setTrusted(nodeId: string, trusted: boolean): Promise<void>;
 
   /**
-   * Disconnect from a peer (but keep in peer list).
+   * Sync with a specific peer.
    */
-  disconnectPeer(nodeId: string): Promise<void>;
+  syncPeer(nodeId: string): Promise<void>;
 
   /**
-   * Connect to all auto-connect peers.
+   * Sync with all known peers.
    */
-  connectAll(): Promise<void>;
+  syncAll(): Promise<void>;
 
   /**
-   * Subscribe to peer state changes.
+   * Generate an invite ticket for this device.
    */
-  onPeerStateChange(callback: (states: PeerState[]) => void): () => void;
+  generateInvite(): Promise<string>;
+
+  /**
+   * Get this device's node ID.
+   */
+  getNodeId(): string;
+
+  /**
+   * Get overall sync status.
+   */
+  getStatus(): 'idle' | 'syncing' | 'offline' | 'error';
+
+  /**
+   * Subscribe to events (EventEmitter pattern).
+   */
+  on<K extends keyof PeerManagerEvents>(
+    event: K,
+    listener: (data: PeerManagerEvents[K]) => void
+  ): void;
 }
 ```
 

@@ -116,16 +116,22 @@ function initializeGroups(doc: LoroDoc): void {
 
   // Create default group if not exists
   if (!groups.get('default')) {
-    doc.transact(() => {
-      const defaultGroup = groups.setContainer('default', 'Map');
-      defaultGroup.set('id', 'default');
-      defaultGroup.set('name', 'All Devices');
-      defaultGroup.set('icon', '📱');
-      defaultGroup.set('color', '#7c7c7c');
-      defaultGroup.setContainer('peerIds', 'List');
-      defaultGroup.setContainer('syncPolicy', 'Map');
-      defaultGroup.set('createdAt', Date.now());
-    });
+    // setContainer takes a Container instance, not a string type
+    const defaultGroup = groups.setContainer('default', new LoroMap());
+    defaultGroup.set('id', 'default');
+    defaultGroup.set('name', 'All Devices');
+    defaultGroup.set('icon', '📱');
+    defaultGroup.set('color', '#7c7c7c');
+    // Use LoroList for array storage
+    defaultGroup.setContainer('peerIds', new LoroList());
+    // Nested map for policy
+    const policyMap = defaultGroup.setContainer('syncPolicy', new LoroMap());
+    policyMap.setContainer('excludedFolders', new LoroList());
+    policyMap.set('readOnly', false);
+    policyMap.set('autoConnect', true);
+    policyMap.set('priority', 0);
+    defaultGroup.set('createdAt', Date.now());
+    doc.commit();
   }
 }
 
@@ -133,26 +139,30 @@ function createGroup(doc: LoroDoc, group: Omit<PeerGroup, 'id' | 'createdAt'>): 
   const groups = doc.getMap('groups');
   const id = generateGroupId();
 
-  doc.transact(() => {
-    const groupMap = groups.setContainer(id, 'Map');
-    groupMap.set('id', id);
-    groupMap.set('name', group.name);
-    groupMap.set('icon', group.icon);
-    groupMap.set('color', group.color);
+  // setContainer takes a Container instance, not a string type
+  const groupMap = groups.setContainer(id, new LoroMap());
+  groupMap.set('id', id);
+  groupMap.set('name', group.name);
+  groupMap.set('icon', group.icon);
+  groupMap.set('color', group.color);
 
-    const peerIds = groupMap.setContainer('peerIds', 'List');
-    for (const peerId of group.peerIds) {
-      peerIds.push(peerId);
-    }
+  // Use LoroList for array storage
+  const peerIds = groupMap.setContainer('peerIds', new LoroList());
+  for (const peerId of group.peerIds) {
+    peerIds.push(peerId);
+  }
 
-    const policy = groupMap.setContainer('syncPolicy', 'Map');
-    policy.set('excludedFolders', group.syncPolicy.excludedFolders);
-    policy.set('readOnly', group.syncPolicy.readOnly);
-    policy.set('autoConnect', group.syncPolicy.autoConnect);
-    policy.set('priority', group.syncPolicy.priority);
+  const policy = groupMap.setContainer('syncPolicy', new LoroMap());
+  const excludedFolders = policy.setContainer('excludedFolders', new LoroList());
+  for (const folder of group.syncPolicy.excludedFolders) {
+    excludedFolders.push(folder);
+  }
+  policy.set('readOnly', group.syncPolicy.readOnly);
+  policy.set('autoConnect', group.syncPolicy.autoConnect);
+  policy.set('priority', group.syncPolicy.priority);
 
-    groupMap.set('createdAt', Date.now());
-  });
+  groupMap.set('createdAt', Date.now());
+  doc.commit();
 
   return id;
 }
@@ -173,9 +183,8 @@ function addPeerToGroup(doc: LoroDoc, groupId: string, peerId: string): void {
     return;
   }
 
-  doc.transact(() => {
-    peerIds.push(peerId);
-  });
+  peerIds.push(peerId);
+  doc.commit();
 }
 
 function removePeerFromGroup(doc: LoroDoc, groupId: string, peerId: string): void {
@@ -188,9 +197,8 @@ function removePeerFromGroup(doc: LoroDoc, groupId: string, peerId: string): voi
   const index = peerIds.toArray().indexOf(peerId);
 
   if (index !== -1) {
-    doc.transact(() => {
-      peerIds.delete(index, 1);
-    });
+    peerIds.delete(index, 1);
+    doc.commit();
   }
 }
 ```
@@ -399,27 +407,35 @@ class PeerGroupManager {
       throw new Error(`Group not found: ${id}`);
     }
 
-    this.doc.transact(() => {
-      if (updates.name !== undefined) group.set('name', updates.name);
-      if (updates.icon !== undefined) group.set('icon', updates.icon);
-      if (updates.color !== undefined) group.set('color', updates.color);
+    if (updates.name !== undefined) group.set('name', updates.name);
+    if (updates.icon !== undefined) group.set('icon', updates.icon);
+    if (updates.color !== undefined) group.set('color', updates.color);
 
-      if (updates.syncPolicy) {
-        const policy = group.get('syncPolicy') as LoroMap;
-        if (updates.syncPolicy.excludedFolders !== undefined) {
-          policy.set('excludedFolders', updates.syncPolicy.excludedFolders);
+    if (updates.syncPolicy) {
+      const policy = group.get('syncPolicy') as LoroMap;
+      if (updates.syncPolicy.excludedFolders !== undefined) {
+        // Replace entire list by clearing and re-adding
+        const excludedFolders = policy.get('excludedFolders') as LoroList;
+        const len = excludedFolders.toArray().length;
+        if (len > 0) {
+          excludedFolders.delete(0, len);
         }
-        if (updates.syncPolicy.readOnly !== undefined) {
-          policy.set('readOnly', updates.syncPolicy.readOnly);
-        }
-        if (updates.syncPolicy.autoConnect !== undefined) {
-          policy.set('autoConnect', updates.syncPolicy.autoConnect);
-        }
-        if (updates.syncPolicy.priority !== undefined) {
-          policy.set('priority', updates.syncPolicy.priority);
+        for (const folder of updates.syncPolicy.excludedFolders) {
+          excludedFolders.push(folder);
         }
       }
-    });
+      if (updates.syncPolicy.readOnly !== undefined) {
+        policy.set('readOnly', updates.syncPolicy.readOnly);
+      }
+      if (updates.syncPolicy.autoConnect !== undefined) {
+        policy.set('autoConnect', updates.syncPolicy.autoConnect);
+      }
+      if (updates.syncPolicy.priority !== undefined) {
+        policy.set('priority', updates.syncPolicy.priority);
+      }
+    }
+
+    this.doc.commit();
   }
 
   /**
@@ -438,11 +454,10 @@ class PeerGroupManager {
       addPeerToGroup(this.doc, 'default', peerId);
     }
 
-    // Delete group
+    // Delete group - no transact() needed
     const groups = this.doc.getMap('groups');
-    this.doc.transact(() => {
-      groups.delete(id);
-    });
+    groups.delete(id);
+    this.doc.commit();
   }
 
   /**
@@ -462,6 +477,7 @@ class PeerGroupManager {
   private mapToGroup(map: LoroMap): PeerGroup {
     const peerIds = map.get('peerIds') as LoroList;
     const policy = map.get('syncPolicy') as LoroMap;
+    const excludedFolders = policy.get('excludedFolders') as LoroList;
 
     return {
       id: map.get('id') as string,
@@ -470,7 +486,7 @@ class PeerGroupManager {
       color: map.get('color') as string,
       peerIds: peerIds.toArray() as string[],
       syncPolicy: {
-        excludedFolders: (policy.get('excludedFolders') as string[]) || [],
+        excludedFolders: excludedFolders.toArray() as string[],
         readOnly: (policy.get('readOnly') as boolean) || false,
         autoConnect: (policy.get('autoConnect') as boolean) ?? true,
         priority: (policy.get('priority') as number) || 0,

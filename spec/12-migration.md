@@ -220,21 +220,22 @@ function migrateLoroDoc(doc: LoroDoc): LoroDoc {
     return doc;
   }
 
-  // Migrate through each version
-  doc.transact(() => {
-    if (version < 2) {
-      // Example: v1 -> v2 migration
-      // Add new containers or transform existing data
+  // Migrate through each version (no transact() in Loro - changes auto-batch)
+  if (version < 2) {
+    // Example: v1 -> v2 migration
+    // Add new containers or transform existing data
 
-      // Initialize new tags container if not exists
-      // const tags = doc.getList('tags');
+    // Initialize new tags container if not exists
+    // const tags = doc.getList('tags');
 
-      // Update version
-      meta.set('version', 2);
-    }
+    // Update version
+    meta.set('version', 2);
+  }
 
-    // Future migrations...
-  });
+  // Future migrations...
+
+  // Commit all migration changes
+  doc.commit();
 
   return doc;
 }

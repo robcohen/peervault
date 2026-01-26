@@ -128,25 +128,27 @@ describe('DocumentManager', () => {
 
       expect(meta).toBeDefined();
       expect(meta!.name).toBe('document.md');
-      expect(meta!.type).toBe('text/markdown');
+      expect(meta!.type).toBe('file'); // FileNodeType: 'file' | 'folder' | 'binary'
+      expect(meta!.mimeType).toBe('text/markdown');
       expect(meta!.mtime).toBeGreaterThan(0);
       expect(meta!.ctime).toBeGreaterThan(0);
     });
 
     it('should detect MIME types correctly', async () => {
       const files = [
-        { path: 'test.md', type: 'text/markdown' },
-        { path: 'test.txt', type: 'text/plain' },
-        { path: 'test.json', type: 'application/json' },
-        { path: 'test.png', type: 'image/png' },
-        { path: 'test.jpg', type: 'image/jpeg' },
-        { path: 'test.unknown', type: 'application/octet-stream' },
+        { path: 'test.md', type: 'file', mimeType: 'text/markdown' },
+        { path: 'test.txt', type: 'file', mimeType: 'text/plain' },
+        { path: 'test.json', type: 'file', mimeType: 'application/json' },
+        { path: 'test.png', type: 'binary', mimeType: 'image/png' },
+        { path: 'test.jpg', type: 'binary', mimeType: 'image/jpeg' },
+        { path: 'test.unknown', type: 'file', mimeType: 'application/octet-stream' },
       ];
 
-      for (const { path, type } of files) {
+      for (const { path, type, mimeType } of files) {
         await docManager.handleFileCreate(path);
         const meta = docManager.getFileMeta(path);
         expect(meta!.type).toBe(type);
+        expect(meta!.mimeType).toBe(mimeType);
       }
     });
 

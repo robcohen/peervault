@@ -77,15 +77,20 @@ class ObsidianFileWatcher implements FileWatcher {
     this.excludedFolders = new Set(config.excludedFolders);
   }
 
+  private eventRefs: EventRef[] = [];
+
   start(): void {
-    this.vault.on('create', this.handleCreate.bind(this));
-    this.vault.on('modify', this.handleModify.bind(this));
-    this.vault.on('delete', this.handleDelete.bind(this));
-    this.vault.on('rename', this.handleRename.bind(this));
+    // Capture EventRef for proper cleanup
+    this.eventRefs.push(this.vault.on('create', this.handleCreate.bind(this)));
+    this.eventRefs.push(this.vault.on('modify', this.handleModify.bind(this)));
+    this.eventRefs.push(this.vault.on('delete', this.handleDelete.bind(this)));
+    this.eventRefs.push(this.vault.on('rename', this.handleRename.bind(this)));
   }
 
   stop(): void {
-    // Obsidian handles cleanup on plugin unload
+    // Properly unsubscribe event listeners to prevent memory leaks
+    this.eventRefs.forEach(ref => this.vault.offref(ref));
+    this.eventRefs = [];
     this.debounceTimers.forEach(timer => clearTimeout(timer));
   }
 
@@ -279,7 +284,12 @@ class SyncEngine {
   }
 
   private async handleCreate(path: string): Promise<void> {
-    const file = this.vault.getAbstractFileByPath(path) as TFile;
+    const abstractFile = this.vault.getAbstractFileByPath(path);
+    if (!(abstractFile instanceof TFile)) {
+      // File doesn't exist or is a folder - skip
+      return;
+    }
+    const file = abstractFile;
     const content = await this.vault.read(file);
 
     // Ensure parent folders exist
@@ -300,7 +310,12 @@ class SyncEngine {
       return;
     }
 
-    const file = this.vault.getAbstractFileByPath(path) as TFile;
+    const abstractFile = this.vault.getAbstractFileByPath(path);
+    if (!(abstractFile instanceof TFile)) {
+      // File doesn't exist or is a folder - skip
+      return;
+    }
+    const file = abstractFile;
     const content = await this.vault.read(file);
 
     // Update content in Loro
@@ -812,7 +827,9 @@ class CaseSensitivityHandler {
 
     // Platform-specific: ensure filesystem reflects the case
     // On case-insensitive systems, may need to rename through a temp name
-    if (Platform.isCaseInsensitive) {
+    // Note: Platform.isCaseInsensitive doesn't exist - derive from OS
+    const isCaseInsensitive = Platform.isWin || Platform.isMacOS || Platform.isIosApp;
+    if (isCaseInsensitive) {
       this.renameThroughTemp(oldPath, newPath);
     }
   }
@@ -970,18 +987,31 @@ When user renames the vault folder itself:
  * Obsidian typically requires restart, so this is mostly handled there.
  */
 class VaultRenameHandler {
-  private vaultPath: string;
+  private vaultPath: string | null;
+  private vault: Vault;
 
   constructor(vault: Vault) {
-    this.vaultPath = vault.adapter.getBasePath();
+    this.vault = vault;
+    // getBasePath() only exists on FileSystemAdapter (desktop), not mobile
+    this.vaultPath = this.getVaultBasePath();
+  }
+
+  private getVaultBasePath(): string | null {
+    if (this.vault.adapter instanceof FileSystemAdapter) {
+      return (this.vault.adapter as FileSystemAdapter).getBasePath();
+    }
+    // Mobile doesn't expose base path the same way
+    return null;
   }
 
   /**
    * Check if vault path changed on focus.
-   * Called when app regains focus.
+   * Called when app regains focus. Desktop only.
    */
   async checkVaultPathChanged(): Promise<void> {
-    const currentPath = this.vault.adapter.getBasePath();
+    if (!this.vaultPath) return; // Mobile - skip this check
+
+    const currentPath = this.getVaultBasePath();
 
     if (currentPath !== this.vaultPath) {
       // Vault was moved/renamed

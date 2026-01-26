@@ -57,12 +57,11 @@ export interface StoredPeerInfo {
 
 /** Events from peer manager */
 export interface PeerManagerEvents {
-  "peer:connected": { peer: PeerInfo };
+  "peer:connected": PeerInfo;
   "peer:disconnected": { nodeId: string; reason?: string };
-  "peer:synced": { nodeId: string };
+  "peer:synced": string; // nodeId
   "peer:error": { nodeId: string; error: Error };
-  "peer:discovered": { peer: PeerInfo };
-  "status:change": { status: "idle" | "syncing" | "offline" | "error" };
+  "status:change": "idle" | "syncing" | "offline" | "error";
 }
 
 /** Peer manager configuration */

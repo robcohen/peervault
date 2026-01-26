@@ -614,6 +614,9 @@ interface SyncSession {
   localDoc: LoroDoc;
   peerVersion: Map<string, number> | null;
   connection: IrohConnection;
+
+  /** Request peer's current version vector */
+  requestVersionVector(): Promise<Uint8Array>;
 }
 
 async function startSync(session: SyncSession): Promise<void> {
@@ -1203,13 +1206,15 @@ class SyncStateManager {
     await this.persist();
   }
 
-  getPeerVersion(peerId: string): Map<string, number> | null {
+  getPeerVersion(peerId: string): VersionVector | null {
     const state = this.states.get(peerId);
     if (!state) return null;
 
     try {
       const parsed = JSON.parse(state.lastKnownVersion);
-      return new Map(Object.entries(parsed));
+      const map = new Map<string, number>(Object.entries(parsed));
+      // Wrap in VersionVector for use with doc.export({ from: ... })
+      return new VersionVector(map);
     } catch {
       return null;
     }
@@ -1237,10 +1242,10 @@ class LiveSync {
     private stateManager: SyncStateManager
   ) {
     // Subscribe to local document changes
-    doc.subscribe((event) => {
-      if (event.origin === 'local') {
-        this.onLocalChange();
-      }
+    // Note: Use subscribeLocalUpdates() instead of non-existent subscribe()
+    doc.subscribeLocalUpdates((update: Uint8Array) => {
+      // Local changes detected - trigger sync
+      this.onLocalChange();
     });
   }
 
@@ -1740,6 +1745,28 @@ class ExtendedOfflineRecovery {
 
     // 5. Normal incremental sync
     return { type: 'incremental', localChanges, peerVersion };
+  }
+
+  /**
+   * Check if we're compatible with the peer (schema version, etc.)
+   */
+  private async checkCompatibility(session: SyncSession): Promise<{
+    compatible: boolean;
+    reason?: string;
+    suggestion?: string;
+  }> {
+    // Request peer's schema version via the connection
+    const peerVersion = await session.requestVersionVector();
+    // For now, assume compatible - real implementation would check schema versions
+    return { compatible: true };
+  }
+
+  /**
+   * Parse encoded version vector to Map.
+   */
+  private parseVersionVector(data: Uint8Array): Map<string, number> {
+    const vv = VersionVector.decode(data);
+    return vv.toJSON();
   }
 
   private calculateDivergence(

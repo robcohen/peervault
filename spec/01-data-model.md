@@ -56,7 +56,7 @@ import { LoroDoc, LoroTree, LoroMap, LoroText, LoroList } from 'loro-crdt';
 
 /**
  * Data associated with each tree node.
- * Accessed via tree.getMeta(nodeId).
+ * Accessed via tree.getNodeByID(nodeId)?.data (returns LoroMap).
  */
 interface FileNodeData {
   /** Node type: 'file' or 'folder' */
@@ -175,11 +175,12 @@ function createFile(
 ): TreeID {
   const files = doc.getTree('files');
 
-  // Create tree node (use create() for children, createNode() for roots)
-  const nodeId = parentId === null ? files.createNode() : files.create(parentId);
+  // Create tree node - createNode() returns LoroTreeNode, extract ID
+  const node = files.createNode(parentId ?? undefined);
+  const nodeId = node.id;
 
-  // Get the node's associated metadata map
-  const nodeData = files.getMeta(nodeId);
+  // Get the node's associated metadata map (node.data is a LoroMap)
+  const nodeData = node.data;
 
   // Set file metadata
   nodeData.set('type', 'file');
@@ -217,8 +218,9 @@ function createFolder(
   name: string
 ): TreeID {
   const files = doc.getTree('files');
-  const nodeId = parentId === null ? files.createNode() : files.create(parentId);
-  const nodeData = files.getMeta(nodeId);
+  const node = files.createNode(parentId ?? undefined);
+  const nodeId = node.id;
+  const nodeData = node.data;
 
   nodeData.set('type', 'folder');
   nodeData.set('name', name);
@@ -248,12 +250,14 @@ function moveNode(
 ): void {
   const files = doc.getTree('files');
 
-  // Loro's mov() handles all conflict resolution
-  files.mov(nodeId, newParentId);
+  // Loro's move() handles all conflict resolution
+  files.move(nodeId, newParentId ?? undefined);
 
   // Update mtime
-  const nodeData = files.getMeta(nodeId);
-  nodeData.set('mtime', Date.now());
+  const node = files.getNodeByID(nodeId);
+  if (node) {
+    node.data.set('mtime', Date.now());
+  }
 }
 
 /**
@@ -267,11 +271,24 @@ function moveAfter(
 ): void {
   const files = doc.getTree('files');
 
-  // Loro's movAfter uses fractional indexing
-  files.movAfter(nodeId, afterNodeId);
+  // Get the afterNode to find its parent and index
+  const afterNode = files.getNodeByID(afterNodeId);
+  if (!afterNode) return;
 
-  const nodeData = files.getMeta(nodeId);
-  nodeData.set('mtime', Date.now());
+  const parent = afterNode.parent();
+  const parentId = parent?.id;
+
+  // Find the index of afterNode and move to index + 1
+  const siblings = parent ? parent.children() : files.getNodes().filter(n => !n.parent());
+  const afterIndex = siblings?.findIndex(n => n.id === afterNodeId) ?? -1;
+
+  // Use move() with parent and index (fractional indexing handled internally)
+  files.move(nodeId, parentId, afterIndex + 1);
+
+  const node = files.getNodeByID(nodeId);
+  if (node) {
+    node.data.set('mtime', Date.now());
+  }
 }
 
 /**
@@ -283,10 +300,11 @@ function renameNode(
   newName: string
 ): void {
   const files = doc.getTree('files');
-  const nodeData = files.getMeta(nodeId);
+  const node = files.getNodeByID(nodeId);
+  if (!node) return;
 
-  nodeData.set('name', newName);
-  nodeData.set('mtime', Date.now());
+  node.data.set('name', newName);
+  node.data.set('mtime', Date.now());
 }
 ```
 
@@ -299,15 +317,16 @@ function renameNode(
  */
 function deleteNode(doc: LoroDoc, nodeId: TreeID): void {
   const files = doc.getTree('files');
-  const nodeData = files.getMeta(nodeId);
+  const node = files.getNodeByID(nodeId);
+  if (!node) return;
 
-  nodeData.set('deleted', true);
-  nodeData.set('mtime', Date.now());
+  node.data.set('deleted', true);
+  node.data.set('mtime', Date.now());
 
   // Recursively mark children as deleted
-  const childIds = files.children(nodeId);
-  for (const childId of childIds) {
-    deleteNode(doc, childId);
+  const children = node.children() ?? [];
+  for (const child of children) {
+    deleteNode(doc, child.id);
   }
 }
 ```
@@ -328,7 +347,10 @@ function updateFileContent(
   newContent: string
 ): void {
   const files = doc.getTree('files');
-  const nodeData = files.getMeta(nodeId);
+  const node = files.getNodeByID(nodeId);
+  if (!node) return;
+
+  const nodeData = node.data;
   const content = nodeData.get('content') as LoroText;
 
   // Parse new content
@@ -379,11 +401,10 @@ function getNodePath(doc: LoroDoc, nodeId: TreeID): string {
   const files = doc.getTree('files');
   const parts: string[] = [];
 
-  let currentId: TreeID | null = nodeId;
-  while (currentId !== null) {
-    const nodeData = files.getMeta(currentId);
-    parts.unshift(nodeData.get('name') as string);
-    currentId = files.parent(currentId);
+  let currentNode = files.getNodeByID(nodeId);
+  while (currentNode) {
+    parts.unshift(currentNode.data.get('name') as string);
+    currentNode = currentNode.parent() ?? undefined;
   }
 
   return parts.join('/');
@@ -396,20 +417,22 @@ function findNodeByPath(doc: LoroDoc, path: string): TreeID | null {
   const files = doc.getTree('files');
   const parts = path.split('/').filter(p => p.length > 0);
 
-  let currentId: TreeID | null = null; // null = root
+  let currentNode: LoroTreeNode | undefined = undefined; // undefined = root level
   for (const part of parts) {
-    // Use roots() for root level, children() for nested
-    const childIds = currentId === null ? files.roots() : files.children(currentId);
-    const found = childIds.find(childId => {
-      const childData = files.getMeta(childId);
-      return childData.get('name') === part && !childData.get('deleted');
+    // Get children: use getNodes() for root level, children() for nested
+    const children = currentNode
+      ? (currentNode.children() ?? [])
+      : files.getNodes().filter(n => !n.parent());
+
+    const found = children.find(child => {
+      return child.data.get('name') === part && !child.data.get('deleted');
     });
 
     if (!found) return null;
-    currentId = found;
+    currentNode = found;
   }
 
-  return currentId;
+  return currentNode?.id ?? null;
 }
 
 /**
@@ -419,20 +442,22 @@ function listAllFiles(doc: LoroDoc): Array<{ nodeId: TreeID; path: string }> {
   const files = doc.getTree('files');
   const result: Array<{ nodeId: TreeID; path: string }> = [];
 
-  function traverse(parentId: TreeID | null, pathPrefix: string) {
-    // Use roots() for root level, children() for nested
-    const childIds = parentId === null ? files.roots() : files.children(parentId);
-    for (const childId of childIds) {
-      const nodeData = files.getMeta(childId);
-      if (nodeData.get('deleted')) continue;
+  function traverse(parentNode: LoroTreeNode | null, pathPrefix: string) {
+    // Get children: use getNodes() for root level, children() for nested
+    const children = parentNode
+      ? (parentNode.children() ?? [])
+      : files.getNodes().filter(n => !n.parent());
 
-      const name = nodeData.get('name') as string;
+    for (const child of children) {
+      if (child.data.get('deleted')) continue;
+
+      const name = child.data.get('name') as string;
       const fullPath = pathPrefix ? `${pathPrefix}/${name}` : name;
 
-      if (nodeData.get('type') === 'file') {
-        result.push({ nodeId: childId, path: fullPath });
+      if (child.data.get('type') === 'file') {
+        result.push({ nodeId: child.id, path: fullPath });
       } else {
-        traverse(childId, fullPath);
+        traverse(child, fullPath);
       }
     }
   }
@@ -862,9 +887,24 @@ function makeLink(content: LoroText, start: number, end: number, url: string): v
 
 /**
  * Get formatting at a position.
+ * Note: Loro doesn't have a direct getFormatAt method; use toDelta() and parse.
  */
 function getFormattingAt(content: LoroText, position: number): Record<string, unknown> {
-  return content.getFormatAt(position);
+  const delta = content.toDelta();
+  let currentPos = 0;
+
+  for (const op of delta) {
+    if (typeof op.insert === 'string') {
+      const len = op.insert.length;
+      if (currentPos + len > position) {
+        // Found the position, return attributes
+        return op.attributes ?? {};
+      }
+      currentPos += len;
+    }
+  }
+
+  return {};
 }
 
 /**
@@ -997,22 +1037,23 @@ class TombstoneCleanup {
       }
     }
 
-    // Find old tombstones
-    function traverse(parentId: TreeID | null) {
-      const childIds = parentId === null ? files.roots() : files.children(parentId);
-      for (const childId of childIds) {
-        const nodeData = files.getMeta(childId);
+    // Find old tombstones - traverse all nodes
+    function traverse(parentNode: LoroTreeNode | null) {
+      const children = parentNode
+        ? (parentNode.children() ?? [])
+        : files.getNodes().filter(n => !n.parent());
 
-        if (nodeData.get('deleted')) {
-          const deletedAt = nodeData.get('deletedAt') as number;
+      for (const child of children) {
+        if (child.data.get('deleted')) {
+          const deletedAt = child.data.get('deletedAt') as number;
           const age = now - deletedAt;
 
           if (age >= minAge) {
-            eligible.push(childId);
+            eligible.push(child.id);
           }
         }
 
-        traverse(childId);
+        traverse(child);
       }
     }
 
@@ -1028,13 +1069,13 @@ class TombstoneCleanup {
     const files = this.doc.getTree('files');
     let cleaned = 0;
 
-    this.doc.transact(() => {
-      for (const nodeId of nodeIds) {
-        // Use Loro's delete method to permanently remove
-        files.delete(nodeId);
-        cleaned++;
-      }
-    });
+    // Loro auto-batches operations; use commit() for explicit transaction boundary
+    for (const nodeId of nodeIds) {
+      // Use Loro's delete method to permanently remove
+      files.delete(nodeId);
+      cleaned++;
+    }
+    this.doc.commit(); // Commit all deletions as a single transaction
 
     return cleaned;
   }
@@ -1730,12 +1771,11 @@ class UndoRedoHandler {
 
     if (file) {
       // Apply as new Loro operation (not trying to reverse Loro history)
-      this.doc.transact(() => {
-        const nodeId = findNodeByPath(this.doc, file.path);
-        if (nodeId) {
-          updateFileContent(this.doc, nodeId, content);
-        }
-      });
+      const nodeId = findNodeByPath(this.doc, file.path);
+      if (nodeId) {
+        updateFileContent(this.doc, nodeId, content);
+      }
+      this.doc.commit();
     }
   }
 }
@@ -2279,8 +2319,8 @@ class LoroDoc {
   /** Import updates or snapshot from another document */
   import(data: Uint8Array): void;
 
-  /** Run operations in a transaction */
-  transact(fn: () => void): void;
+  /** Commit pending changes */
+  commit(options?: { origin?: string; timestamp?: number; message?: string }): void;
 }
 
 interface ExportOptions {

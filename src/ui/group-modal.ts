@@ -8,6 +8,7 @@ import { App, Modal, Notice, Setting, TFolder } from "obsidian";
 import type PeerVaultPlugin from "../main";
 import type { PeerGroup, GroupSyncPolicy } from "../peer/groups";
 import { DEFAULT_SYNC_POLICY } from "../peer/groups";
+import { STATUS_ICONS } from "./status-icons";
 
 /** Color presets for groups */
 const COLOR_PRESETS = [
@@ -371,14 +372,24 @@ export class GroupModal extends Modal {
         color: this.color,
         syncPolicy: this.syncPolicy,
       });
-      group = groupManager.getGroup(this.existingGroup.id)!;
+      const updatedGroup = groupManager.getGroup(this.existingGroup.id);
+      if (!updatedGroup) {
+        new Notice("Failed to update group");
+        return;
+      }
+      group = updatedGroup;
       new Notice(`Group "${this.name}" updated`);
     } else {
       // Create new
       group = groupManager.createGroup(this.name.trim(), this.icon, this.color);
       // Update sync policy (createGroup uses defaults)
       groupManager.updateGroup(group.id, { syncPolicy: this.syncPolicy });
-      group = groupManager.getGroup(group.id)!;
+      const createdGroup = groupManager.getGroup(group.id);
+      if (!createdGroup) {
+        new Notice("Failed to create group");
+        return;
+      }
+      group = createdGroup;
       new Notice(`Group "${this.name}" created`);
     }
 
@@ -499,7 +510,10 @@ export class GroupPeersModal extends Modal {
     if (!groupManager) return;
 
     groupManager.addPeerToGroup(this.group.id, peerId);
-    this.group = groupManager.getGroup(this.group.id)!;
+    const updatedGroup = groupManager.getGroup(this.group.id);
+    if (updatedGroup) {
+      this.group = updatedGroup;
+    }
     this.refresh();
     new Notice("Device added to group");
   }
@@ -509,7 +523,10 @@ export class GroupPeersModal extends Modal {
     if (!groupManager) return;
 
     groupManager.removePeerFromGroup(this.group.id, peerId);
-    this.group = groupManager.getGroup(this.group.id)!;
+    const updatedGroup = groupManager.getGroup(this.group.id);
+    if (updatedGroup) {
+      this.group = updatedGroup;
+    }
     this.refresh();
     new Notice("Device removed from group");
   }
@@ -521,15 +538,18 @@ export class GroupPeersModal extends Modal {
 
   private getStateIcon(state: string): string {
     switch (state) {
+      case "connected":
       case "synced":
+        return STATUS_ICONS.connected;
       case "syncing":
-        return "🟢";
       case "connecting":
-        return "🟡";
+        return STATUS_ICONS.syncing;
       case "error":
-        return "🔴";
+        return STATUS_ICONS.error;
+      case "disconnected":
+        return STATUS_ICONS.offline;
       default:
-        return "⚪";
+        return STATUS_ICONS.idle;
     }
   }
 }

@@ -1459,7 +1459,7 @@ describe('Filesystem behavior verification', () => {
 
     try {
       await writeFile(path, 'test');
-      fail('Should have thrown for path too long');
+      expect().fail('Should have thrown for path too long');
     } catch (error) {
       expect(error.code).toMatch(/ENAMETOOLONG|EINVAL/);
     }
@@ -1472,7 +1472,7 @@ describe('Filesystem behavior verification', () => {
 ```json
 {
   "devDependencies": {
-    "vitest": "^1.0.0",
+    "bun-types": "latest",
     "fast-check": "^3.0.0",
     "@playwright/test": "^1.40.0",
     "loro-crdt": "^1.0.0"
@@ -1480,7 +1480,7 @@ describe('Filesystem behavior verification', () => {
 }
 ```
 
-- Vitest (unit/integration tests)
+- Bun test (unit/integration tests, Jest-compatible)
 - fast-check (property-based testing)
 - Playwright (E2E tests)
 - Test doubles for Obsidian APIs

@@ -344,14 +344,20 @@ export class SelectiveSyncModal extends Modal {
   }
 
   private refresh(): void {
-    this.close();
-    new SelectiveSyncModal(this.app, this.plugin).open();
-    // Restore expanded state
-    const modal = this.app.workspace.containerEl.querySelector(
-      ".peervault-selective-sync-modal",
-    );
-    if (modal) {
-      // The new modal will have the same expanded state since we share the class property
-    }
+    // Re-render in place to preserve expandedFolders state
+    const { contentEl } = this;
+    contentEl.empty();
+
+    contentEl.createEl("h2", { text: "Selective Sync" });
+
+    contentEl.createEl("p", {
+      text: "Choose which folders to sync. Excluded folders will not be synced to other devices.",
+      cls: "peervault-help-text",
+    });
+
+    this.renderQuickActions(contentEl);
+    this.renderFolderTree(contentEl);
+    this.renderSummary(contentEl);
+    this.renderActions(contentEl);
   }
 }

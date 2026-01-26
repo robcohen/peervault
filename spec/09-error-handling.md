@@ -454,8 +454,9 @@ function notifyUser(error: PeerVaultError): void {
 interface LogEntry {
   timestamp: string;
   level: 'debug' | 'info' | 'warn' | 'error';
+  category: 'sync' | 'network' | 'crdt' | 'storage' | 'ui';
   message: string;
-  context?: Record<string, unknown>;
+  data?: Record<string, unknown>;
   error?: {
     code: string;
     category: string;
@@ -696,12 +697,12 @@ class DiagnosticLogger {
 
   /**
    * Export logs for support.
+   * Note: Plugin version from manifest, Obsidian version not exposed in public API.
    */
-  exportLogs(): string {
+  exportLogs(manifest: PluginManifest): string {
     return JSON.stringify({
       exportedAt: new Date().toISOString(),
-      pluginVersion: this.pluginVersion,
-      obsidianVersion: this.obsidianVersion,
+      pluginVersion: manifest.version,
       platform: Platform.isMobile ? 'mobile' : 'desktop',
       logs: this.logs,
     }, null, 2);
@@ -710,7 +711,7 @@ class DiagnosticLogger {
   /**
    * Export anonymized logs (removes file paths, peer IDs).
    */
-  exportAnonymizedLogs(): string {
+  exportAnonymizedLogs(manifest: PluginManifest): string {
     const anonymized = this.logs.map(entry => ({
       ...entry,
       message: this.anonymize(entry.message),
@@ -719,7 +720,7 @@ class DiagnosticLogger {
 
     return JSON.stringify({
       exportedAt: new Date().toISOString(),
-      pluginVersion: this.pluginVersion,
+      pluginVersion: manifest.version,
       platform: Platform.isMobile ? 'mobile' : 'desktop',
       logs: anonymized,
     }, null, 2);
@@ -865,7 +866,6 @@ class DebugPanelModal extends Modal {
 
     const rows = [
       ['Plugin Version', this.plugin.manifest.version],
-      ['Obsidian Version', this.app.vault.version],
       ['Platform', Platform.isMobile ? 'Mobile' : 'Desktop'],
       ['Connected Peers', stats.connectedPeers.toString()],
       ['Total Peers', stats.totalPeers.toString()],
@@ -968,7 +968,6 @@ class DebugPanelModal extends Modal {
 PeerVault Support Info
 ======================
 Plugin Version: ${this.plugin.manifest.version}
-Obsidian Version: ${this.app.vault.version}
 Platform: ${Platform.isMobile ? 'Mobile' : 'Desktop'}
 OS: ${Platform.isIosApp ? 'iOS' : Platform.isAndroidApp ? 'Android' : navigator.platform}
 Connected Peers: ${stats.connectedPeers}

@@ -348,18 +348,19 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     const nodeId = connection.peerId;
     this.logger.info("Incoming connection from:", nodeId);
 
-    // Get or create peer info
-    let peer = this.peers.get(nodeId);
+    // Get peer info - reject unknown peers per spec/06-peer-management.md
+    const peer = this.peers.get(nodeId);
     if (!peer) {
-      peer = {
-        nodeId,
-        state: "connecting",
-        firstSeen: Date.now(),
-        lastSeen: Date.now(),
-        trusted: false, // Incoming peers need explicit trust
-      };
-      this.peers.set(nodeId, peer);
-      this.emit("peer:connected", peer);
+      this.logger.warn("Rejected unknown peer:", nodeId);
+      await connection.close();
+      return;
+    }
+
+    // Verify peer is trusted before accepting sync
+    if (!peer.trusted) {
+      this.logger.warn("Rejected untrusted peer:", nodeId);
+      await connection.close();
+      return;
     }
 
     peer.lastSeen = Date.now();

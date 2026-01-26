@@ -14,6 +14,8 @@ import { PairingModal } from "./pairing-modal";
 import { ConflictModal } from "./conflict-modal";
 import { FileHistoryModal } from "./file-history-modal";
 import { GroupModal, GroupPeersModal } from "./group-modal";
+import { showConfirm } from "./confirm-modal";
+import { STATUS_ICONS } from "./status-icons";
 import { DEFAULT_GROUP_ID } from "../peer/groups";
 
 export class PeerVaultSettingsTab extends PluginSettingTab {
@@ -77,7 +79,12 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
       )
       .addButton((btn) =>
         btn.setButtonText("Sync Now").onClick(async () => {
-          await this.plugin.sync();
+          try {
+            await this.plugin.sync();
+            new Notice("Sync completed");
+          } catch (error) {
+            new Notice(`Sync failed: ${error}`);
+          }
         }),
       );
   }
@@ -129,15 +136,15 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
       .setName("Vault ID")
       .setDesc("Shared identifier for this vault")
       .addText((text) => {
-        const vaultId = this.plugin.documentManager.getVaultId();
-        text.setValue(vaultId.substring(0, 8) + "...");
+        const vaultId = this.plugin.documentManager?.getVaultId() ?? "Not initialized";
+        text.setValue(vaultId.length > 8 ? vaultId.substring(0, 8) + "..." : vaultId);
         text.setDisabled(true);
         text.inputEl.style.fontFamily = "var(--font-monospace)";
         text.inputEl.style.fontSize = "12px";
       });
 
     // Files tracked
-    const fileCount = this.plugin.documentManager.listAllPaths().length;
+    const fileCount = this.plugin.documentManager?.listAllPaths().length ?? 0;
     new Setting(container)
       .setName("Files tracked")
       .setDesc(`${fileCount} file(s) in sync`);
@@ -192,9 +199,12 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
               .setIcon("trash")
               .setTooltip("Remove device")
               .onClick(async () => {
-                const confirmed = confirm(
-                  `Remove "${peer.name || "this device"}" from sync?`,
-                );
+                const confirmed = await showConfirm(this.app, {
+                  title: "Remove Device",
+                  message: `Remove "${peer.name || "this device"}" from sync?`,
+                  confirmText: "Remove",
+                  isDestructive: true,
+                });
                 if (confirmed) {
                   await this.plugin.peerManager.removePeer(peer.nodeId);
                   new Notice("Device removed");
@@ -272,9 +282,12 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
             .setIcon("trash")
             .setTooltip("Delete group")
             .onClick(async () => {
-              const confirmed = confirm(
-                `Delete group "${group.name}"?\n\nDevices will remain but won't be in this group.`,
-              );
+              const confirmed = await showConfirm(this.app, {
+                title: "Delete Group",
+                message: `Delete group "${group.name}"?\n\nDevices will remain but won't be in this group.`,
+                confirmText: "Delete",
+                isDestructive: true,
+              });
               if (confirmed) {
                 try {
                   groupManager.deleteGroup(group.id);
@@ -573,14 +586,18 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
           .setButtonText("Reset")
           .setWarning()
           .onClick(async () => {
-            const confirmed = confirm(
-              "Are you sure you want to reset all PeerVault data?\n\n" +
+            const confirmed = await showConfirm(this.app, {
+              title: "Reset PeerVault",
+              message:
+                "Are you sure you want to reset all PeerVault data?\n\n" +
                 "This will:\n" +
-                "• Remove all paired devices\n" +
-                "• Delete sync history\n" +
-                "• Clear encryption keys\n\n" +
+                "- Remove all paired devices\n" +
+                "- Delete sync history\n" +
+                "- Clear encryption keys\n\n" +
                 "Your vault files will NOT be deleted.",
-            );
+              confirmText: "Reset",
+              isDestructive: true,
+            });
             if (confirmed) {
               await this.resetPlugin();
             }
@@ -600,9 +617,11 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
       this.plugin.settings.keySalt = undefined;
 
       // Remove all peers
-      const peers = this.plugin.peerManager.getPeers();
-      for (const peer of peers) {
-        await this.plugin.peerManager.removePeer(peer.nodeId);
+      if (this.plugin.peerManager) {
+        const peers = this.plugin.peerManager.getPeers();
+        for (const peer of peers) {
+          await this.plugin.peerManager.removePeer(peer.nodeId);
+        }
       }
 
       // Save settings
@@ -623,14 +642,17 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
   private getStateIcon(state: string): string {
     switch (state) {
       case "connected":
+        return STATUS_ICONS.connected;
       case "syncing":
-        return "🟢";
+        return STATUS_ICONS.syncing;
       case "connecting":
-        return "🟡";
+        return STATUS_ICONS.syncing;
       case "error":
-        return "🔴";
+        return STATUS_ICONS.error;
+      case "disconnected":
+        return STATUS_ICONS.offline;
       default:
-        return "⚪";
+        return STATUS_ICONS.idle;
     }
   }
 }

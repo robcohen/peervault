@@ -82,6 +82,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     encryption?: EncryptionService;
   };
   private aborted = false;
+  private unsubscribeLocalUpdates: (() => void) | null = null;
 
   constructor(
     private peerId: string,
@@ -141,6 +142,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       // Step 4: Enter live mode
       this.setState("live");
       this.startPingTimer();
+      this.subscribeToLocalUpdates();
       this.startLiveLoop();
 
       this.emit("sync:complete", undefined);
@@ -207,6 +209,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       // Step 4: Enter live mode
       this.setState("live");
       this.startPingTimer();
+      this.subscribeToLocalUpdates();
       this.startLiveLoop();
 
       this.emit("sync:complete", undefined);
@@ -239,6 +242,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
   async close(): Promise<void> {
     this.aborted = true;
     this.stopPingTimer();
+    this.stopLocalUpdateSubscription();
 
     if (this.stream) {
       try {
@@ -655,6 +659,34 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     }
   }
 
+  /**
+   * Subscribe to local document updates and push them to the peer.
+   */
+  private subscribeToLocalUpdates(): void {
+    // Unsubscribe from any existing subscription
+    if (this.unsubscribeLocalUpdates) {
+      this.unsubscribeLocalUpdates();
+    }
+
+    // Subscribe to local updates and send them to peer
+    this.unsubscribeLocalUpdates = this.documentManager.subscribeLocalUpdates(
+      (updates: Uint8Array) => {
+        if (this.state === "live" && this.stream && !this.aborted) {
+          this.sendUpdate(updates).catch((err) => {
+            this.logger.error("Failed to push local update:", err);
+          });
+        }
+      },
+    );
+  }
+
+  private stopLocalUpdateSubscription(): void {
+    if (this.unsubscribeLocalUpdates) {
+      this.unsubscribeLocalUpdates();
+      this.unsubscribeLocalUpdates = null;
+    }
+  }
+
   // ===========================================================================
   // Private: Message I/O
   // ===========================================================================
@@ -668,7 +700,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
 
     // Encrypt if encryption is enabled
     if (this.config.encryption?.isEnabled()) {
-      bytes = this.config.encryption.encrypt(bytes);
+      bytes = await this.config.encryption.encrypt(bytes);
     }
 
     await this.stream.send(bytes);
@@ -683,7 +715,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
 
     // Decrypt if encryption is enabled
     if (this.config.encryption?.isEnabled()) {
-      bytes = this.config.encryption.decrypt(bytes);
+      bytes = await this.config.encryption.decrypt(bytes);
     }
 
     return deserializeMessage(bytes);

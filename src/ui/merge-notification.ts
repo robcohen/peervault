@@ -7,6 +7,7 @@
  */
 
 import { App, Modal, Notice } from "obsidian";
+import { STATUS_ICONS } from "./status-icons";
 
 /** Information about a merge event */
 export interface MergeInfo {
@@ -33,7 +34,11 @@ const MAX_RECENT_MERGES = 20;
 /**
  * Record a merge event and optionally show a notification.
  */
-export function recordMerge(info: MergeInfo, showNotice = true): void {
+export function recordMerge(
+  info: MergeInfo,
+  app?: App,
+  showNotice = true,
+): void {
   recentMerges.unshift(info);
 
   // Trim old entries
@@ -42,7 +47,7 @@ export function recordMerge(info: MergeInfo, showNotice = true): void {
   }
 
   if (showNotice && info.changedFiles.length > 0) {
-    showMergeNotice(info);
+    showMergeNotice(info, app);
   }
 }
 
@@ -63,7 +68,7 @@ export function clearMergeHistory(): void {
 /**
  * Show a notice about merged changes.
  */
-function showMergeNotice(info: MergeInfo): void {
+function showMergeNotice(info: MergeInfo, app?: App): void {
   const totalChanges =
     info.filesCreated + info.filesUpdated + info.filesDeleted;
 
@@ -78,8 +83,14 @@ function showMergeNotice(info: MergeInfo): void {
 
   // Create clickable notice
   const notice = new Notice(message, 8000);
-  notice.noticeEl.style.cursor = "pointer";
-  notice.noticeEl.title = "Click to see details";
+  if (app) {
+    notice.noticeEl.style.cursor = "pointer";
+    notice.noticeEl.title = "Click to see details";
+    notice.noticeEl.onclick = () => {
+      notice.hide();
+      new MergeDetailModal(app, info).open();
+    };
+  }
 }
 
 /**
@@ -144,10 +155,14 @@ export class MergeDetailModal extends Modal {
         li.createEl("a", {
           text: path,
           cls: "merge-file-link",
-        }).onclick = (e) => {
+        }).onclick = async (e) => {
           e.preventDefault();
-          this.app.workspace.openLinkText(path, "");
-          this.close();
+          try {
+            await this.app.workspace.openLinkText(path, "");
+            this.close();
+          } catch (error) {
+            new Notice(`Could not open file: ${error}`);
+          }
         };
       }
 

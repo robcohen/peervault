@@ -4,8 +4,10 @@
  * Browse and restore previous versions of files using Loro's time-travel.
  */
 
-import { App, Modal, Notice, Setting, TFile } from "obsidian";
+import { App, Modal, Notice, Setting } from "obsidian";
 import type PeerVaultPlugin from "../main";
+import type { HistoricalVersion } from "../core/document-manager";
+import type { OpId } from "loro-crdt";
 
 /** A version entry for a file */
 export interface FileVersion {
@@ -23,6 +25,8 @@ export interface FileVersion {
   preview?: string;
   /** Content length */
   contentLength?: number;
+  /** Frontiers for checkout (if available) */
+  frontiers?: OpId[];
 }
 
 /**
@@ -70,7 +74,8 @@ export class FileHistoryModal extends Modal {
         this.renderVersionList(contentEl);
       }
     } catch (error) {
-      loading.setText(`Error loading history: ${error}`);
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      loading.setText(`Error loading history: ${errorMsg}`);
     }
   }
 
@@ -126,7 +131,7 @@ export class FileHistoryModal extends Modal {
       cls: "peervault-empty-state",
     });
     container.createEl("p", {
-      text: "History is recorded when files are synced between devices.",
+      text: "History is recorded when changes are made to the document.",
       cls: "peervault-help-text",
     });
   }
@@ -135,11 +140,16 @@ export class FileHistoryModal extends Modal {
     const section = container.createDiv({ cls: "peervault-version-list" });
 
     // Current version
+    const currentVersion = this.versions[0];
+    if (!currentVersion) {
+      return; // Safety check - should not happen since we check length before calling
+    }
+
     const currentSection = section.createDiv({
       cls: "peervault-version-section",
     });
     currentSection.createEl("h3", { text: "Current Version" });
-    this.renderVersionItem(currentSection, this.versions[0]!, true);
+    this.renderVersionItem(currentSection, currentVersion, true);
 
     // Previous versions
     if (this.versions.length > 1) {
@@ -149,7 +159,10 @@ export class FileHistoryModal extends Modal {
       historySection.createEl("h3", { text: "Previous Versions" });
 
       for (let i = 1; i < this.versions.length && i < 20; i++) {
-        this.renderVersionItem(historySection, this.versions[i]!, false);
+        const version = this.versions[i];
+        if (version) {
+          this.renderVersionItem(historySection, version, false);
+        }
       }
 
       if (this.versions.length > 20) {
@@ -173,7 +186,9 @@ export class FileHistoryModal extends Modal {
     // Header with timestamp and change type
     const header = item.createDiv({ cls: "peervault-version-header" });
 
-    const timeStr = new Date(version.timestamp).toLocaleString();
+    // Loro timestamps are in seconds, convert to milliseconds for Date
+    const timestampMs = version.timestamp < 1e12 ? version.timestamp * 1000 : version.timestamp;
+    const timeStr = new Date(timestampMs).toLocaleString();
     header.createSpan({ text: timeStr, cls: "peervault-version-time" });
 
     const badge = header.createSpan({
@@ -203,28 +218,90 @@ export class FileHistoryModal extends Modal {
       size.setText(`Size: ${this.formatBytes(version.contentLength)}`);
     }
 
-    // Actions
-    if (!isCurrent && version.changeType !== "deleted") {
+    // Actions for non-current versions with frontiers
+    if (!isCurrent && version.changeType !== "deleted" && version.frontiers) {
       const actions = item.createDiv({ cls: "peervault-version-actions" });
 
       const viewBtn = actions.createEl("button", { text: "View" });
       viewBtn.onclick = () => this.viewVersion(version);
 
-      const restoreBtn = actions.createEl("button", {
-        text: "Restore",
-        cls: "mod-cta",
-      });
+      const restoreBtn = actions.createEl("button", { text: "Restore" });
       restoreBtn.onclick = () => this.restoreVersion(version);
+    }
+  }
+
+  private async viewVersion(version: FileVersion): Promise<void> {
+    if (!version.frontiers || !this.plugin.documentManager) {
+      new Notice("Cannot view this version");
+      return;
+    }
+
+    try {
+      // Checkout to the historical version
+      const historicalDoc = this.plugin.documentManager.checkoutToFrontiers(version.frontiers);
+
+      // Get the content at that version
+      const content = this.plugin.documentManager.getTextContentFromDoc(historicalDoc, this.filePath);
+
+      if (content === undefined) {
+        new Notice("File not found at this version");
+        return;
+      }
+
+      // Show content in a new modal
+      new VersionViewModal(this.app, this.filePath, version, content).open();
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      new Notice(`Failed to view version: ${errorMsg}`);
+    }
+  }
+
+  private async restoreVersion(version: FileVersion): Promise<void> {
+    if (!version.frontiers || !this.plugin.documentManager) {
+      new Notice("Cannot restore this version");
+      return;
+    }
+
+    try {
+      // Checkout to the historical version
+      const historicalDoc = this.plugin.documentManager.checkoutToFrontiers(version.frontiers);
+
+      // Get the content at that version
+      const content = this.plugin.documentManager.getTextContentFromDoc(historicalDoc, this.filePath);
+
+      if (content === undefined) {
+        new Notice("File not found at this version");
+        return;
+      }
+
+      // Write the content back to the current document
+      await this.plugin.documentManager.setTextContent(this.filePath, content);
+
+      // Also update the Obsidian vault file
+      const file = this.app.vault.getAbstractFileByPath(this.filePath);
+      if (file && "path" in file) {
+        await this.app.vault.modify(file as import("obsidian").TFile, content);
+      }
+
+      new Notice(`Restored "${this.filePath}" to previous version`);
+      this.close();
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      new Notice(`Failed to restore version: ${errorMsg}`);
     }
   }
 
   private async loadFileVersions(path: string): Promise<FileVersion[]> {
     const versions: FileVersion[] = [];
-    const doc = this.plugin.documentManager.getLoro();
+    const documentManager = this.plugin.documentManager;
+
+    if (!documentManager) {
+      return versions;
+    }
 
     // Get current content
-    const currentContent = this.plugin.documentManager.getTextContent(path);
-    const meta = this.plugin.documentManager.getFileMeta(path);
+    const currentContent = documentManager.getTextContent(path);
+    const meta = documentManager.getFileMeta(path);
 
     if (meta) {
       versions.push({
@@ -236,94 +313,105 @@ export class FileHistoryModal extends Modal {
       });
     }
 
-    // Try to get history from Loro's oplog
-    // Note: Loro's time-travel API allows us to view document at any version
+    // Get version history from Loro
+    // Note: This samples historical versions to avoid performance issues
     try {
-      const oplogVersion = doc.oplogVersion();
-      const frontiers = doc.oplogFrontiers();
+      const history = documentManager.getVersionHistory();
+      const myNodeId = this.plugin.getNodeId();
 
-      // For now, create synthetic history based on what we know
-      // In a full implementation, we'd iterate through the oplog
-      // to find all changes that affected this file
+      // Only check a limited number of versions (most recent ones)
+      // to avoid performance problems with large histories
+      const MAX_VERSIONS_TO_CHECK = 50;
+      const versionsToCheck = history.slice(0, MAX_VERSIONS_TO_CHECK);
 
-      // Get peers that have contributed
-      const peers = this.plugin.getConnectedPeers();
-      for (const peer of peers) {
-        if (peer.lastSeen && peer.lastSeen < Date.now() - 1000) {
-          versions.push({
-            versionId: `peer-${peer.nodeId}`,
-            timestamp: peer.lastSeen,
-            peerId: peer.nodeId,
-            peerName: peer.name,
-            changeType: "modified",
-            preview: "(synced from peer)",
-          });
+      // Track content hashes to detect actual changes
+      const seenContentHashes = new Set<string>();
+      if (currentContent) {
+        seenContentHashes.add(this.hashContent(currentContent));
+      }
+
+      for (const histVersion of versionsToCheck) {
+        // Skip very recent versions (likely same as current)
+        if (meta && Math.abs(histVersion.timestamp * 1000 - meta.mtime) < 2000) {
+          continue;
+        }
+
+        try {
+          const historicalDoc = documentManager.checkoutToFrontiers(histVersion.frontiers);
+          const historicalContent = documentManager.getTextContentFromDoc(historicalDoc, path);
+
+          // Only include if file exists and content is different from what we've seen
+          if (historicalContent !== undefined) {
+            const contentHash = this.hashContent(historicalContent);
+
+            // Skip if we've already seen this exact content
+            if (seenContentHashes.has(contentHash)) {
+              continue;
+            }
+            seenContentHashes.add(contentHash);
+
+            const peerName = histVersion.peerId === myNodeId
+              ? "This device"
+              : this.getPeerName(histVersion.peerId);
+
+            versions.push({
+              versionId: `${histVersion.peerId}-${histVersion.lamport}`,
+              timestamp: histVersion.timestamp,
+              peerId: histVersion.peerId,
+              peerName: peerName,
+              changeType: "modified",
+              preview: historicalContent.substring(0, 100),
+              contentLength: historicalContent.length,
+              frontiers: histVersion.frontiers,
+            });
+
+            // Limit total versions shown
+            if (versions.length >= 20) {
+              break;
+            }
+          }
+        } catch {
+          // Skip versions that can't be checked out
         }
       }
     } catch (error) {
-      this.plugin.logger.debug("Could not load detailed history:", error);
+      this.plugin.logger.debug("Could not load Loro history:", error);
     }
 
-    // Sort by timestamp descending
-    versions.sort((a, b) => b.timestamp - a.timestamp);
+    // Sort by timestamp descending (newest first)
+    versions.sort((a, b) => {
+      const aTime = a.timestamp < 1e12 ? a.timestamp * 1000 : a.timestamp;
+      const bTime = b.timestamp < 1e12 ? b.timestamp * 1000 : b.timestamp;
+      return bTime - aTime;
+    });
 
     return versions;
   }
 
-  private async viewVersion(version: FileVersion): Promise<void> {
-    // For a full implementation, we'd use Loro's checkout to view old content
-    // For now, show a notice
-    new Notice(`Version from ${new Date(version.timestamp).toLocaleString()}`);
-
-    try {
-      const doc = this.plugin.documentManager.getLoro();
-
-      // In a full implementation:
-      // const historicalDoc = doc.checkout(version.frontiers);
-      // const content = getContentFromDoc(historicalDoc, this.filePath);
-
-      // For now, show current content
-      const content = this.plugin.documentManager.getTextContent(this.filePath);
-      if (content) {
-        // Create a temporary file or modal to show content
-        const modal = new VersionViewModal(
-          this.app,
-          this.filePath,
-          version,
-          content,
-        );
-        modal.open();
-      }
-    } catch (error) {
-      new Notice(`Failed to view version: ${error}`);
-    }
+  /**
+   * Create a simple hash of content for deduplication.
+   * Uses length + sample of content to quickly identify duplicates.
+   */
+  private hashContent(content: string): string {
+    const len = content.length;
+    // Sample characters at various positions for a quick fingerprint
+    const sample = [
+      content.charAt(0),
+      content.charAt(Math.floor(len / 4)),
+      content.charAt(Math.floor(len / 2)),
+      content.charAt(Math.floor(len * 3 / 4)),
+      content.charAt(len - 1),
+    ].join('');
+    return `${len}:${sample}`;
   }
 
-  private async restoreVersion(version: FileVersion): Promise<void> {
-    const confirmed = confirm(
-      `Restore "${this.filePath}" to version from ${new Date(version.timestamp).toLocaleString()}?\n\nThis will overwrite the current content.`,
-    );
-
-    if (!confirmed) return;
-
+  private getPeerName(peerId: string): string | undefined {
     try {
-      // For a full implementation, we'd use Loro's checkout
-      // For now, show that we would restore
-      new Notice(
-        `Restoring to version from ${new Date(version.timestamp).toLocaleString()}...`,
-      );
-
-      // In a full implementation:
-      // const doc = this.plugin.documentManager.getLoro();
-      // const historicalDoc = doc.checkout(version.frontiers);
-      // const content = getContentFromDoc(historicalDoc, this.filePath);
-      // await this.app.vault.modify(file, content);
-
-      new Notice(
-        "Version restored (simulated - full restore requires Loro time-travel integration)",
-      );
-    } catch (error) {
-      new Notice(`Failed to restore: ${error}`);
+      const peers = this.plugin.getConnectedPeers();
+      const peer = peers.find((p) => p.nodeId === peerId);
+      return peer?.name;
+    } catch {
+      return undefined;
     }
   }
 
@@ -335,7 +423,7 @@ export class FileHistoryModal extends Modal {
 }
 
 /**
- * Modal for viewing a specific version's content.
+ * Modal for viewing a historical version's content.
  */
 class VersionViewModal extends Modal {
   constructor(
@@ -351,25 +439,32 @@ class VersionViewModal extends Modal {
     const { contentEl } = this;
     contentEl.addClass("peervault-version-view-modal");
 
-    contentEl.createEl("h2", { text: `Version: ${this.filePath}` });
-
-    const info = contentEl.createDiv({ cls: "peervault-version-info" });
-    info.createEl("p", {
-      text: `Date: ${new Date(this.version.timestamp).toLocaleString()}`,
+    // Header
+    const timestampMs = this.version.timestamp < 1e12
+      ? this.version.timestamp * 1000
+      : this.version.timestamp;
+    contentEl.createEl("h2", {
+      text: `${this.filePath} @ ${new Date(timestampMs).toLocaleString()}`
     });
+
+    // Source info
+    const source = contentEl.createDiv({ cls: "peervault-version-source" });
     if (this.version.peerName) {
-      info.createEl("p", { text: `From: ${this.version.peerName}` });
+      source.setText(`From: ${this.version.peerName}`);
+    } else if (this.version.peerId) {
+      source.setText(`From: ${this.version.peerId.substring(0, 8)}...`);
     }
 
+    // Content
     const contentArea = contentEl.createEl("textarea", {
       cls: "peervault-version-content",
-      attr: { readonly: "true" },
+      attr: { readonly: "true", rows: "20" },
     });
     contentArea.value = this.content;
     contentArea.style.width = "100%";
-    contentArea.style.height = "400px";
     contentArea.style.fontFamily = "var(--font-monospace)";
 
+    // Actions
     new Setting(contentEl)
       .addButton((btn) =>
         btn.setButtonText("Copy").onClick(() => {

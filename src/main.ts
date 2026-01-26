@@ -17,8 +17,6 @@ import { Logger } from "./utils/logger";
 import {
   PeerVaultSettingsTab,
   PeerVaultStatusModal,
-  AddDeviceModal,
-  ShowInviteModal,
   PairingModal,
   MergeHistoryModal,
   recordMerge,
@@ -241,15 +239,18 @@ export default class PeerVaultPlugin extends Plugin {
           // Record merge event
           if (stats.created > 0 || stats.updated > 0 || stats.failed > 0) {
             const changedPaths = this.documentManager.listAllPaths();
-            recordMerge({
-              changedFiles: changedPaths.slice(0, 100), // Limit to 100 files
-              peerName,
-              peerId: nodeId,
-              timestamp: Date.now(),
-              filesCreated: stats.created,
-              filesUpdated: stats.updated,
-              filesDeleted: 0,
-            });
+            recordMerge(
+              {
+                changedFiles: changedPaths.slice(0, 100), // Limit to 100 files
+                peerName,
+                peerId: nodeId,
+                timestamp: Date.now(),
+                filesCreated: stats.created,
+                filesUpdated: stats.updated,
+                filesDeleted: 0,
+              },
+              this.app,
+            );
           }
         } catch (err) {
           this.logger.error("Failed to sync from document:", err);
@@ -311,29 +312,41 @@ export default class PeerVaultPlugin extends Plugin {
     this.logger.info("Node ID:", this.transport.getNodeId());
   }
 
-  override async onunload(): Promise<void> {
+  override onunload(): void {
     this.logger.info("Unloading PeerVault plugin...");
 
-    // Stop vault sync
+    // Stop vault sync (synchronous)
     if (this.vaultSync) {
       this.vaultSync.stop();
     }
 
-    // Shut down peer manager
-    if (this.peerManager) {
-      await this.peerManager.shutdown();
-    }
-
-    // Shut down transport
-    if (this.transport) {
-      await this.transport.shutdown();
-    }
-
-    // Save document state
-    await this.documentManager.save();
-
-    // Clean up UI
+    // Clean up UI (synchronous)
     this.connectionStatus?.destroy();
+
+    // Fire-and-forget async cleanup
+    // Obsidian's onunload() is synchronous, so we can't await
+    void (async () => {
+      try {
+        // Shut down peer manager
+        if (this.peerManager) {
+          await this.peerManager.shutdown();
+        }
+
+        // Shut down transport
+        if (this.transport) {
+          await this.transport.shutdown();
+        }
+
+        // Save document state
+        if (this.documentManager) {
+          await this.documentManager.save();
+        }
+
+        this.logger.info("PeerVault async cleanup complete");
+      } catch (err) {
+        this.logger.error("Error during async cleanup:", err);
+      }
+    })();
 
     this.logger.info("PeerVault plugin unloaded");
   }
@@ -392,7 +405,7 @@ export default class PeerVaultPlugin extends Plugin {
       id: "add-device",
       name: "Add device (paste ticket)",
       callback: () => {
-        new AddDeviceModal(this.app, this).open();
+        new PairingModal(this.app, this, "manual").open();
       },
     });
 
@@ -401,7 +414,7 @@ export default class PeerVaultPlugin extends Plugin {
       id: "show-invite",
       name: "Show my connection invite",
       callback: () => {
-        new ShowInviteModal(this.app, this).open();
+        new PairingModal(this.app, this, "show").open();
       },
     });
 

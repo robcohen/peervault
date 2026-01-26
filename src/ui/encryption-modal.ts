@@ -14,8 +14,10 @@ import {
   importKey,
   keyToRecoveryPhrase,
   recoveryPhraseToKey,
+  EncryptionService,
 } from "../crypto";
 import { encodeBase64, decodeBase64 } from "tweetnacl-util";
+import { showConfirm } from "./confirm-modal";
 
 /**
  * Modal for encryption setup and management.
@@ -24,6 +26,7 @@ export class EncryptionModal extends Modal {
   private password = "";
   private confirmPassword = "";
   private recoveryPhrase = "";
+  private isClosed = false;
 
   constructor(
     app: App,
@@ -49,6 +52,7 @@ export class EncryptionModal extends Modal {
   }
 
   override onClose(): void {
+    this.isClosed = true;
     // Clear sensitive data
     this.password = "";
     this.confirmPassword = "";
@@ -82,6 +86,7 @@ export class EncryptionModal extends Modal {
       .addText((text) => {
         text.inputEl.type = "password";
         text.inputEl.placeholder = "Enter password";
+        text.inputEl.autocomplete = "off";
         text.onChange((value) => {
           this.password = value;
         });
@@ -93,6 +98,7 @@ export class EncryptionModal extends Modal {
       .addText((text) => {
         text.inputEl.type = "password";
         text.inputEl.placeholder = "Confirm password";
+        text.inputEl.autocomplete = "off";
         text.onChange((value) => {
           this.confirmPassword = value;
         });
@@ -149,21 +155,19 @@ export class EncryptionModal extends Modal {
       const encryption = getEncryptionService();
 
       // Generate new encryption key
-      const key = encryption.generateKey();
+      const key = await encryption.generateKey();
 
       // Set the key so encryption is active
-      encryption.setKey(key);
+      await encryption.setKey(key);
 
       // Generate salt and derive password key
       const salt = generateSalt();
       const passwordKey = await deriveKeyFromPassword(this.password, salt);
 
       // Encrypt the encryption key with the password-derived key
-      const tempEncryption = new (
-        await import("../crypto")
-      ).EncryptionService();
-      tempEncryption.setKey(passwordKey);
-      const encryptedKey = tempEncryption.encrypt(key);
+      const tempEncryption = new EncryptionService();
+      await tempEncryption.setKey(passwordKey);
+      const encryptedKey = await tempEncryption.encrypt(key);
 
       // Save to settings
       this.plugin.settings.encryptionEnabled = true;
@@ -205,10 +209,12 @@ export class EncryptionModal extends Modal {
     // Start re-encryption
     this.plugin.storage
       .reencryptAll((percent, message) => {
+        if (this.isClosed) return;
         progressFill.style.width = `${percent}%`;
         statusText.setText(message);
       })
       .then((result) => {
+        if (this.isClosed) return;
         // Show recovery phrase after re-encryption completes
         const phrase = keyToRecoveryPhrase(key);
         this.showRecoveryPhrase(phrase, result);
@@ -216,6 +222,7 @@ export class EncryptionModal extends Modal {
       .catch((error) => {
         this.plugin.logger.error("Re-encryption failed:", error);
         new Notice(`Re-encryption failed: ${error}`);
+        if (this.isClosed) return;
         statusText.setText(`Error: ${error}`);
       });
   }
@@ -289,7 +296,7 @@ export class EncryptionModal extends Modal {
     try {
       const key = recoveryPhraseToKey(this.recoveryPhrase);
       const encryption = getEncryptionService();
-      encryption.setKey(key);
+      await encryption.setKey(key);
 
       // We need a password to protect the imported key
       if (this.password.length < 8) {
@@ -304,11 +311,9 @@ export class EncryptionModal extends Modal {
       const passwordKey = await deriveKeyFromPassword(this.password, salt);
 
       // Encrypt the encryption key with the password-derived key
-      const tempEncryption = new (
-        await import("../crypto")
-      ).EncryptionService();
-      tempEncryption.setKey(passwordKey);
-      const encryptedKey = tempEncryption.encrypt(key);
+      const tempEncryption = new EncryptionService();
+      await tempEncryption.setKey(passwordKey);
+      const encryptedKey = await tempEncryption.encrypt(key);
 
       // Save to settings
       this.plugin.settings.encryptionEnabled = true;
@@ -361,6 +366,7 @@ export class EncryptionModal extends Modal {
         .addText((text) => {
           text.inputEl.type = "password";
           text.inputEl.placeholder = "Enter password";
+          text.inputEl.autocomplete = "off";
           text.onChange((value) => {
             this.password = value;
           });
@@ -419,9 +425,13 @@ export class EncryptionModal extends Modal {
           .setButtonText("Disable")
           .setWarning()
           .onClick(async () => {
-            const confirmed = confirm(
-              "Are you sure you want to disable encryption? This will require re-syncing all data.",
-            );
+            const confirmed = await showConfirm(this.app, {
+              title: "Disable Encryption",
+              message:
+                "Are you sure you want to disable encryption?\n\nThis will require re-syncing all data.",
+              confirmText: "Disable",
+              isDestructive: true,
+            });
             if (confirmed) {
               await this.disableEncryption();
             }
@@ -441,23 +451,27 @@ export class EncryptionModal extends Modal {
       return;
     }
 
+    const { keySalt, encryptedKey: encryptedKeyBase64 } = this.plugin.settings;
+    if (!keySalt || !encryptedKeyBase64) {
+      new Notice("Encryption not properly configured. Please set up encryption again.");
+      return;
+    }
+
     try {
-      const salt = decodeBase64(this.plugin.settings.keySalt!);
-      const encryptedKey = decodeBase64(this.plugin.settings.encryptedKey!);
+      const salt = decodeBase64(keySalt);
+      const encryptedKey = decodeBase64(encryptedKeyBase64);
 
       // Derive password key
       const passwordKey = await deriveKeyFromPassword(this.password, salt);
 
       // Decrypt the encryption key
-      const tempEncryption = new (
-        await import("../crypto")
-      ).EncryptionService();
-      tempEncryption.setKey(passwordKey);
-      const key = tempEncryption.decrypt(encryptedKey);
+      const tempEncryption = new EncryptionService();
+      await tempEncryption.setKey(passwordKey);
+      const key = await tempEncryption.decrypt(encryptedKey);
 
       // Set the actual encryption key
       const encryption = getEncryptionService();
-      encryption.setKey(key);
+      await encryption.setKey(key);
 
       new Notice("Encryption unlocked");
       this.close();
@@ -515,6 +529,7 @@ export class EncryptionModal extends Modal {
 
     new Setting(contentEl).setName("New Password").addText((text) => {
       text.inputEl.type = "password";
+      text.inputEl.autocomplete = "new-password";
       text.setPlaceholder("Enter new password");
       text.onChange((value) => {
         newPassword = value;
@@ -523,6 +538,7 @@ export class EncryptionModal extends Modal {
 
     new Setting(contentEl).setName("Confirm New Password").addText((text) => {
       text.inputEl.type = "password";
+      text.inputEl.autocomplete = "new-password";
       text.setPlaceholder("Confirm new password");
       text.onChange((value) => {
         confirmNewPassword = value;
@@ -566,11 +582,9 @@ export class EncryptionModal extends Modal {
               );
 
               // Encrypt the encryption key with the new password-derived key
-              const tempEncryption = new (
-                await import("../crypto")
-              ).EncryptionService();
-              tempEncryption.setKey(passwordKey);
-              const encryptedKey = tempEncryption.encrypt(key);
+              const tempEncryption = new EncryptionService();
+              await tempEncryption.setKey(passwordKey);
+              const encryptedKey = await tempEncryption.encrypt(key);
 
               // Save to settings
               this.plugin.settings.encryptedKey = encodeBase64(encryptedKey);
@@ -625,11 +639,12 @@ export class EncryptionModal extends Modal {
     // Start decryption
     this.plugin.storage
       .decryptAll((percent, message) => {
+        if (this.isClosed) return;
         progressFill.style.width = `${percent}%`;
         statusText.setText(message);
       })
       .then(async (result) => {
-        // Clear encryption settings
+        // Clear encryption settings (always do this even if modal closed)
         const encryption = getEncryptionService();
         encryption.clearKey();
 
@@ -638,6 +653,11 @@ export class EncryptionModal extends Modal {
         this.plugin.settings.encryptedKey = undefined;
         this.plugin.settings.keySalt = undefined;
         await this.plugin.saveSettings();
+
+        new Notice("Encryption disabled");
+
+        // Skip UI updates if modal was closed
+        if (this.isClosed) return;
 
         // Show completion
         contentEl.empty();
@@ -664,12 +684,11 @@ export class EncryptionModal extends Modal {
               this.close();
             }),
         );
-
-        new Notice("Encryption disabled");
       })
       .catch((error) => {
         this.plugin.logger.error("Decryption failed:", error);
         new Notice(`Decryption failed: ${error}`);
+        if (this.isClosed) return;
         statusText.setText(`Error: ${error}`);
       });
   }

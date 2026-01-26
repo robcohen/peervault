@@ -158,7 +158,13 @@ export class VaultSync {
    */
   private async syncFileContent(path: string): Promise<void> {
     const file = this.app.vault.getAbstractFileByPath(path);
-    if (!file || !(file instanceof this.app.vault.adapter.constructor)) {
+    if (!file) {
+      this.logger.debug("File not found:", path);
+      return;
+    }
+
+    // Use type guard to check if it's a TFile (not a folder)
+    if (!("stat" in file)) {
       // Not a file (might be a folder)
       return;
     }
@@ -399,10 +405,15 @@ export class VaultSync {
     if (content.type === "text" && content.text !== undefined) {
       // Write text file
       const existing = this.app.vault.getAbstractFileByPath(path);
-      if (existing) {
+      if (existing && "stat" in existing) {
+        // It's a TFile, safe to modify
         await this.app.vault.modify(existing as TFile, content.text);
-      } else {
+      } else if (!existing) {
         await this.app.vault.create(path, content.text);
+      } else {
+        // It's a folder with the same name, can't write file
+        this.logger.warn("Cannot write file, folder exists at path:", path);
+        return;
       }
       this.logger.debug("Wrote text file from document:", path);
     } else if (content.type === "binary" && content.blobHash) {
@@ -422,10 +433,15 @@ export class VaultSync {
       new Uint8Array(arrayBuffer).set(blobData);
 
       const existing = this.app.vault.getAbstractFileByPath(path);
-      if (existing) {
+      if (existing && "stat" in existing) {
+        // It's a TFile, safe to modify
         await this.app.vault.modifyBinary(existing as TFile, arrayBuffer);
-      } else {
+      } else if (!existing) {
         await this.app.vault.createBinary(path, arrayBuffer);
+      } else {
+        // It's a folder with the same name, can't write file
+        this.logger.warn("Cannot write binary, folder exists at path:", path);
+        return;
       }
       this.logger.debug("Wrote binary file from document:", path);
     }

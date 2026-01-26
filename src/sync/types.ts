@@ -4,26 +4,38 @@
  * Message types and interfaces for the sync protocol.
  */
 
-/** Sync message types */
+/**
+ * Sync message types - codes match spec/04-sync-protocol.md
+ */
 export enum SyncMessageType {
   /** Initial version exchange */
   VERSION_INFO = 0x01,
 
-  /** Request updates from peer since a version */
-  REQUEST_UPDATES = 0x02,
-
   /** Updates payload (Loro export) */
-  UPDATES = 0x03,
+  UPDATES = 0x02,
+
+  /** Request a full document snapshot (for new peers) */
+  SNAPSHOT_REQUEST = 0x03,
+
+  /** Full document snapshot */
+  SNAPSHOT = 0x04,
+
+  /** Chunk of a large snapshot */
+  SNAPSHOT_CHUNK = 0x05,
 
   /** Sync complete acknowledgment */
-  SYNC_COMPLETE = 0x04,
+  SYNC_COMPLETE = 0x06,
+
+  /** Error message */
+  ERROR = 0x07,
 
   /** Keep-alive ping */
-  PING = 0x05,
+  PING = 0x08,
 
   /** Keep-alive pong */
-  PONG = 0x06,
+  PONG = 0x09,
 
+  // Blob sync messages (0x10 range, extension to spec)
   /** List of blob hashes we have */
   BLOB_HASHES = 0x10,
 
@@ -35,9 +47,6 @@ export enum SyncMessageType {
 
   /** Blob sync complete */
   BLOB_SYNC_COMPLETE = 0x13,
-
-  /** Error message */
-  ERROR = 0xff,
 }
 
 /** Base sync message structure */
@@ -55,11 +64,29 @@ export interface VersionInfoMessage extends SyncMessage {
   vaultId: string;
 }
 
-/** Request updates message */
-export interface RequestUpdatesMessage extends SyncMessage {
-  type: SyncMessageType.REQUEST_UPDATES;
-  /** Version to request updates since */
-  sinceVersionBytes: Uint8Array;
+/** Snapshot request message - for new peers requesting full document */
+export interface SnapshotRequestMessage extends SyncMessage {
+  type: SyncMessageType.SNAPSHOT_REQUEST;
+}
+
+/** Full document snapshot message */
+export interface SnapshotMessage extends SyncMessage {
+  type: SyncMessageType.SNAPSHOT;
+  /** Full Loro document snapshot */
+  snapshot: Uint8Array;
+  /** Size of full snapshot for progress tracking */
+  totalSize: number;
+}
+
+/** Chunk of a large snapshot */
+export interface SnapshotChunkMessage extends SyncMessage {
+  type: SyncMessageType.SNAPSHOT_CHUNK;
+  /** Chunk sequence number (0-indexed) */
+  chunkIndex: number;
+  /** Total number of chunks */
+  totalChunks: number;
+  /** Chunk data */
+  data: Uint8Array;
 }
 
 /** Updates message - contains Loro export data */
@@ -141,7 +168,9 @@ export enum SyncErrorCode {
 /** Union type of all sync messages */
 export type AnySyncMessage =
   | VersionInfoMessage
-  | RequestUpdatesMessage
+  | SnapshotRequestMessage
+  | SnapshotMessage
+  | SnapshotChunkMessage
   | UpdatesMessage
   | SyncCompleteMessage
   | PingMessage

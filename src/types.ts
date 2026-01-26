@@ -25,20 +25,31 @@ export interface PeerVaultDoc {
 }
 
 /**
- * File node metadata stored in the Loro tree.
+ * Node type in the file tree.
+ * - 'file': Text file with content stored in node.data.content (LoroText)
+ * - 'folder': Directory node
+ * - 'binary': Binary file with content hash stored in node.data.blobHash
+ */
+export type FileNodeType = "file" | "folder" | "binary";
+
+/**
+ * File node metadata stored in the Loro tree node.data (LoroMap).
+ * Per Loro best practices, all data including content is stored in node.data.
  */
 export interface FileNodeMeta {
   /** File name (not path) */
   name: string;
-  /** MIME type or 'folder' */
-  type: string;
+  /** Node type: 'file' | 'folder' | 'binary' */
+  type: FileNodeType;
+  /** MIME type (e.g., 'text/markdown', 'image/png') */
+  mimeType?: string;
   /** Last modification time (Unix ms) */
   mtime: number;
   /** Creation time (Unix ms) */
   ctime: number;
-  /** Soft delete flag */
-  deleted?: boolean;
-  /** For binary files: content hash */
+  /** Soft delete flag (always initialized, not optional) */
+  deleted: boolean;
+  /** For binary files: content hash (SHA-256 hex) */
   blobHash?: string;
 }
 

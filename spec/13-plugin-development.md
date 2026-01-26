@@ -328,17 +328,20 @@ export default class PeerVaultPlugin extends Plugin {
     });
   }
 
-  async onunload(): Promise<void> {
+  onunload(): void {
     console.log('Unloading PeerVault plugin');
 
-    // Flush pending syncs
-    await this.syncEngine?.flush();
+    // Note: onunload() is synchronous per Obsidian API.
+    // For async cleanup, fire-and-forget or use synchronous methods.
 
-    // Disconnect from peers
-    await this.peerManager?.disconnectAll();
+    // Flush pending syncs (fire-and-forget)
+    this.syncEngine?.flush().catch(console.error);
 
-    // Shut down transport
-    await this.transport?.shutdown();
+    // Disconnect from peers (fire-and-forget)
+    this.peerManager?.disconnectAll().catch(console.error);
+
+    // Shut down transport (fire-and-forget)
+    this.transport?.shutdown().catch(console.error);
 
     // Note: registerEvent() handlers are automatically cleaned up
   }

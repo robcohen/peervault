@@ -879,9 +879,17 @@ class LongSyncCancellationUI {
         this.modal = null;
       });
 
-    this.modal.onClose = () => {
+    // Store cleanup function to call when modal closes
+    const cleanup = () => {
       window.clearInterval(updateInterval);
       this.modal = null;
+    };
+
+    // Override close to include cleanup
+    const originalClose = this.modal.close.bind(this.modal);
+    this.modal.close = () => {
+      cleanup();
+      originalClose();
     };
 
     this.modal.open();
@@ -1315,17 +1323,17 @@ class JoinDeviceModal extends Modal {
 Show version history for a file using Loro's time travel capabilities.
 
 ```typescript
-import { LoroDoc, Frontiers } from 'loro-crdt';
+import { LoroDoc, type OpId, type Change } from 'loro-crdt';
 
 interface VersionEntry {
-  /** Version frontiers (Loro's version identifier) */
-  frontiers: Frontiers;
-  /** Timestamp of the change */
+  /** Version frontiers (OpId array for checkout) */
+  frontiers: OpId[];
+  /** Timestamp of the change (Unix seconds) */
   timestamp: number;
   /** Peer ID that made the change */
   peerId: string;
-  /** Human-readable description */
-  description: string;
+  /** Lamport timestamp for causal ordering */
+  lamport: number;
 }
 
 class HistoryView extends ItemView {
@@ -1394,22 +1402,32 @@ class HistoryView extends ItemView {
     const versions: VersionEntry[] = [];
 
     // Get change history from Loro
-    // Note: Loro's API for history traversal
+    // getAllChanges() returns Map<PeerID, Change[]>
     const changes = doc.getAllChanges();
 
-    for (const [peerId, peerChanges] of Object.entries(changes)) {
+    // Iterate over the Map entries
+    for (const [peerId, peerChanges] of changes.entries()) {
       for (const change of peerChanges) {
+        // Construct frontiers from change position
+        // Frontiers point to the end of this change (counter + length - 1)
+        const frontiers: OpId[] = [
+          { peer: change.peer, counter: change.counter + change.length - 1 }
+        ];
+
         versions.push({
-          frontiers: change.frontiers,
+          frontiers,
           timestamp: change.timestamp,
           peerId,
-          description: this.describeChange(change),
+          lamport: change.lamport,
         });
       }
     }
 
-    // Sort by timestamp descending (newest first)
-    versions.sort((a, b) => b.timestamp - a.timestamp);
+    // Sort by lamport (causal order), then timestamp
+    versions.sort((a, b) => {
+      if (a.lamport !== b.lamport) return b.lamport - a.lamport;
+      return b.timestamp - a.timestamp;
+    });
 
     return versions;
   }
@@ -1417,8 +1435,12 @@ class HistoryView extends ItemView {
   private async previewVersion(version: VersionEntry): Promise<void> {
     const doc = this.plugin.syncEngine.getDoc();
 
-    // Loro supports time travel via checkout
-    const historicalDoc = doc.checkout(version.frontiers);
+    // Clone the document and checkout to historical version
+    // Note: checkout() returns void and makes doc "detached", so we clone first
+    const snapshot = doc.export({ mode: "snapshot" });
+    const historicalDoc = new LoroDoc();
+    historicalDoc.import(snapshot);
+    historicalDoc.checkout(version.frontiers);
 
     // Get file content at that version
     const content = this.getFileContentAtVersion(historicalDoc, this.filePath!);
@@ -1430,8 +1452,11 @@ class HistoryView extends ItemView {
   private async restoreVersion(version: VersionEntry): Promise<void> {
     const doc = this.plugin.syncEngine.getDoc();
 
-    // Get content at historical version
-    const historicalDoc = doc.checkout(version.frontiers);
+    // Clone and checkout to get content at historical version
+    const snapshot = doc.export({ mode: "snapshot" });
+    const historicalDoc = new LoroDoc();
+    historicalDoc.import(snapshot);
+    historicalDoc.checkout(version.frontiers);
     const oldContent = this.getFileContentAtVersion(historicalDoc, this.filePath!);
 
     // Apply as new change (preserves history)
@@ -1461,16 +1486,14 @@ class HistoryView extends ItemView {
     return content?.toString() ?? '';
   }
 
-  private describeChange(change: any): string {
-    // Generate human-readable description based on operations
-    const ops = change.operations || [];
-    if (ops.length === 0) return '';
+  private describeChange(change: Change): string {
+    // Use change message if available, otherwise describe based on length
+    if (change.message) return change.message;
 
-    // Simplify for display
-    const types = new Set(ops.map((op: any) => op.type));
-    if (types.has('insert') && types.has('delete')) return 'edited';
-    if (types.has('insert')) return 'added content';
-    if (types.has('delete')) return 'removed content';
+    // The Change interface provides: peer, counter, lamport, length, timestamp, deps
+    // We can only infer basic info from the operation count
+    if (change.length > 10) return 'multiple edits';
+    if (change.length > 1) return 'edited';
     return 'modified';
   }
 }
@@ -2206,6 +2229,12 @@ const EDITOR_MERGE_CSS = `
 Full-featured version history viewer with diff comparison.
 
 ```typescript
+import { LoroDoc, type OpId } from 'loro-crdt';
+import { ItemView, Notice } from 'obsidian';
+
+// Uses VersionEntry from earlier section
+// Uses confirmDialog, findNodeByPath, updateFileContent, getSemanticDiff utilities
+
 class HistoryBrowserView extends ItemView {
   static VIEW_TYPE = 'peervault-history-browser';
 
@@ -2419,7 +2448,11 @@ class HistoryBrowserView extends ItemView {
 
   private async getVersionContent(version: VersionEntry): Promise<string> {
     const doc = this.plugin.syncEngine.getDoc();
-    const historicalDoc = doc.checkout(version.frontiers);
+    // Clone and checkout - checkout() returns void and makes doc detached
+    const snapshot = doc.export({ mode: "snapshot" });
+    const historicalDoc = new LoroDoc();
+    historicalDoc.import(snapshot);
+    historicalDoc.checkout(version.frontiers);
     return this.getFileContentAtVersion(historicalDoc, this.selectedFile!);
   }
 

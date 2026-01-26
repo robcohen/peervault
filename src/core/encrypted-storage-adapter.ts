@@ -2,14 +2,14 @@
  * Encrypted Storage Adapter
  *
  * Wraps a StorageAdapter to provide transparent encryption at rest.
- * Files are encrypted with NaCl secretbox (XSalsa20-Poly1305) before being
+ * Files are encrypted with AES-256-GCM (Web Crypto API) before being
  * written to storage, and decrypted when read.
  *
  * Encryption format:
  * - Bytes 0-3: Magic number 'PVE1' (PeerVault Encrypted v1)
  * - Byte 4: Format version (0x01)
  * - Bytes 5-15: Reserved (zeros)
- * - Bytes 16+: nonce (24 bytes) || ciphertext
+ * - Bytes 16+: IV (12 bytes) || ciphertext || auth tag (16 bytes)
  *
  * Backward compatible: Files without the magic header are read as plaintext.
  */
@@ -98,7 +98,7 @@ export class EncryptedStorageAdapter implements StorageAdapter {
       }
 
       try {
-        return this.encryption.decrypt(encryptedPayload);
+        return await this.encryption.decrypt(encryptedPayload);
       } catch (error) {
         throw new Error(`Failed to decrypt file "${key}": ${error}`);
       }
@@ -114,7 +114,7 @@ export class EncryptedStorageAdapter implements StorageAdapter {
   async write(key: string, data: Uint8Array): Promise<void> {
     if (this.encryption.isEnabled()) {
       // Encrypt the data
-      const encrypted = this.encryption.encrypt(data);
+      const encrypted = await this.encryption.encrypt(data);
 
       // Create header + encrypted payload
       const header = createHeader();
@@ -190,13 +190,13 @@ export class EncryptedStorageAdapter implements StorageAdapter {
         let plaintext: Uint8Array;
         if (hasEncryptionHeader(rawData)) {
           const encryptedPayload = rawData.slice(HEADER_SIZE);
-          plaintext = this.encryption.decrypt(encryptedPayload);
+          plaintext = await this.encryption.decrypt(encryptedPayload);
         } else {
           plaintext = rawData;
         }
 
         // Re-encrypt with current key
-        const encryptedData = this.encryption.encrypt(plaintext);
+        const encryptedData = await this.encryption.encrypt(plaintext);
         const header = createHeader();
         const combined = new Uint8Array(HEADER_SIZE + encryptedData.length);
         combined.set(header, 0);
@@ -241,7 +241,7 @@ export class EncryptedStorageAdapter implements StorageAdapter {
         // Only process encrypted files
         if (hasEncryptionHeader(rawData)) {
           const encryptedPayload = rawData.slice(HEADER_SIZE);
-          const plaintext = this.encryption.decrypt(encryptedPayload);
+          const plaintext = await this.encryption.decrypt(encryptedPayload);
 
           // Write back as plaintext
           await this.inner.write(key, plaintext);

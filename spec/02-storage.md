@@ -75,8 +75,8 @@ interface StorageMeta {
   /** Last successful write timestamp */
   lastWrite: string;
 
-  /** Last known version vector (for incremental exports) */
-  lastVersion: Uint8Array | null;
+  /** Last known version vector as base64 (for JSON storage) */
+  lastVersion: string | null;
 
   /** Document size in bytes (for monitoring) */
   docSizeBytes: number;
@@ -277,11 +277,12 @@ class ObsidianStorageAdapter implements StorageAdapter {
   }
 
   private async updateMeta(doc: LoroDoc): Promise<void> {
+    const versionBytes = doc.version().encode();
     const meta: StorageMeta = {
       version: 1,
       createdAt: new Date().toISOString(),
       lastWrite: new Date().toISOString(),
-      lastVersion: Array.from(doc.version().encode()),
+      lastVersion: btoa(String.fromCharCode(...versionBytes)),
       docSizeBytes: doc.export({ mode: 'snapshot' }).byteLength,
       fileCount: countFiles(doc),
     };
@@ -406,7 +407,8 @@ const updates = doc.export({ mode: 'update', from: peerVersion });
 
 // Shallow snapshot - state without full history (smaller)
 // Use for: Read-only sharing, reducing storage
-const shallow = doc.export({ mode: 'shallow-snapshot' });
+// Note: shallow-snapshot requires frontiers parameter
+const shallow = doc.export({ mode: 'shallow-snapshot', frontiers: doc.oplogFrontiers() });
 ```
 
 ### When to Create Snapshots
@@ -474,19 +476,40 @@ interface PeerSyncState {
 /**
  * Find the minimum version all peers have.
  * Operations before this can be safely garbage collected.
+ *
+ * Note: VersionVector doesn't have an intersect() method.
+ * We compute the intersection manually: only peer IDs present in ALL
+ * version vectors are included, with the minimum counter for each.
  */
 function findStableVersion(peerStates: PeerSyncState[]): VersionVector {
   if (peerStates.length === 0) {
     return new VersionVector(); // Empty - nothing is stable
   }
 
-  // Intersect all peer versions
-  let stable = peerStates[0].version;
-  for (const peer of peerStates.slice(1)) {
-    stable = stable.intersect(peer.version);
+  // Start with first peer's version vector
+  const firstVV = peerStates[0].version.toJSON(); // Returns Map<PeerID, number>
+  const minVersions = new Map<string, number>(firstVV);
+
+  // For each subsequent peer, intersect: only keep peer IDs in BOTH
+  for (let i = 1; i < peerStates.length; i++) {
+    const vvJson = peerStates[i].version.toJSON();
+
+    for (const peerId of minVersions.keys()) {
+      const otherCounter = vvJson.get(peerId);
+      if (otherCounter === undefined) {
+        // Peer ID not in this VV - remove from intersection
+        minVersions.delete(peerId);
+      } else {
+        // Both have it - take minimum counter
+        const current = minVersions.get(peerId)!;
+        if (otherCounter < current) {
+          minVersions.set(peerId, otherCounter);
+        }
+      }
+    }
   }
 
-  return stable;
+  return new VersionVector(minVersions);
 }
 ```
 
@@ -532,7 +555,8 @@ class GarbageCollector {
 
     // Loro's shallow snapshot discards detailed history
     // while preserving ability to merge with peers
-    const compacted = doc.export({ mode: 'shallow-snapshot' });
+    // Note: shallow-snapshot requires frontiers parameter
+    const compacted = doc.export({ mode: 'shallow-snapshot', frontiers: doc.oplogFrontiers() });
 
     // Create new document from compacted export
     const newDoc = new LoroDoc();

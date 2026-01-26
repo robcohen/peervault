@@ -3059,6 +3059,9 @@ export class WasmEndpoint {
 
   /** Close the endpoint */
   close(): Promise<void>;
+
+  /** Free WASM resources (call when done) */
+  free(): void;
 }
 
 /**
@@ -3079,6 +3082,9 @@ export class WasmConnection {
 
   /** Close the connection */
   close(): Promise<void>;
+
+  /** Free WASM resources (call when done) */
+  free(): void;
 }
 
 /**
@@ -3093,6 +3099,9 @@ export class WasmStream {
 
   /** Close the stream */
   close(): Promise<void>;
+
+  /** Free WASM resources (call when done) */
+  free(): void;
 }
 ```
 

@@ -4,10 +4,11 @@
  * Shows sync status and connected peers.
  */
 
-import { App, Modal, Setting } from "obsidian";
+import { App, Modal, Notice, Setting } from "obsidian";
 import type PeerVaultPlugin from "../main";
 import type { PeerInfo } from "../types";
 import { PairingModal } from "./pairing-modal";
+import { STATUS_ICONS, getStatusLabel } from "./status-icons";
 
 export class PeerVaultStatusModal extends Modal {
   plugin: PeerVaultPlugin;
@@ -46,28 +47,25 @@ export class PeerVaultStatusModal extends Modal {
     const statusValue = statusRow.createSpan({ cls: "peervault-value" });
 
     const status = this.plugin.getStatus();
-    const statusIcons: Record<string, string> = {
-      idle: "Idle",
-      syncing: "Syncing...",
-      offline: "Offline",
-      error: "Error",
-    };
-    statusValue.setText(statusIcons[status] ?? "Unknown");
+    const icon = STATUS_ICONS[status as keyof typeof STATUS_ICONS] ?? STATUS_ICONS.unknown;
+    const label = getStatusLabel(status);
+    statusValue.setText(`${icon} ${label}`);
+    statusValue.ariaLabel = label; // For screen readers
     statusValue.addClass(`peervault-status-${status}`);
 
     // Vault ID
     const vaultRow = statusGrid.createDiv({ cls: "peervault-status-row" });
     vaultRow.createSpan({ text: "Vault ID:", cls: "peervault-label" });
-    const vaultId = this.plugin.documentManager.getVaultId();
+    const vaultId = this.plugin.documentManager?.getVaultId() ?? "Not initialized";
     vaultRow.createSpan({
-      text: vaultId.substring(0, 8) + "...",
+      text: vaultId.length > 8 ? vaultId.substring(0, 8) + "..." : vaultId,
       cls: "peervault-value",
     });
 
     // Files tracked
     const filesRow = statusGrid.createDiv({ cls: "peervault-status-row" });
     filesRow.createSpan({ text: "Files tracked:", cls: "peervault-label" });
-    const fileCount = this.plugin.documentManager.listAllPaths().length;
+    const fileCount = this.plugin.documentManager?.listAllPaths().length ?? 0;
     filesRow.createSpan({ text: String(fileCount), cls: "peervault-value" });
   }
 
@@ -143,8 +141,13 @@ export class PeerVaultStatusModal extends Modal {
       .setDesc("Manually trigger sync with all connected peers")
       .addButton((btn) =>
         btn.setButtonText("Sync").onClick(async () => {
-          await this.plugin.sync();
-          this.close();
+          try {
+            await this.plugin.sync();
+            new Notice("Sync completed");
+            this.close();
+          } catch (error) {
+            new Notice(`Sync failed: ${error}`);
+          }
         }),
       );
   }

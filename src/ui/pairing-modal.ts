@@ -103,7 +103,8 @@ export class PairingModal extends Modal {
         return;
       } catch (error) {
         this.isGenerating = false;
-        loadingEl.setText(`Failed to generate invite: ${error}`);
+        const errorMsg = error instanceof Error ? error.message : "Unknown error";
+        loadingEl.setText(`Failed to generate invite: ${errorMsg}`);
         return;
       }
     }
@@ -281,14 +282,17 @@ export class PairingModal extends Modal {
       }
     } catch (error) {
       this.plugin.logger.error("Failed to process QR image:", error);
-      new Notice(`Failed to process image: ${error}`);
+      const errorMsg = error instanceof Error ? error.message : "Unknown error";
+      new Notice(`Failed to process image: ${errorMsg}`);
     }
   }
 
   private async loadImageData(file: File): Promise<ImageData> {
     return new Promise((resolve, reject) => {
       const img = new Image();
+      const objectUrl = URL.createObjectURL(file);
       img.onload = () => {
+        URL.revokeObjectURL(objectUrl); // Clean up to prevent memory leak
         const canvas = document.createElement("canvas");
         canvas.width = img.width;
         canvas.height = img.height;
@@ -301,8 +305,11 @@ export class PairingModal extends Modal {
         const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
         resolve(imageData);
       };
-      img.onerror = () => reject(new Error("Failed to load image"));
-      img.src = URL.createObjectURL(file);
+      img.onerror = () => {
+        URL.revokeObjectURL(objectUrl); // Clean up on error too
+        reject(new Error("Failed to load image"));
+      };
+      img.src = objectUrl;
     });
   }
 
@@ -413,7 +420,8 @@ export class PairingModal extends Modal {
       this.close();
     } catch (error) {
       this.plugin.logger.error("Failed to connect to peer:", error);
-      new Notice(`Connection failed: ${error}`);
+      const errorMsg = error instanceof Error ? error.message : "Unknown error";
+      new Notice(`Connection failed: ${errorMsg}`);
     }
   }
 }

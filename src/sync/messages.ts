@@ -9,7 +9,9 @@ import {
   SyncErrorCode,
   type AnySyncMessage,
   type VersionInfoMessage,
-  type RequestUpdatesMessage,
+  type SnapshotRequestMessage,
+  type SnapshotMessage,
+  type SnapshotChunkMessage,
   type UpdatesMessage,
   type SyncCompleteMessage,
   type PingMessage,
@@ -31,8 +33,12 @@ export function serializeMessage(message: AnySyncMessage): Uint8Array {
   switch (message.type) {
     case SyncMessageType.VERSION_INFO:
       return serializeVersionInfo(message);
-    case SyncMessageType.REQUEST_UPDATES:
-      return serializeRequestUpdates(message);
+    case SyncMessageType.SNAPSHOT_REQUEST:
+      return serializeSnapshotRequest(message);
+    case SyncMessageType.SNAPSHOT:
+      return serializeSnapshot(message);
+    case SyncMessageType.SNAPSHOT_CHUNK:
+      return serializeSnapshotChunk(message);
     case SyncMessageType.UPDATES:
       return serializeUpdates(message);
     case SyncMessageType.SYNC_COMPLETE:
@@ -73,8 +79,12 @@ export function deserializeMessage(data: Uint8Array): AnySyncMessage {
   switch (type) {
     case SyncMessageType.VERSION_INFO:
       return deserializeVersionInfo(data, timestamp);
-    case SyncMessageType.REQUEST_UPDATES:
-      return deserializeRequestUpdates(data, timestamp);
+    case SyncMessageType.SNAPSHOT_REQUEST:
+      return deserializeSnapshotRequest(timestamp);
+    case SyncMessageType.SNAPSHOT:
+      return deserializeSnapshot(data, timestamp);
+    case SyncMessageType.SNAPSHOT_CHUNK:
+      return deserializeSnapshotChunk(data, timestamp);
     case SyncMessageType.UPDATES:
       return deserializeUpdates(data, timestamp);
     case SyncMessageType.SYNC_COMPLETE:
@@ -162,18 +172,45 @@ function deserializeVersionInfo(
 }
 
 // ============================================================================
-// REQUEST_UPDATES
+// SNAPSHOT_REQUEST
 // ============================================================================
 
 /**
- * REQUEST_UPDATES format:
- * - u8: type (0x02)
+ * SNAPSHOT_REQUEST format:
+ * - u8: type (0x03)
  * - u64: timestamp
- * - u32: sinceVersionBytes length
- * - bytes: sinceVersionBytes
  */
-function serializeRequestUpdates(msg: RequestUpdatesMessage): Uint8Array {
-  const totalLength = 1 + 8 + 4 + msg.sinceVersionBytes.length;
+function serializeSnapshotRequest(msg: SnapshotRequestMessage): Uint8Array {
+  const buffer = new ArrayBuffer(9);
+  const view = new DataView(buffer);
+
+  view.setUint8(0, msg.type);
+  view.setBigUint64(1, BigInt(msg.timestamp), false);
+
+  return new Uint8Array(buffer);
+}
+
+function deserializeSnapshotRequest(timestamp: number): SnapshotRequestMessage {
+  return {
+    type: SyncMessageType.SNAPSHOT_REQUEST,
+    timestamp,
+  };
+}
+
+// ============================================================================
+// SNAPSHOT
+// ============================================================================
+
+/**
+ * SNAPSHOT format:
+ * - u8: type (0x04)
+ * - u64: timestamp
+ * - u32: totalSize
+ * - u32: snapshot length
+ * - bytes: snapshot
+ */
+function serializeSnapshot(msg: SnapshotMessage): Uint8Array {
+  const totalLength = 1 + 8 + 4 + 4 + msg.snapshot.length;
 
   const buffer = new ArrayBuffer(totalLength);
   const view = new DataView(buffer);
@@ -184,28 +221,99 @@ function serializeRequestUpdates(msg: RequestUpdatesMessage): Uint8Array {
   view.setBigUint64(offset, BigInt(msg.timestamp), false);
   offset += 8;
 
-  view.setUint32(offset, msg.sinceVersionBytes.length, false);
+  view.setUint32(offset, msg.totalSize, false);
   offset += 4;
-  bytes.set(msg.sinceVersionBytes, offset);
+
+  view.setUint32(offset, msg.snapshot.length, false);
+  offset += 4;
+  bytes.set(msg.snapshot, offset);
 
   return bytes;
 }
 
-function deserializeRequestUpdates(
+function deserializeSnapshot(
   data: Uint8Array,
   timestamp: number,
-): RequestUpdatesMessage {
+): SnapshotMessage {
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   let offset = 9;
 
-  const sinceVersionBytesLen = view.getUint32(offset, false);
+  const totalSize = view.getUint32(offset, false);
   offset += 4;
-  const sinceVersionBytes = data.slice(offset, offset + sinceVersionBytesLen);
+
+  const snapshotLen = view.getUint32(offset, false);
+  offset += 4;
+  const snapshot = data.slice(offset, offset + snapshotLen);
 
   return {
-    type: SyncMessageType.REQUEST_UPDATES,
+    type: SyncMessageType.SNAPSHOT,
     timestamp,
-    sinceVersionBytes,
+    snapshot,
+    totalSize,
+  };
+}
+
+// ============================================================================
+// SNAPSHOT_CHUNK
+// ============================================================================
+
+/**
+ * SNAPSHOT_CHUNK format:
+ * - u8: type (0x05)
+ * - u64: timestamp
+ * - u32: chunkIndex
+ * - u32: totalChunks
+ * - u32: data length
+ * - bytes: data
+ */
+function serializeSnapshotChunk(msg: SnapshotChunkMessage): Uint8Array {
+  const totalLength = 1 + 8 + 4 + 4 + 4 + msg.data.length;
+
+  const buffer = new ArrayBuffer(totalLength);
+  const view = new DataView(buffer);
+  const bytes = new Uint8Array(buffer);
+  let offset = 0;
+
+  view.setUint8(offset++, msg.type);
+  view.setBigUint64(offset, BigInt(msg.timestamp), false);
+  offset += 8;
+
+  view.setUint32(offset, msg.chunkIndex, false);
+  offset += 4;
+
+  view.setUint32(offset, msg.totalChunks, false);
+  offset += 4;
+
+  view.setUint32(offset, msg.data.length, false);
+  offset += 4;
+  bytes.set(msg.data, offset);
+
+  return bytes;
+}
+
+function deserializeSnapshotChunk(
+  data: Uint8Array,
+  timestamp: number,
+): SnapshotChunkMessage {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  let offset = 9;
+
+  const chunkIndex = view.getUint32(offset, false);
+  offset += 4;
+
+  const totalChunks = view.getUint32(offset, false);
+  offset += 4;
+
+  const dataLen = view.getUint32(offset, false);
+  offset += 4;
+  const chunkData = data.slice(offset, offset + dataLen);
+
+  return {
+    type: SyncMessageType.SNAPSHOT_CHUNK,
+    timestamp,
+    chunkIndex,
+    totalChunks,
+    data: chunkData,
   };
 }
 
@@ -215,7 +323,7 @@ function deserializeRequestUpdates(
 
 /**
  * UPDATES format:
- * - u8: type (0x03)
+ * - u8: type (0x02)
  * - u64: timestamp
  * - u32: opCount
  * - u32: updates length
@@ -271,7 +379,7 @@ function deserializeUpdates(
 
 /**
  * SYNC_COMPLETE format:
- * - u8: type (0x04)
+ * - u8: type (0x06)
  * - u64: timestamp
  * - u32: versionBytes length
  * - bytes: versionBytes
@@ -319,7 +427,7 @@ function deserializeSyncComplete(
 
 /**
  * PING/PONG format:
- * - u8: type (0x05 or 0x06)
+ * - u8: type (0x08 or 0x09)
  * - u64: timestamp
  * - u32: seq
  */
@@ -369,7 +477,7 @@ function deserializePong(data: Uint8Array, timestamp: number): PongMessage {
 
 /**
  * ERROR format:
- * - u8: type (0xff)
+ * - u8: type (0x07)
  * - u64: timestamp
  * - u8: error code
  * - u32: message length
@@ -431,13 +539,36 @@ export function createVersionInfoMessage(
   };
 }
 
-export function createRequestUpdatesMessage(
-  sinceVersionBytes: Uint8Array,
-): RequestUpdatesMessage {
+export function createSnapshotRequestMessage(): SnapshotRequestMessage {
   return {
-    type: SyncMessageType.REQUEST_UPDATES,
+    type: SyncMessageType.SNAPSHOT_REQUEST,
     timestamp: Date.now(),
-    sinceVersionBytes,
+  };
+}
+
+export function createSnapshotMessage(
+  snapshot: Uint8Array,
+  totalSize?: number,
+): SnapshotMessage {
+  return {
+    type: SyncMessageType.SNAPSHOT,
+    timestamp: Date.now(),
+    snapshot,
+    totalSize: totalSize ?? snapshot.length,
+  };
+}
+
+export function createSnapshotChunkMessage(
+  chunkIndex: number,
+  totalChunks: number,
+  data: Uint8Array,
+): SnapshotChunkMessage {
+  return {
+    type: SyncMessageType.SNAPSHOT_CHUNK,
+    timestamp: Date.now(),
+    chunkIndex,
+    totalChunks,
+    data,
   };
 }
 

@@ -81,18 +81,19 @@ function createBinaryFileRef(
 ): TreeID {
   const files = doc.getTree('files');
 
-  const nodeId = files.create(parentId);
-  const nodeData = files.getMeta(nodeId);
+  // createNode returns LoroTreeNode, extract ID and data
+  const node = files.createNode(parentId ?? undefined);
+  const nodeId = node.id;
+  const nodeData = node.data;
 
-  doc.transact(() => {
-    nodeData.set('type', 'binary');
-    nodeData.set('name', name);
-    nodeData.set('hash', hash);
-    nodeData.set('size', size);
-    nodeData.set('mimeType', mimeType);
-    nodeData.set('mtime', Date.now());
-    nodeData.set('deleted', false);
-  });
+  // Loro auto-batches operations; no transact() needed
+  nodeData.set('type', 'binary');
+  nodeData.set('name', name);
+  nodeData.set('hash', hash);
+  nodeData.set('size', size);
+  nodeData.set('mimeType', mimeType);
+  nodeData.set('mtime', Date.now());
+  nodeData.set('deleted', false);
 
   return nodeId;
 }
@@ -301,15 +302,17 @@ class BinarySyncProtocol {
     const hashes: string[] = [];
     const files = this.doc.getTree('files');
 
-    function traverse(parentId: TreeID | null) {
-      // Use roots() for root level, children() for nested
-      const childIds = parentId === null ? files.roots() : files.children(parentId);
-      for (const childId of childIds) {
-        const nodeData = files.getMeta(childId);
-        if (nodeData.get('type') === 'binary' && !nodeData.get('deleted')) {
-          hashes.push(nodeData.get('hash') as string);
+    function traverse(parentNode: LoroTreeNode | null) {
+      // Get children: getNodes() for root level, children() for nested
+      const children = parentNode
+        ? (parentNode.children() ?? [])
+        : files.getNodes().filter(n => !n.parent());
+
+      for (const child of children) {
+        if (child.data.get('type') === 'binary' && !child.data.get('deleted')) {
+          hashes.push(child.data.get('hash') as string);
         }
-        traverse(childId);
+        traverse(child);
       }
     }
 
