@@ -3,8 +3,7 @@
 //! WASM bindings for Iroh P2P networking in PeerVault.
 //! Exposes Iroh's Endpoint, Connection, and Stream to JavaScript.
 
-use iroh::endpoint::RelayMode;
-use iroh::{Endpoint, NodeAddr, RelayMap, RelayNode, RelayUrl, SecretKey};
+use iroh::{Endpoint, EndpointAddr, RelayMap, RelayMode, RelayUrl, SecretKey};
 use js_sys::{Array, Uint8Array};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -12,9 +11,6 @@ use wasm_bindgen::prelude::*;
 
 /// Protocol identifier for PeerVault sync
 const PEERVAULT_ALPN: &[u8] = b"peervault/sync/1";
-
-/// Default STUN port per RFC 8489
-const DEFAULT_STUN_PORT: u16 = 3478;
 
 /// Initialize the WASM module. Call this once before using any other functions.
 #[wasm_bindgen(start)]
@@ -51,13 +47,13 @@ impl WasmEndpoint {
                 })?;
                 SecretKey::from_bytes(&arr)
             }
-            None => SecretKey::generate(rand::rngs::OsRng),
+            None => SecretKey::generate(&mut rand::rng()),
         };
 
         // Determine relay mode based on provided URLs
         let relay_mode = match relay_urls {
             Some(urls) if urls.length() > 0 => {
-                let mut relay_nodes = Vec::new();
+                let mut relay_url_list = Vec::new();
                 for i in 0..urls.length() {
                     let url_str = urls
                         .get(i)
@@ -68,18 +64,10 @@ impl WasmEndpoint {
                         .parse()
                         .map_err(|e| JsValue::from_str(&format!("Invalid relay URL '{}': {}", url_str, e)))?;
 
-                    relay_nodes.push(RelayNode {
-                        url,
-                        stun_only: false,
-                        stun_port: DEFAULT_STUN_PORT,
-                        quic: None, // No QUIC-based address discovery
-                    });
+                    relay_url_list.push(url);
                 }
 
-                let relay_map = RelayMap::from_nodes(relay_nodes)
-                    .map_err(|e| JsValue::from_str(&format!("Invalid relay configuration: {}", e)))?;
-
-                RelayMode::Custom(relay_map)
+                RelayMode::Custom(RelayMap::from_iter(relay_url_list))
             }
             _ => RelayMode::Default,
         };
@@ -101,7 +89,7 @@ impl WasmEndpoint {
     /// Get this endpoint's node ID (public key as hex string).
     #[wasm_bindgen(js_name = nodeId)]
     pub fn node_id(&self) -> String {
-        self.endpoint.node_id().to_string()
+        self.endpoint.id().to_string()
     }
 
     /// Get the secret key bytes for persistence.
@@ -115,32 +103,34 @@ impl WasmEndpoint {
     /// This waits for the relay connection to be established.
     #[wasm_bindgen(js_name = generateTicket)]
     pub async fn generate_ticket(&self) -> Result<String, JsValue> {
-        // Get node address (waits for relay connection in WASM)
-        let node_addr = self.endpoint.node_addr().await
-            .map_err(|e| JsValue::from_str(&format!("Failed to get node addr: {}", e)))?;
+        // Wait for endpoint to be online (connected to relay)
+        self.endpoint.online().await;
+
+        // Get endpoint address
+        let endpoint_addr = self.endpoint.addr();
 
         // Serialize to JSON for sharing
-        serde_json::to_string(&node_addr)
+        serde_json::to_string(&endpoint_addr)
             .map_err(|e| JsValue::from_str(&format!("Failed to serialize ticket: {}", e)))
     }
 
     /// Connect to a peer using their ticket.
     #[wasm_bindgen(js_name = connectWithTicket)]
     pub async fn connect_with_ticket(&self, ticket: String) -> Result<WasmConnection, JsValue> {
-        // Parse ticket (JSON) to get NodeAddr
-        let node_addr: NodeAddr = serde_json::from_str(&ticket)
+        // Parse ticket (JSON) to get EndpointAddr
+        let endpoint_addr: EndpointAddr = serde_json::from_str(&ticket)
             .map_err(|e| JsValue::from_str(&format!("Invalid ticket: {}", e)))?;
 
-        let remote_node_id = node_addr.node_id.to_string();
+        let remote_endpoint_id = endpoint_addr.id.to_string();
 
         let connection = self.endpoint
-            .connect(node_addr, PEERVAULT_ALPN)
+            .connect(endpoint_addr, PEERVAULT_ALPN)
             .await
             .map_err(|e| JsValue::from_str(&format!("Connection failed: {}", e)))?;
 
         Ok(WasmConnection {
             connection: Arc::new(Mutex::new(connection)),
-            remote_node_id,
+            remote_node_id: remote_endpoint_id,
         })
     }
 
@@ -157,10 +147,7 @@ impl WasmEndpoint {
             .await
             .map_err(|e| JsValue::from_str(&format!("Accept failed: {}", e)))?;
 
-        let remote_node_id = connection
-            .remote_node_id()
-            .map_err(|e| JsValue::from_str(&format!("Failed to get remote node ID: {}", e)))?
-            .to_string();
+        let remote_node_id = connection.remote_id().to_string();
 
         Ok(WasmConnection {
             connection: Arc::new(Mutex::new(connection)),
