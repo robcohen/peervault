@@ -1362,3 +1362,68 @@
   border-color: var(--color-red);
   background: rgba(255, 100, 100, 0.05);
 }
+
+/* ===========================================================================
+   Drag and Drop for Device Groups
+   =========================================================================== */
+
+.peervault-draggable {
+  cursor: grab;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+.peervault-draggable:active {
+  cursor: grabbing;
+}
+
+.peervault-dragging {
+  opacity: 0.5;
+  transform: scale(0.98);
+}
+
+.peervault-drop-target {
+  transition: background-color 0.2s ease, border-color 0.2s ease, transform 0.2s ease;
+}
+
+.peervault-drag-over {
+  background: var(--background-modifier-hover) !important;
+  border-color: var(--interactive-accent) !important;
+  transform: scale(1.02);
+  box-shadow: 0 0 0 2px var(--interactive-accent);
+  border-radius: 8px;
+}
+
+.peervault-group-header {
+  border-left: 3px solid transparent;
+  transition: border-color 0.2s ease;
+}
+
+.peervault-group-header.peervault-drag-over {
+  border-left-color: var(--interactive-accent);
+}
+
+.peervault-device-item {
+  border-left: 3px solid transparent;
+}
+
+.peervault-group-content {
+  padding-left: 12px;
+  border-left: 1px solid var(--background-modifier-border);
+  margin-left: 8px;
+  margin-bottom: 12px;
+}
+
+.peervault-group-settings {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--background-modifier-border);
+}
+
+.peervault-settings-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 8px;
+}

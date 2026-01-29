@@ -103,13 +103,40 @@ fmt:
 clean:
     rm -rf dist/ .bun/ node_modules/
 
-# Create a release build
+# Create a release build with specific version
 release version:
     @echo "Building release {{version}}..."
     bun run build
     @echo "Updating manifest.json version to {{version}}..."
     jq '.version = "{{version}}"' manifest.json > manifest.json.tmp && mv manifest.json.tmp manifest.json
     @echo "Release {{version}} ready!"
+
+# Bump patch version, build, and create GitHub release
+bump:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Get current version and bump patch
+    CURRENT=$(jq -r '.version' manifest.json)
+    MAJOR=$(echo "$CURRENT" | cut -d. -f1)
+    MINOR=$(echo "$CURRENT" | cut -d. -f2)
+    PATCH=$(echo "$CURRENT" | cut -d. -f3)
+    NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
+    echo "Bumping version: $CURRENT -> $NEW_VERSION"
+
+    # Update manifest.json
+    jq ".version = \"$NEW_VERSION\"" manifest.json > manifest.json.tmp && mv manifest.json.tmp manifest.json
+
+    # Update versions.json
+    jq ". + {\"$NEW_VERSION\": \"1.4.0\"}" versions.json > versions.json.tmp && mv versions.json.tmp versions.json
+
+    # Build
+    bun run build
+
+    # Create tarball
+    tar -czvf "peervault-$NEW_VERSION.tar.gz" -C dist main.js manifest.json styles.css
+
+    echo "Ready for release v$NEW_VERSION"
+    echo "Run: gh release create v$NEW_VERSION peervault-$NEW_VERSION.tar.gz dist/main.js dist/manifest.json dist/styles.css --title \"v$NEW_VERSION\" --generate-notes"
 
 # Copy plugin to Obsidian vault for testing (set OBSIDIAN_VAULT env var)
 deploy:
