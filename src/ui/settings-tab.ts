@@ -433,45 +433,76 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
     }
   }
 
-  private renderDeviceInAllDevices(
+  /**
+   * Unified device rendering for both All Devices and Group contexts.
+   */
+  private renderDevice(
     container: HTMLElement,
     peer: { nodeId: string; hostname?: string; nickname?: string; state: string },
-    userGroups: { id: string; name: string; icon: string; peerIds: string[] }[],
+    options: {
+      /** Enable drag-and-drop (for All Devices section) */
+      draggable?: boolean;
+      /** Show "Drag to group" hint in description */
+      showDragHint?: boolean;
+      /** Group context (if rendering in a group) */
+      group?: { id: string; peerIds: string[] };
+      /** Whether it's the default group (hides remove button) */
+      isDefaultGroup?: boolean;
+    } = {},
   ): void {
     const stateIcon = this.getStateIcon(peer.state);
     const displayName = peer.hostname
       ? (peer.nickname ? `${peer.hostname} (${peer.nickname})` : peer.hostname)
       : (peer.nickname || nodeIdToWords(peer.nodeId));
 
+    const shortId = peer.nodeId.substring(0, 8) + "...";
+    const description = options.showDragHint ? `Drag to group • ${shortId}` : shortId;
+
     const setting = new Setting(container)
       .setName(`${stateIcon} ${displayName}`)
-      .setDesc(userGroups.length > 0 ? "Drag to group • " + peer.nodeId.substring(0, 8) + "..." : peer.nodeId.substring(0, 8) + "...")
+      .setDesc(description)
       .setClass("peervault-device-item");
 
-    // Make the setting element draggable
     const settingEl = setting.settingEl;
-    settingEl.setAttribute("draggable", "true");
-    settingEl.addClass("peervault-draggable");
 
-    settingEl.addEventListener("dragstart", (e) => {
-      this.draggedPeerId = peer.nodeId;
-      settingEl.addClass("peervault-dragging");
-      if (e.dataTransfer) {
-        e.dataTransfer.effectAllowed = "move";
-        e.dataTransfer.setData("text/plain", peer.nodeId);
-      }
-    });
+    // Drag-and-drop for All Devices section
+    if (options.draggable) {
+      settingEl.setAttribute("draggable", "true");
+      settingEl.addClass("peervault-draggable");
 
-    settingEl.addEventListener("dragend", () => {
-      this.draggedPeerId = null;
-      settingEl.removeClass("peervault-dragging");
-      // Remove all drag-over states
-      container.querySelectorAll(".peervault-drag-over").forEach((el) => {
-        el.removeClass("peervault-drag-over");
+      settingEl.addEventListener("dragstart", (e) => {
+        this.draggedPeerId = peer.nodeId;
+        settingEl.addClass("peervault-dragging");
+        if (e.dataTransfer) {
+          e.dataTransfer.effectAllowed = "move";
+          e.dataTransfer.setData("text/plain", peer.nodeId);
+        }
       });
-    });
 
-    // Delete device button
+      settingEl.addEventListener("dragend", () => {
+        this.draggedPeerId = null;
+        settingEl.removeClass("peervault-dragging");
+        container.querySelectorAll(".peervault-drag-over").forEach((el) => {
+          el.removeClass("peervault-drag-over");
+        });
+      });
+    }
+
+    // Remove from group button (only in group context, not default group)
+    if (options.group && !options.isDefaultGroup) {
+      setting.addExtraButton((btn) =>
+        btn
+          .setIcon("x")
+          .setTooltip("Remove from group")
+          .onClick(() => {
+            this.plugin.peerManager?.getGroupManager()?.removePeerFromGroup(options.group!.id, peer.nodeId);
+            new Notice("Device removed from group");
+            this.display();
+          }),
+      );
+    }
+
+    // Delete device button (always shown)
     setting.addExtraButton((btn) =>
       btn
         .setIcon("trash")
@@ -492,55 +523,26 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
     );
   }
 
+  /** @deprecated Use renderDevice with { draggable: true, showDragHint: true } */
+  private renderDeviceInAllDevices(
+    container: HTMLElement,
+    peer: { nodeId: string; hostname?: string; nickname?: string; state: string },
+    userGroups: { id: string; name: string; icon: string; peerIds: string[] }[],
+  ): void {
+    this.renderDevice(container, peer, {
+      draggable: true,
+      showDragHint: userGroups.length > 0,
+    });
+  }
+
+  /** @deprecated Use renderDevice with group context */
   private renderDeviceInGroup(
     container: HTMLElement,
     peer: { nodeId: string; hostname?: string; nickname?: string; state: string },
     group: { id: string; peerIds: string[] },
     isDefaultGroup: boolean,
   ): void {
-    const stateIcon = this.getStateIcon(peer.state);
-    const displayName = peer.hostname
-      ? (peer.nickname ? `${peer.hostname} (${peer.nickname})` : peer.hostname)
-      : (peer.nickname || nodeIdToWords(peer.nodeId));
-
-    const setting = new Setting(container)
-      .setName(`${stateIcon} ${displayName}`)
-      .setDesc(peer.nodeId.substring(0, 8) + "...")
-      .setClass("peervault-device-item");
-
-    // Remove from group button (not for default group)
-    if (!isDefaultGroup) {
-      setting.addExtraButton((btn) =>
-        btn
-          .setIcon("x")
-          .setTooltip("Remove from group")
-          .onClick(() => {
-            this.plugin.peerManager?.getGroupManager()?.removePeerFromGroup(group.id, peer.nodeId);
-            new Notice("Device removed from group");
-            this.display();
-          }),
-      );
-    }
-
-    // Delete device button
-    setting.addExtraButton((btn) =>
-      btn
-        .setIcon("trash")
-        .setTooltip("Delete device")
-        .onClick(async () => {
-          const confirmed = await showConfirm(this.app, {
-            title: "Remove Device",
-            message: `Remove "${displayName}" from sync entirely?`,
-            confirmText: "Remove",
-            isDestructive: true,
-          });
-          if (confirmed) {
-            await this.plugin.peerManager?.removePeer(peer.nodeId);
-            new Notice("Device removed");
-            this.display();
-          }
-        }),
-    );
+    this.renderDevice(container, peer, { group, isDefaultGroup });
   }
 
   private renderInlineGroupSettings(

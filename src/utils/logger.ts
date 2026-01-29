@@ -4,6 +4,29 @@
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
+/**
+ * Patterns for sensitive data that should be redacted in logs.
+ */
+const SENSITIVE_PATTERNS = [
+  // Node IDs (64-char hex strings)
+  { pattern: /\b[a-f0-9]{64}\b/gi, replacement: "[NODE_ID]" },
+  // Iroh tickets
+  { pattern: /iroh:\/\/[a-zA-Z0-9_-]+/g, replacement: "[TICKET]" },
+  // Base64-encoded keys (32+ chars)
+  { pattern: /\b[A-Za-z0-9+/]{32,}={0,2}\b/g, replacement: "[KEY]" },
+] as const;
+
+/**
+ * Redact sensitive information from a string.
+ */
+function redactSensitive(value: string): string {
+  let result = value;
+  for (const { pattern, replacement } of SENSITIVE_PATTERNS) {
+    result = result.replace(pattern, replacement);
+  }
+  return result;
+}
+
 /** Log entry for the buffer */
 export interface LogEntry {
   timestamp: number;
@@ -18,11 +41,16 @@ const MAX_LOG_ENTRIES = 500;
 
 function addToBuffer(level: LogLevel, prefix: string, args: unknown[]): void {
   const message = args.map(arg => {
-    if (arg instanceof Error) return `${arg.name}: ${arg.message}`;
-    if (typeof arg === "object") {
-      try { return JSON.stringify(arg); } catch { return String(arg); }
+    let str: string;
+    if (arg instanceof Error) {
+      str = `${arg.name}: ${arg.message}`;
+    } else if (typeof arg === "object") {
+      try { str = JSON.stringify(arg); } catch { str = String(arg); }
+    } else {
+      str = String(arg);
     }
-    return String(arg);
+    // Redact sensitive data in log buffer
+    return redactSensitive(str);
   }).join(" ");
 
   LOG_BUFFER.push({ timestamp: Date.now(), level, prefix, message });

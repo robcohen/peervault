@@ -28,6 +28,175 @@ import { SyncErrors } from "../errors";
 const TEXT_ENCODER = new TextEncoder();
 const TEXT_DECODER = new TextDecoder();
 
+// ============================================================================
+// Serialization Helpers
+// ============================================================================
+
+/**
+ * Helper for building binary messages incrementally.
+ */
+class MessageWriter {
+  private buffer: ArrayBuffer;
+  private view: DataView;
+  private bytes: Uint8Array;
+  private offset = 0;
+
+  constructor(size: number) {
+    this.buffer = new ArrayBuffer(size);
+    this.view = new DataView(this.buffer);
+    this.bytes = new Uint8Array(this.buffer);
+  }
+
+  /** Write message header (type + timestamp) */
+  writeHeader(type: SyncMessageType, timestamp: number): this {
+    this.view.setUint8(this.offset++, type);
+    this.view.setBigUint64(this.offset, BigInt(timestamp), false);
+    this.offset += 8;
+    return this;
+  }
+
+  writeU8(value: number): this {
+    this.view.setUint8(this.offset++, value);
+    return this;
+  }
+
+  writeU16(value: number): this {
+    this.view.setUint16(this.offset, value, false);
+    this.offset += 2;
+    return this;
+  }
+
+  writeU32(value: number): this {
+    this.view.setUint32(this.offset, value, false);
+    this.offset += 4;
+    return this;
+  }
+
+  /** Write length-prefixed bytes (u32 length + data) */
+  writeBytes(data: Uint8Array): this {
+    this.view.setUint32(this.offset, data.length, false);
+    this.offset += 4;
+    this.bytes.set(data, this.offset);
+    this.offset += data.length;
+    return this;
+  }
+
+  /** Write length-prefixed string (u32 length + UTF-8) */
+  writeString(str: string): this {
+    const encoded = TEXT_ENCODER.encode(str);
+    return this.writeBytes(encoded);
+  }
+
+  /** Write short string (u16 length + UTF-8) */
+  writeShortString(str: string): this {
+    const encoded = TEXT_ENCODER.encode(str);
+    this.view.setUint16(this.offset, encoded.length, false);
+    this.offset += 2;
+    this.bytes.set(encoded, this.offset);
+    this.offset += encoded.length;
+    return this;
+  }
+
+  /** Write optional short string (u16 length, 0 if null) */
+  writeOptionalShortString(str: string | undefined): this {
+    if (str) {
+      return this.writeShortString(str);
+    }
+    this.view.setUint16(this.offset, 0, false);
+    this.offset += 2;
+    return this;
+  }
+
+  /** Write raw bytes without length prefix */
+  writeRaw(data: Uint8Array): this {
+    this.bytes.set(data, this.offset);
+    this.offset += data.length;
+    return this;
+  }
+
+  finish(): Uint8Array {
+    return this.bytes;
+  }
+}
+
+/**
+ * Helper for reading binary messages.
+ */
+class MessageReader {
+  private view: DataView;
+  private offset = 9; // Skip header (type + timestamp already parsed)
+
+  constructor(private data: Uint8Array) {
+    this.view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  }
+
+  readU8(): number {
+    return this.view.getUint8(this.offset++);
+  }
+
+  readU16(): number {
+    const value = this.view.getUint16(this.offset, false);
+    this.offset += 2;
+    return value;
+  }
+
+  readU32(): number {
+    const value = this.view.getUint32(this.offset, false);
+    this.offset += 4;
+    return value;
+  }
+
+  /** Read length-prefixed bytes (u32 length + data) */
+  readBytes(): Uint8Array {
+    const len = this.readU32();
+    const bytes = this.data.slice(this.offset, this.offset + len);
+    this.offset += len;
+    return bytes;
+  }
+
+  /** Read length-prefixed string (u32 length + UTF-8) */
+  readString(): string {
+    return TEXT_DECODER.decode(this.readBytes());
+  }
+
+  /** Read short string (u16 length + UTF-8) */
+  readShortString(): string {
+    const len = this.readU16();
+    const str = TEXT_DECODER.decode(this.data.slice(this.offset, this.offset + len));
+    this.offset += len;
+    return str;
+  }
+
+  /** Read optional short string (returns undefined if length is 0) */
+  readOptionalShortString(): string | undefined {
+    const len = this.readU16();
+    if (len === 0) return undefined;
+    const str = TEXT_DECODER.decode(this.data.slice(this.offset, this.offset + len));
+    this.offset += len;
+    return str;
+  }
+
+  /** Read remaining bytes */
+  readRemaining(): Uint8Array {
+    return this.data.slice(this.offset);
+  }
+}
+
+/** Calculate serialized size of a string (4-byte length + UTF-8 bytes) */
+function stringSize(str: string): number {
+  return 4 + TEXT_ENCODER.encode(str).length;
+}
+
+/** Calculate serialized size of a short string (2-byte length + UTF-8 bytes) */
+function shortStringSize(str: string): number {
+  return 2 + TEXT_ENCODER.encode(str).length;
+}
+
+/** Calculate serialized size of optional short string */
+function optionalShortStringSize(str: string | undefined): number {
+  return str ? shortStringSize(str) : 2;
+}
+
 /**
  * Serialize a sync message to bytes.
  */
