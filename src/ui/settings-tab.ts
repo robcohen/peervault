@@ -526,9 +526,14 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
     section.createEl("div", { cls: "peervault-section-divider" });
 
     const isValidTicket = (ticket: string): boolean => {
-      // Iroh tickets are base32 encoded, typically 100+ chars
-      if (!ticket || ticket.length < 50) return false;
-      return /^[A-Za-z2-7]+$/.test(ticket);
+      if (!ticket || ticket.length < 20) return false;
+      try {
+        const parsed = JSON.parse(ticket);
+        // Must have id (node ID) and addrs array
+        return typeof parsed.id === "string" && parsed.id.length > 0 && Array.isArray(parsed.addrs);
+      } catch {
+        return false;
+      }
     };
 
     // Ticket input with validation
