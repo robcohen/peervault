@@ -3,7 +3,8 @@
 //! WASM bindings for Iroh P2P networking in PeerVault.
 //! Exposes Iroh's Endpoint, Connection, and Stream to JavaScript.
 
-use iroh::{Endpoint, EndpointAddr, RelayMap, RelayMode, RelayUrl, SecretKey};
+use iroh::{Endpoint, RelayMap, RelayMode, RelayUrl, SecretKey};
+use iroh_tickets::endpoint::EndpointTicket;
 use js_sys::{Array, Uint8Array};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -119,20 +120,21 @@ impl WasmEndpoint {
         // Wait for endpoint to be online (connected to relay)
         self.endpoint.online().await;
 
-        // Get endpoint address
+        // Get endpoint address and wrap in ticket
         let endpoint_addr = self.endpoint.addr();
+        let ticket = EndpointTicket::new(endpoint_addr);
 
-        // Serialize to JSON for sharing
-        serde_json::to_string(&endpoint_addr)
-            .map_err(|e| JsValue::from_str(&format!("Failed to serialize ticket: {}", e)))
+        // Serialize to standard iroh ticket format (endpoint<base32>)
+        Ok(ticket.to_string())
     }
 
     /// Connect to a peer using their ticket.
     #[wasm_bindgen(js_name = connectWithTicket)]
-    pub async fn connect_with_ticket(&self, ticket: String) -> Result<WasmConnection, JsValue> {
-        // Parse ticket (JSON) to get EndpointAddr
-        let endpoint_addr: EndpointAddr = serde_json::from_str(&ticket)
+    pub async fn connect_with_ticket(&self, ticket_str: String) -> Result<WasmConnection, JsValue> {
+        // Parse standard iroh ticket format
+        let ticket: EndpointTicket = ticket_str.parse()
             .map_err(|e| JsValue::from_str(&format!("Invalid ticket: {}", e)))?;
+        let endpoint_addr = ticket.endpoint_addr().clone();
 
         let remote_endpoint_id = endpoint_addr.id.to_string();
 

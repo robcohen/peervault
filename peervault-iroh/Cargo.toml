@@ -1,7 +1,7 @@
 [package]
 name = "peervault-iroh"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 description = "WASM bindings for Iroh P2P networking in PeerVault"
 
 [lib]
@@ -10,6 +10,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # Iroh for P2P networking (default-features = false for WASM compatibility)
 iroh = { version = "0.95", default-features = false }
+iroh-tickets = "0.2"
 
 # WASM bindings - pin exact version to match iroh-examples/browser-echo
 wasm-bindgen = "=0.2.105"
