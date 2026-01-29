@@ -525,49 +525,77 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
     // --- Connect to Another Device ---
     section.createEl("div", { cls: "peervault-section-divider" });
 
-    new Setting(section)
-      .setName("Connect to Device")
-      .setDesc("Paste their invite ticket");
-
-    // Ticket input
-    const ticketSetting = new Setting(section);
-    ticketSetting.controlEl.style.flexDirection = "column";
-    ticketSetting.controlEl.style.alignItems = "stretch";
-
-    const ticketInput = ticketSetting.controlEl.createEl("textarea", {
-      cls: "peervault-ticket-input",
-      attr: { placeholder: "Paste ticket here...", rows: "2" },
-    });
-    ticketInput.value = this.ticketInput;
-    ticketInput.oninput = () => {
-      this.ticketInput = ticketInput.value.trim();
+    const isValidTicket = (ticket: string): boolean => {
+      // Iroh tickets are base32 encoded, typically 100+ chars
+      if (!ticket || ticket.length < 50) return false;
+      return /^[A-Za-z2-7]+$/.test(ticket);
     };
 
-    // Connect button
-    new Setting(section).addButton((btn) =>
-      btn
-        .setButtonText("Connect")
-        .setCta()
-        .onClick(async () => {
-          if (!this.ticketInput) {
-            new Notice("Please paste a ticket first");
-            return;
-          }
+    // Ticket input with validation
+    const ticketInput = section.createEl("input", {
+      cls: "peervault-ticket-input-compact",
+      attr: {
+        type: "text",
+        placeholder: "Paste invite ticket...",
+        spellcheck: "false",
+      },
+    });
+    ticketInput.value = this.ticketInput;
+
+    // Initial validation state
+    if (this.ticketInput) {
+      ticketInput.addClass(isValidTicket(this.ticketInput) ? "valid" : "invalid");
+    }
+
+    let connectBtn: HTMLButtonElement;
+
+    const updateValidation = () => {
+      const ticket = ticketInput.value.trim();
+      this.ticketInput = ticket;
+      ticketInput.removeClass("valid", "invalid");
+      if (ticket) {
+        ticketInput.addClass(isValidTicket(ticket) ? "valid" : "invalid");
+      }
+      connectBtn.disabled = !isValidTicket(ticket);
+    };
+
+    ticketInput.oninput = updateValidation;
+
+    // Buttons: Paste + Connect
+    new Setting(section)
+      .addButton((btn) =>
+        btn.setButtonText("Paste").onClick(async () => {
           try {
-            btn.setButtonText("Connecting...");
-            btn.setDisabled(true);
-            await this.plugin.addPeer(this.ticketInput);
-            new Notice("Device connected!");
-            this.ticketInput = "";
-            this.showAddDevice = false;
-            this.display();
-          } catch (error) {
-            new Notice(`Connection failed: ${error}`);
-            btn.setButtonText("Connect");
-            btn.setDisabled(false);
+            const text = await navigator.clipboard.readText();
+            ticketInput.value = text.trim();
+            updateValidation();
+          } catch {
+            new Notice("Could not read clipboard");
           }
         }),
-    );
+      )
+      .addButton((btn) => {
+        connectBtn = btn.buttonEl;
+        btn
+          .setButtonText("Connect")
+          .setCta()
+          .setDisabled(!isValidTicket(this.ticketInput))
+          .onClick(async () => {
+            try {
+              btn.setButtonText("Connecting...");
+              btn.setDisabled(true);
+              await this.plugin.addPeer(this.ticketInput);
+              new Notice("Device connected!");
+              this.ticketInput = "";
+              this.showAddDevice = false;
+              this.display();
+            } catch (error) {
+              new Notice(`Connection failed: ${error}`);
+              btn.setButtonText("Connect");
+              updateValidation();
+            }
+          });
+      });
 
     // Scan QR option
     section.createEl("div", { cls: "peervault-section-divider" });
