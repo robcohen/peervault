@@ -510,6 +510,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
         this.handleSyncError(peer.nodeId);
       } else if (state === "closed") {
         this.updatePeerState(peer.nodeId, "offline");
+        this.handleSyncError(peer.nodeId, true); // Reconnect on clean disconnect
       }
     });
 
@@ -565,8 +566,10 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
         this.updatePeerState(peer.nodeId, "synced");
       } else if (state === "error") {
         this.updatePeerState(peer.nodeId, "error");
+        this.handleSyncError(peer.nodeId);
       } else if (state === "closed") {
         this.updatePeerState(peer.nodeId, "offline");
+        this.handleSyncError(peer.nodeId, true); // Reconnect on clean disconnect
       }
     });
 
@@ -590,21 +593,31 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     await session.handleIncomingSync(stream);
   }
 
-  private handleSyncError(nodeId: string): void {
+  private handleSyncError(nodeId: string, isCleanDisconnect = false): void {
     if (!this.config.autoReconnect) return;
 
-    const attempts = (this.reconnectAttempts.get(nodeId) ?? 0) + 1;
-    this.reconnectAttempts.set(nodeId, attempts);
+    // Only increment counter for errors, not clean disconnects
+    // This prevents sleep/wake cycles from exhausting retry limit
+    const attempts = isCleanDisconnect
+      ? (this.reconnectAttempts.get(nodeId) ?? 0)
+      : (this.reconnectAttempts.get(nodeId) ?? 0) + 1;
+
+    if (!isCleanDisconnect) {
+      this.reconnectAttempts.set(nodeId, attempts);
+    }
 
     if (attempts > this.config.maxReconnectAttempts) {
       this.logger.warn(`Max reconnect attempts reached for peer: ${nodeId}`);
       return;
     }
 
-    // Exponential backoff, capped at 30s
-    const delay = Math.min(this.config.reconnectBackoff * Math.pow(2, attempts - 1), 30000);
+    // Exponential backoff for errors, fixed 5s delay for clean disconnects
+    const delay = isCleanDisconnect
+      ? 5000
+      : Math.min(this.config.reconnectBackoff * Math.pow(2, attempts - 1), 30000);
+
     this.logger.info(
-      `Reconnecting to ${nodeId} in ${delay}ms (attempt ${attempts})`,
+      `Reconnecting to ${nodeId} in ${delay}ms${isCleanDisconnect ? ' (clean disconnect)' : ` (attempt ${attempts})`}`,
     );
 
     setTimeout(() => {
