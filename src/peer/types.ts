@@ -95,6 +95,9 @@ export interface PeerManagerConfig {
   /** Reconnect backoff base (ms) */
   reconnectBackoff?: number;
 
-  /** Our device hostname to share with peers */
-  hostname?: string;
+  /** Our device hostname (required, from system) */
+  hostname: string;
+
+  /** Our device nickname (optional, user-defined) */
+  nickname?: string;
 }

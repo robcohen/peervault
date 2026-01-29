@@ -331,7 +331,11 @@ export class ConnectionStatusModal extends Modal {
 
       // Name
       const name = item.createSpan({ cls: "peervault-peer-name" });
-      name.setText(peer.nickname ?? peer.hostname ?? peer.nodeId.substring(0, 8) + "...");
+      name.setText(
+        peer.hostname
+          ? (peer.nickname ? `${peer.hostname} (${peer.nickname})` : peer.hostname)
+          : peer.nodeId.substring(0, 8) + "...",
+      );
 
       // State
       const state = item.createSpan({

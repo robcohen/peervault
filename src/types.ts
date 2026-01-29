@@ -260,6 +260,8 @@ export interface PeerVaultSettings {
   gcMinHistoryDays: number;
   /** Require peer consensus before GC (default: true) */
   gcRequirePeerConsensus: boolean;
+  /** User-defined nickname for this device (optional) */
+  deviceNickname?: string;
 }
 
 export const DEFAULT_SETTINGS: PeerVaultSettings = {

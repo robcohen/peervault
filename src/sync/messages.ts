@@ -126,26 +126,26 @@ export function deserializeMessage(data: Uint8Array): AnySyncMessage {
  * - bytes: vaultId (UTF-8)
  * - u32: versionBytes length
  * - bytes: versionBytes
- * - u32: ticket length (0 if no ticket, for backward compat)
- * - bytes: ticket (UTF-8, optional)
- * - u16: hostname length (0 if none, for backward compat)
- * - bytes: hostname (UTF-8, optional)
+ * - u32: ticket length
+ * - bytes: ticket (UTF-8)
+ * - u16: hostname length
+ * - bytes: hostname (UTF-8)
+ * - u16: nickname length (0 if none)
+ * - bytes: nickname (UTF-8, optional)
  */
 function serializeVersionInfo(msg: VersionInfoMessage): Uint8Array {
   const vaultIdBytes = TEXT_ENCODER.encode(msg.vaultId);
-  const ticketBytes = msg.ticket ? TEXT_ENCODER.encode(msg.ticket) : null;
-  const hostnameBytes = msg.hostname ? TEXT_ENCODER.encode(msg.hostname) : null;
+  const ticketBytes = TEXT_ENCODER.encode(msg.ticket);
+  const hostnameBytes = TEXT_ENCODER.encode(msg.hostname);
+  const nicknameBytes = msg.nickname ? TEXT_ENCODER.encode(msg.nickname) : null;
   const totalLength =
     1 +
     8 +
-    4 +
-    vaultIdBytes.length +
-    4 +
-    msg.versionBytes.length +
-    4 +
-    (ticketBytes?.length || 0) +
-    2 +
-    (hostnameBytes?.length || 0);
+    4 + vaultIdBytes.length +
+    4 + msg.versionBytes.length +
+    4 + ticketBytes.length +
+    2 + hostnameBytes.length +
+    2 + (nicknameBytes?.length || 0);
 
   const buffer = new ArrayBuffer(totalLength);
   const view = new DataView(buffer);
@@ -166,19 +166,20 @@ function serializeVersionInfo(msg: VersionInfoMessage): Uint8Array {
   bytes.set(msg.versionBytes, offset);
   offset += msg.versionBytes.length;
 
-  // Ticket (optional, for bidirectional reconnection)
-  view.setUint32(offset, ticketBytes?.length || 0, false);
+  view.setUint32(offset, ticketBytes.length, false);
   offset += 4;
-  if (ticketBytes) {
-    bytes.set(ticketBytes, offset);
-    offset += ticketBytes.length;
-  }
+  bytes.set(ticketBytes, offset);
+  offset += ticketBytes.length;
 
-  // Hostname (optional, for display)
-  view.setUint16(offset, hostnameBytes?.length || 0, false);
+  view.setUint16(offset, hostnameBytes.length, false);
   offset += 2;
-  if (hostnameBytes) {
-    bytes.set(hostnameBytes, offset);
+  bytes.set(hostnameBytes, offset);
+  offset += hostnameBytes.length;
+
+  view.setUint16(offset, nicknameBytes?.length || 0, false);
+  offset += 2;
+  if (nicknameBytes) {
+    bytes.set(nicknameBytes, offset);
   }
 
   return bytes;
@@ -201,26 +202,21 @@ function deserializeVersionInfo(
   const versionBytes = data.slice(offset, offset + versionBytesLen);
   offset += versionBytesLen;
 
-  // Ticket (optional, for backward compat with older clients)
-  let ticket: string | undefined;
-  if (offset + 4 <= data.length) {
-    const ticketLen = view.getUint32(offset, false);
-    offset += 4;
-    if (ticketLen > 0 && offset + ticketLen <= data.length) {
-      ticket = TEXT_DECODER.decode(data.slice(offset, offset + ticketLen));
-      offset += ticketLen;
-    }
-  }
+  const ticketLen = view.getUint32(offset, false);
+  offset += 4;
+  const ticket = TEXT_DECODER.decode(data.slice(offset, offset + ticketLen));
+  offset += ticketLen;
 
-  // Hostname (optional, for backward compat with older clients)
-  let hostname: string | undefined;
-  if (offset + 2 <= data.length) {
-    const hostnameLen = view.getUint16(offset, false);
-    offset += 2;
-    if (hostnameLen > 0 && offset + hostnameLen <= data.length) {
-      hostname = TEXT_DECODER.decode(data.slice(offset, offset + hostnameLen));
-    }
-  }
+  const hostnameLen = view.getUint16(offset, false);
+  offset += 2;
+  const hostname = TEXT_DECODER.decode(data.slice(offset, offset + hostnameLen));
+  offset += hostnameLen;
+
+  const nicknameLen = view.getUint16(offset, false);
+  offset += 2;
+  const nickname = nicknameLen > 0
+    ? TEXT_DECODER.decode(data.slice(offset, offset + nicknameLen))
+    : undefined;
 
   return {
     type: SyncMessageType.VERSION_INFO,
@@ -229,6 +225,7 @@ function deserializeVersionInfo(
     versionBytes,
     ticket,
     hostname,
+    nickname,
   };
 }
 
@@ -591,8 +588,9 @@ function deserializeError(data: Uint8Array, timestamp: number): ErrorMessage {
 export function createVersionInfoMessage(
   vaultId: string,
   versionBytes: Uint8Array,
-  ticket?: string,
-  hostname?: string,
+  ticket: string,
+  hostname: string,
+  nickname?: string,
 ): VersionInfoMessage {
   return {
     type: SyncMessageType.VERSION_INFO,
@@ -601,6 +599,7 @@ export function createVersionInfoMessage(
     versionBytes,
     ticket,
     hostname,
+    nickname,
   };
 }
 

@@ -24,7 +24,7 @@ import { PeerErrors } from "../errors";
 
 const PEERS_STORAGE_KEY = "peervault-peers";
 
-const DEFAULT_CONFIG: Omit<Required<PeerManagerConfig>, "hostname"> = {
+const DEFAULT_CONFIG: Omit<Required<PeerManagerConfig>, "hostname" | "nickname"> = {
   autoSyncInterval: 60000, // 1 minute
   autoReconnect: true,
   maxReconnectAttempts: 10,
@@ -51,7 +51,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   private sessions = new Map<string, SyncSession>();
   private reconnectAttempts = new Map<string, number>();
   private pendingPairingRequests = new Map<string, { request: PairingRequest; connection: PeerConnection }>();
-  private config: Omit<Required<PeerManagerConfig>, "hostname"> & { hostname?: string };
+  private config: Omit<Required<PeerManagerConfig>, "hostname" | "nickname"> & { hostname: string; nickname?: string };
   private autoSyncTimer: ReturnType<typeof setInterval> | null = null;
   private status: "idle" | "syncing" | "offline" | "error" = "idle";
   private groupManager!: PeerGroupManager;
@@ -61,7 +61,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     private documentManager: DocumentManager,
     private storage: StorageAdapter,
     private logger: Logger,
-    config?: PeerManagerConfig,
+    config: PeerManagerConfig,
     private blobStore?: BlobStore,
   ) {
     super();
@@ -517,7 +517,12 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       peer.nodeId,
       this.documentManager,
       this.logger,
-      { peerIsReadOnly: syncPolicy.readOnly, ourTicket, ourHostname: this.config.hostname },
+      {
+        peerIsReadOnly: syncPolicy.readOnly,
+        ourTicket,
+        ourHostname: this.config.hostname,
+        ourNickname: this.config.nickname,
+      },
       this.blobStore,
     );
 
@@ -553,12 +558,13 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       );
     });
 
-    // Store peer's hostname when received (for display)
-    session.on("hostname:received", (hostname) => {
-      this.logger.debug(`Received hostname from peer ${peer.nodeId.slice(0, 8)}: ${hostname}`);
+    // Store peer's info when received (for display)
+    session.on("peer:info", ({ hostname, nickname }) => {
+      this.logger.debug(`Received info from peer ${peer.nodeId.slice(0, 8)}: ${hostname}${nickname ? ` (${nickname})` : ""}`);
       peer.hostname = hostname;
+      peer.nickname = nickname;
       this.savePeers().catch((err) =>
-        this.logger.error("Failed to save peer hostname:", err),
+        this.logger.error("Failed to save peer info:", err),
       );
     });
 
@@ -605,7 +611,13 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       peer.nodeId,
       this.documentManager,
       this.logger,
-      { peerIsReadOnly: syncPolicy.readOnly, allowVaultAdoption: isFirstSync, ourTicket, ourHostname: this.config.hostname },
+      {
+        peerIsReadOnly: syncPolicy.readOnly,
+        allowVaultAdoption: isFirstSync,
+        ourTicket,
+        ourHostname: this.config.hostname,
+        ourNickname: this.config.nickname,
+      },
       this.blobStore,
     );
 
@@ -639,12 +651,13 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       );
     });
 
-    // Store peer's hostname when received (for display)
-    session.on("hostname:received", (hostname) => {
-      this.logger.debug(`Received hostname from peer ${peer.nodeId.slice(0, 8)}: ${hostname}`);
+    // Store peer's info when received (for display)
+    session.on("peer:info", ({ hostname, nickname }) => {
+      this.logger.debug(`Received info from peer ${peer.nodeId.slice(0, 8)}: ${hostname}${nickname ? ` (${nickname})` : ""}`);
       peer.hostname = hostname;
+      peer.nickname = nickname;
       this.savePeers().catch((err) =>
-        this.logger.error("Failed to save peer hostname:", err),
+        this.logger.error("Failed to save peer info:", err),
       );
     });
 

@@ -4,7 +4,8 @@
  * Main plugin entry point.
  */
 
-import { Plugin, Notice } from "obsidian";
+import { Plugin, Notice, Platform } from "obsidian";
+import * as os from "os";
 import type { PeerVaultSettings, SyncStatus, PeerInfo } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
 import { DocumentManager, waitForLoroWasm } from "./core/document-manager";
@@ -166,6 +167,9 @@ export default class PeerVaultPlugin extends Plugin {
     await this.transport.initialize();
 
     // Initialize peer manager with blob store for binary sync
+    // Get hostname - on mobile, os.hostname() returns empty string, so use platform name
+    const hostname = os.hostname() || (Platform.isMobile ? "Mobile Device" : "Desktop");
+
     this.peerManager = new PeerManager(
       this.transport,
       this.documentManager,
@@ -174,6 +178,8 @@ export default class PeerVaultPlugin extends Plugin {
       {
         autoSyncInterval: this.settings.syncInterval * 1000,
         autoReconnect: true,
+        hostname,
+        nickname: this.settings.deviceNickname,
       },
       this.blobStore,
     );
@@ -202,7 +208,9 @@ export default class PeerVaultPlugin extends Plugin {
 
       // Get peer info for notification
       const peer = this.peerManager.getPeers().find((p) => p.nodeId === nodeId);
-      const peerName = peer?.nickname ?? peer?.hostname ?? "Unknown Device";
+      const peerName = peer?.hostname
+        ? (peer.nickname ? `${peer.hostname} (${peer.nickname})` : peer.hostname)
+        : "Unknown Device";
 
       // Record edits for conflict tracking
       const tracker = getConflictTracker();

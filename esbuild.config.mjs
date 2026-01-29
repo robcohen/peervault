@@ -214,7 +214,7 @@ const config = {
   platform: 'browser',  // Browser platform for mobile compatibility
   format: 'cjs',
   target: 'es2020',
-  external: ['obsidian', 'electron', '@codemirror/*', '@lezer/*'],
+  external: ['obsidian', 'electron', '@codemirror/*', '@lezer/*', 'os'],
   sourcemap: isWatch ? 'inline' : false,
   minify: !isWatch,
   treeShaking: true,

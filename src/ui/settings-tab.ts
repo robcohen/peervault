@@ -4,7 +4,8 @@
  * Plugin settings UI for PeerVault configuration.
  */
 
-import { App, PluginSettingTab, Setting, Notice } from "obsidian";
+import { App, PluginSettingTab, Setting, Notice, Platform } from "obsidian";
+import * as os from "os";
 import type PeerVaultPlugin from "../main";
 import { getEncryptionService } from "../crypto";
 import { getConflictTracker } from "../core/conflict-tracker";
@@ -188,6 +189,34 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
           }),
       );
 
+    // Device hostname (from system, not editable)
+    const hostname = os.hostname() || (Platform.isMobile ? "Mobile Device" : "Desktop");
+    new Setting(container)
+      .setName("Hostname")
+      .setDesc("Your device's system hostname (shared with peers)")
+      .addText((text) => {
+        text.setValue(hostname);
+        text.setDisabled(true);
+      });
+
+    // Device nickname (user-defined, optional)
+    new Setting(container)
+      .setName("Device nickname")
+      .setDesc("Optional friendly name shown to other devices")
+      .addText((text) => {
+        text
+          .setPlaceholder("e.g., Work Laptop")
+          .setValue(this.plugin.settings.deviceNickname ?? "")
+          .onChange(async (value) => {
+            this.plugin.settings.deviceNickname = value || undefined;
+            await this.plugin.saveSettings();
+            // Update peer manager config
+            if (this.plugin.peerManager) {
+              (this.plugin.peerManager as any).config.nickname = value || undefined;
+            }
+          });
+      });
+
     // Vault ID
     new Setting(container)
       .setName("Vault ID")
@@ -271,7 +300,9 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
           peer.connectionState.charAt(0).toUpperCase() +
           peer.connectionState.slice(1);
 
-        const displayName = peer.nickname ?? peer.hostname ?? "Unknown Device";
+        const displayName = peer.hostname
+          ? (peer.nickname ? `${peer.hostname} (${peer.nickname})` : peer.hostname)
+          : "Unknown Device";
         new Setting(container)
           .setName(`${stateIcon} ${displayName}`)
           .setDesc(`${stateText} • ${peer.nodeId.substring(0, 8)}...`)
