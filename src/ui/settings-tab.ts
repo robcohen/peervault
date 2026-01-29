@@ -527,9 +527,13 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
 
     const isValidTicket = (ticket: string): boolean => {
       if (!ticket || ticket.length < 20) return false;
-      // Standard iroh ticket format: endpoint<base32>
-      // Base32 uses A-Z and 2-7, lowercase allowed
-      return /^endpoint[a-z2-7]+$/i.test(ticket);
+      // JSON format with id and addrs fields
+      try {
+        const parsed = JSON.parse(ticket);
+        return typeof parsed.id === "string" && parsed.id.length > 0 && Array.isArray(parsed.addrs);
+      } catch {
+        return false;
+      }
     };
 
     // Ticket input with validation
