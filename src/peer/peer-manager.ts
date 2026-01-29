@@ -134,7 +134,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   /**
    * Add a new peer using their connection ticket.
    */
-  async addPeer(ticket: string, nickname?: string): Promise<PeerInfo> {
+  async addPeer(ticket: string): Promise<PeerInfo> {
     try {
       this.setStatus("syncing");
 
@@ -147,13 +147,11 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       if (peer) {
         // Update existing peer
         peer.ticket = ticket;
-        if (nickname) peer.nickname = nickname;
         peer.lastSeen = Date.now();
       } else {
-        // Create new peer
+        // Create new peer (hostname/nickname will be received during sync)
         peer = {
           nodeId,
-          nickname,
           state: "connecting",
           ticket,
           firstSeen: Date.now(),

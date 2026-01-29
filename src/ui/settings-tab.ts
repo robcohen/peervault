@@ -28,7 +28,6 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
   private showAddDevice = false;
   private myTicket = "";
   private ticketInput = "";
-  private nameInput = "";
 
   constructor(app: App, plugin: PeerVaultPlugin) {
     super(app, plugin);
@@ -414,39 +413,31 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
       this.ticketInput = ticketInput.value.trim();
     };
 
-    // Name input + Connect button
-    new Setting(section)
-      .setName("Device name (optional)")
-      .addText((text) =>
-        text.setPlaceholder("e.g., Phone").onChange((value) => {
-          this.nameInput = value.trim();
+    // Connect button
+    new Setting(section).addButton((btn) =>
+      btn
+        .setButtonText("Connect")
+        .setCta()
+        .onClick(async () => {
+          if (!this.ticketInput) {
+            new Notice("Please paste a ticket first");
+            return;
+          }
+          try {
+            btn.setButtonText("Connecting...");
+            btn.setDisabled(true);
+            await this.plugin.addPeer(this.ticketInput);
+            new Notice("Device connected!");
+            this.ticketInput = "";
+            this.showAddDevice = false;
+            this.display();
+          } catch (error) {
+            new Notice(`Connection failed: ${error}`);
+            btn.setButtonText("Connect");
+            btn.setDisabled(false);
+          }
         }),
-      )
-      .addButton((btn) =>
-        btn
-          .setButtonText("Connect")
-          .setCta()
-          .onClick(async () => {
-            if (!this.ticketInput) {
-              new Notice("Please paste a ticket first");
-              return;
-            }
-            try {
-              btn.setButtonText("Connecting...");
-              btn.setDisabled(true);
-              await this.plugin.addPeer(this.ticketInput, this.nameInput || undefined);
-              new Notice("Device connected!");
-              this.ticketInput = "";
-              this.nameInput = "";
-              this.showAddDevice = false;
-              this.display();
-            } catch (error) {
-              new Notice(`Connection failed: ${error}`);
-              btn.setButtonText("Connect");
-              btn.setDisabled(false);
-            }
-          }),
-      );
+    );
 
     // Scan QR option
     section.createEl("div", { cls: "peervault-section-divider" });

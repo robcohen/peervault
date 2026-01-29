@@ -585,12 +585,12 @@ export default class PeerVaultPlugin extends Plugin {
   /**
    * Add a peer using a connection ticket.
    */
-  async addPeer(ticket: string, name?: string): Promise<void> {
+  async addPeer(ticket: string): Promise<void> {
     if (!this.peerManager) {
       throw ConfigErrors.invalid("peerManager", "Peer manager not initialized");
     }
 
-    await this.peerManager.addPeer(ticket, name);
+    await this.peerManager.addPeer(ticket);
   }
 
   /**

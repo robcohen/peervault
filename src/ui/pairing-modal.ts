@@ -16,7 +16,6 @@ export class PairingModal extends Modal {
   plugin: PeerVaultPlugin;
   private activeTab: PairingTab;
   private ticketInput = "";
-  private nameInput = "";
   private myTicket = "";
   private isGenerating = false;
 
@@ -254,16 +253,6 @@ export class PairingModal extends Modal {
       await this.pasteFromClipboard();
     };
 
-    // Device name input for after scanning
-    const nameSection = container.createDiv({ cls: "peervault-name-section" });
-    new Setting(nameSection)
-      .setName("Device Name")
-      .setDesc("Optional name for the device you're connecting to")
-      .addText((text) =>
-        text.setPlaceholder("e.g., Phone").onChange((value) => {
-          this.nameInput = value.trim();
-        }),
-      );
   }
 
   private async processQRImage(file: File): Promise<void> {
@@ -379,15 +368,6 @@ export class PairingModal extends Modal {
       );
 
     new Setting(container)
-      .setName("Device Name")
-      .setDesc("Optional friendly name for this device")
-      .addText((text) =>
-        text.setPlaceholder("e.g., Work Laptop").onChange((value) => {
-          this.nameInput = value.trim();
-        }),
-      );
-
-    new Setting(container)
       .addButton((btn) =>
         btn.setButtonText("Cancel").onClick(() => {
           this.close();
@@ -415,7 +395,7 @@ export class PairingModal extends Modal {
 
     try {
       new Notice("Connecting to peer...");
-      await this.plugin.addPeer(this.ticketInput, this.nameInput || undefined);
+      await this.plugin.addPeer(this.ticketInput);
       new Notice("Device connected successfully!");
       this.close();
     } catch (error) {
