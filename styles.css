@@ -1295,3 +1295,39 @@
   color: var(--color-red);
   font-size: 12px;
 }
+
+/* ===========================================================================
+   Camera Scanner Modal
+   =========================================================================== */
+
+.peervault-camera-modal {
+  padding: 0;
+}
+
+.peervault-camera-instructions {
+  color: var(--text-muted);
+  margin-bottom: 16px;
+}
+
+.peervault-camera-container {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  background: var(--background-secondary);
+  border-radius: 8px;
+  overflow: hidden;
+  margin-bottom: 16px;
+  min-height: 300px;
+}
+
+.peervault-camera-video {
+  max-width: 100%;
+  max-height: 400px;
+  border-radius: 8px;
+}
+
+.peervault-camera-status {
+  text-align: center;
+  color: var(--text-muted);
+  margin-bottom: 16px;
+}

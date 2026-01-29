@@ -4,7 +4,7 @@
  * Plugin settings UI for PeerVault configuration.
  */
 
-import { App, PluginSettingTab, Setting, Notice } from "obsidian";
+import { App, Platform, PluginSettingTab, Setting, Notice, Modal } from "obsidian";
 import type PeerVaultPlugin from "../main";
 import { getDeviceHostname, nodeIdToWords } from "../utils/device";
 import { getConflictTracker } from "../core/conflict-tracker";
@@ -572,14 +572,25 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
     // Scan QR option
     section.createEl("div", { cls: "peervault-section-divider" });
 
-    new Setting(section)
+    const scanSetting = new Setting(section)
       .setName("Scan QR Code")
-      .setDesc("Upload an image containing a QR code")
-      .addButton((btn) =>
-        btn.setButtonText("Choose Image").onClick(() => {
-          this.openQRScanner();
+      .setDesc(Platform.isDesktop ? "Use camera or upload an image" : "Upload an image containing a QR code");
+
+    // Camera button (desktop only)
+    if (Platform.isDesktop) {
+      scanSetting.addButton((btn) =>
+        btn.setButtonText("Use Camera").onClick(() => {
+          this.openCameraScanner();
         }),
       );
+    }
+
+    // File picker button (all platforms)
+    scanSetting.addButton((btn) =>
+      btn.setButtonText("Choose Image").onClick(() => {
+        this.openQRScanner();
+      }),
+    );
   }
 
   private async generateQRCode(container: HTMLElement, data: string): Promise<void> {
@@ -660,6 +671,15 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
       };
       img.src = objectUrl;
     });
+  }
+
+  private openCameraScanner(): void {
+    const modal = new CameraScannerModal(this.app, (ticket) => {
+      this.ticketInput = ticket;
+      this.showAddDevice = true;
+      this.display();
+    });
+    modal.open();
   }
 
   private renderSyncSection(container: HTMLElement): void {
@@ -1054,6 +1074,131 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
         return STATUS_ICONS.offline;
       default:
         return STATUS_ICONS.idle;
+    }
+  }
+}
+
+/**
+ * Modal for scanning QR codes using the device camera (desktop only).
+ */
+class CameraScannerModal extends Modal {
+  private stream: MediaStream | null = null;
+  private video: HTMLVideoElement | null = null;
+  private canvas: HTMLCanvasElement | null = null;
+  private scanInterval: ReturnType<typeof setInterval> | null = null;
+
+  constructor(
+    app: App,
+    private onScan: (ticket: string) => void,
+  ) {
+    super(app);
+  }
+
+  override async onOpen(): Promise<void> {
+    const { contentEl } = this;
+    contentEl.addClass("peervault-camera-modal");
+
+    contentEl.createEl("h2", { text: "Scan QR Code" });
+    contentEl.createEl("p", {
+      text: "Point your camera at a PeerVault QR code",
+      cls: "peervault-camera-instructions",
+    });
+
+    // Video container
+    const videoContainer = contentEl.createDiv({ cls: "peervault-camera-container" });
+
+    // Create video element
+    this.video = videoContainer.createEl("video", {
+      cls: "peervault-camera-video",
+      attr: { autoplay: "", playsinline: "" },
+    });
+
+    // Hidden canvas for frame capture
+    this.canvas = document.createElement("canvas");
+
+    // Status text
+    const statusEl = contentEl.createEl("p", {
+      text: "Starting camera...",
+      cls: "peervault-camera-status",
+    });
+
+    // Close button
+    new Setting(contentEl).addButton((btn) =>
+      btn.setButtonText("Cancel").onClick(() => this.close()),
+    );
+
+    // Start camera
+    try {
+      this.stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
+      });
+      this.video.srcObject = this.stream;
+      await this.video.play();
+      statusEl.setText("Scanning for QR code...");
+
+      // Start scanning
+      this.startScanning();
+    } catch (error) {
+      statusEl.setText(`Camera error: ${error}`);
+      statusEl.addClass("peervault-error-text");
+    }
+  }
+
+  override onClose(): void {
+    this.stopScanning();
+    this.stopCamera();
+    this.contentEl.empty();
+  }
+
+  private startScanning(): void {
+    if (!this.video || !this.canvas) return;
+
+    const ctx = this.canvas.getContext("2d");
+    if (!ctx) return;
+
+    this.scanInterval = setInterval(async () => {
+      if (!this.video || this.video.readyState !== this.video.HAVE_ENOUGH_DATA) {
+        return;
+      }
+
+      // Set canvas size to video size
+      this.canvas!.width = this.video.videoWidth;
+      this.canvas!.height = this.video.videoHeight;
+
+      // Draw video frame to canvas
+      ctx.drawImage(this.video, 0, 0);
+
+      // Get image data and scan for QR
+      const imageData = ctx.getImageData(0, 0, this.canvas!.width, this.canvas!.height);
+
+      try {
+        const jsQR = (await import("jsqr")).default;
+        const code = jsQR(imageData.data, imageData.width, imageData.height);
+
+        if (code && code.data) {
+          new Notice("QR code detected!");
+          this.onScan(code.data);
+          this.close();
+        }
+      } catch {
+        // jsQR import failed, ignore
+      }
+    }, 200); // Scan every 200ms
+  }
+
+  private stopScanning(): void {
+    if (this.scanInterval) {
+      clearInterval(this.scanInterval);
+      this.scanInterval = null;
+    }
+  }
+
+  private stopCamera(): void {
+    if (this.stream) {
+      for (const track of this.stream.getTracks()) {
+        track.stop();
+      }
+      this.stream = null;
     }
   }
 }
