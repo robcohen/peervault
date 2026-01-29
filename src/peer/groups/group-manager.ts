@@ -352,6 +352,20 @@ export class PeerGroupManager extends EventEmitter<PeerGroupEvents> {
   }
 
   /**
+   * Remove a peer from all groups.
+   */
+  removePeerFromAllGroups(peerId: string): void {
+    for (const group of this.getGroups()) {
+      if (group.peerIds.includes(peerId)) {
+        const newPeerIds = group.peerIds.filter((id) => id !== peerId);
+        this.updateGroup(group.id, { peerIds: newPeerIds });
+        this.logger.debug("Removed peer from group:", peerId, group.id);
+        this.emit("peer:removed-from-group", { groupId: group.id, peerId });
+      }
+    }
+  }
+
+  /**
    * Get all peers that belong to any group.
    */
   getAllGroupedPeers(): string[] {

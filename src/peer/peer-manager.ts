@@ -188,6 +188,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
 
     this.peers.delete(nodeId);
     this.reconnectAttempts.delete(nodeId);
+    this.groupManager.removePeerFromAllGroups(nodeId);
 
     await this.savePeers();
     this.emit("peer:disconnected", { nodeId, reason: "removed" });
@@ -207,6 +208,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
 
     this.peers.delete(nodeId);
     this.reconnectAttempts.delete(nodeId);
+    this.groupManager.removePeerFromAllGroups(nodeId);
 
     await this.savePeers();
     this.emit("peer:disconnected", { nodeId, reason: "removed by peer" });
