@@ -25,10 +25,10 @@ import { PeerErrors } from "../errors";
 const PEERS_STORAGE_KEY = "peervault-peers";
 
 const DEFAULT_CONFIG: Omit<Required<PeerManagerConfig>, "hostname" | "nickname"> = {
-  autoSyncInterval: 60000, // 1 minute
+  autoSyncInterval: 30000, // Reduced from 60s for more frequent sync checks
   autoReconnect: true,
   maxReconnectAttempts: 10,
-  reconnectBackoff: 1000,
+  reconnectBackoff: 500, // Reduced from 1000 for faster reconnection
 };
 
 /** Events from peer manager */

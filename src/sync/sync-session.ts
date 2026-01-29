@@ -69,7 +69,7 @@ const DEFAULT_CONFIG: Omit<Required<SyncSessionConfig>, "ourTicket" | "ourHostna
   peerIsReadOnly: boolean;
   allowVaultAdoption: boolean;
 } = {
-  pingInterval: 30000,
+  pingInterval: 15000, // Reduced from 30000 for faster stale detection
   pingTimeout: 10000,
   maxRetries: 3,
   peerIsReadOnly: false,
@@ -586,16 +586,8 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     const peerWants = (peerRequest as BlobRequestMessage).hashes;
     this.logger.debug("Peer wants:", peerWants.length);
 
-    // Send blobs peer wants
-    for (const hash of peerWants) {
-      const data = await this.blobStore.get(hash);
-      if (data) {
-        const meta = await this.blobStore.getMeta(hash);
-        await this.sendMessage(
-          createBlobDataMessage(hash, data, meta?.mimeType),
-        );
-      }
-    }
+    // Send blobs peer wants (parallel load, sequential send)
+    await this.sendBlobsParallel(peerWants);
 
     // Send blob sync complete (we're done sending)
     await this.sendMessage(createBlobSyncCompleteMessage(peerWants.length));
@@ -701,21 +693,45 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       }
     }
 
-    // Now send blobs peer wants
-    for (const hash of peerWants) {
-      const data = await this.blobStore.get(hash);
-      if (data) {
-        const meta = await this.blobStore.getMeta(hash);
-        await this.sendMessage(
-          createBlobDataMessage(hash, data, meta?.mimeType),
-        );
-      }
-    }
+    // Now send blobs peer wants (parallel load, sequential send)
+    await this.sendBlobsParallel(peerWants);
 
     // Send our blob sync complete
     await this.sendMessage(createBlobSyncCompleteMessage(peerWants.length));
 
     this.logger.debug("Blob sync complete (receiver)");
+  }
+
+  /**
+   * Send blobs with parallel disk loading for better performance.
+   * Loads blobs in batches of 4 from disk, then sends sequentially.
+   */
+  private async sendBlobsParallel(hashes: string[]): Promise<void> {
+    if (!this.blobStore || hashes.length === 0) return;
+
+    const BATCH_SIZE = 4;
+
+    for (let i = 0; i < hashes.length; i += BATCH_SIZE) {
+      const batch = hashes.slice(i, i + BATCH_SIZE);
+
+      // Load batch in parallel
+      const blobsWithData = await Promise.all(
+        batch.map(async (hash) => {
+          const data = await this.blobStore!.get(hash);
+          const meta = data ? await this.blobStore!.getMeta(hash) : null;
+          return { hash, data, mimeType: meta?.mimeType };
+        }),
+      );
+
+      // Send loaded blobs sequentially (protocol requires ordered messages)
+      for (const blob of blobsWithData) {
+        if (blob.data) {
+          await this.sendMessage(
+            createBlobDataMessage(blob.hash, blob.data, blob.mimeType),
+          );
+        }
+      }
+    }
   }
 
   // ===========================================================================
