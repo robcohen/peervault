@@ -47,6 +47,10 @@ export enum SyncMessageType {
 
   /** Blob sync complete */
   BLOB_SYNC_COMPLETE = 0x13,
+
+  // Peer management messages (0x20 range)
+  /** Notification that peer has been removed */
+  PEER_REMOVED = 0x20,
 }
 
 /** Base sync message structure */
@@ -158,6 +162,13 @@ export interface BlobSyncCompleteMessage extends SyncMessage {
   blobCount: number;
 }
 
+/** Peer removed notification message */
+export interface PeerRemovedMessage extends SyncMessage {
+  type: SyncMessageType.PEER_REMOVED;
+  /** Reason for removal (optional) */
+  reason?: string;
+}
+
 /** Sync error codes */
 export enum SyncErrorCode {
   UNKNOWN = 0,
@@ -181,7 +192,8 @@ export type AnySyncMessage =
   | BlobHashesMessage
   | BlobRequestMessage
   | BlobDataMessage
-  | BlobSyncCompleteMessage;
+  | BlobSyncCompleteMessage
+  | PeerRemovedMessage;
 
 /** Sync session state */
 export type SyncSessionState =

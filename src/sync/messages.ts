@@ -21,6 +21,7 @@ import {
   type BlobRequestMessage,
   type BlobDataMessage,
   type BlobSyncCompleteMessage,
+  type PeerRemovedMessage,
 } from "./types";
 import { SyncErrors } from "../errors";
 
@@ -58,6 +59,8 @@ export function serializeMessage(message: AnySyncMessage): Uint8Array {
       return serializeBlobData(message);
     case SyncMessageType.BLOB_SYNC_COMPLETE:
       return serializeBlobSyncComplete(message);
+    case SyncMessageType.PEER_REMOVED:
+      return serializePeerRemoved(message);
     default:
       throw SyncErrors.invalidMessage(
         (message as AnySyncMessage).type,
@@ -104,6 +107,8 @@ export function deserializeMessage(data: Uint8Array): AnySyncMessage {
       return deserializeBlobData(data, timestamp);
     case SyncMessageType.BLOB_SYNC_COMPLETE:
       return deserializeBlobSyncComplete(data, timestamp);
+    case SyncMessageType.PEER_REMOVED:
+      return deserializePeerRemoved(data, timestamp);
     default:
       throw SyncErrors.invalidMessage(type);
   }
@@ -952,5 +957,68 @@ export function createBlobSyncCompleteMessage(
     type: SyncMessageType.BLOB_SYNC_COMPLETE,
     timestamp: Date.now(),
     blobCount,
+  };
+}
+
+// ============================================================================
+// PEER_REMOVED
+// ============================================================================
+
+/**
+ * PEER_REMOVED format:
+ * - u8: type (0x20)
+ * - u64: timestamp
+ * - u16: reason length (0 if none)
+ * - bytes: reason (UTF-8, optional)
+ */
+function serializePeerRemoved(msg: PeerRemovedMessage): Uint8Array {
+  const reasonBytes = msg.reason ? TEXT_ENCODER.encode(msg.reason) : null;
+  const totalLength = 1 + 8 + 2 + (reasonBytes?.length || 0);
+
+  const buffer = new ArrayBuffer(totalLength);
+  const view = new DataView(buffer);
+  const bytes = new Uint8Array(buffer);
+  let offset = 0;
+
+  view.setUint8(offset++, msg.type);
+  view.setBigUint64(offset, BigInt(msg.timestamp), false);
+  offset += 8;
+
+  view.setUint16(offset, reasonBytes?.length || 0, false);
+  offset += 2;
+  if (reasonBytes) {
+    bytes.set(reasonBytes, offset);
+  }
+
+  return bytes;
+}
+
+function deserializePeerRemoved(
+  data: Uint8Array,
+  timestamp: number,
+): PeerRemovedMessage {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  let offset = 9; // Skip type and timestamp
+
+  const reasonLen = view.getUint16(offset, false);
+  offset += 2;
+
+  let reason: string | undefined;
+  if (reasonLen > 0 && offset + reasonLen <= data.length) {
+    reason = TEXT_DECODER.decode(data.slice(offset, offset + reasonLen));
+  }
+
+  return {
+    type: SyncMessageType.PEER_REMOVED,
+    timestamp,
+    reason,
+  };
+}
+
+export function createPeerRemovedMessage(reason?: string): PeerRemovedMessage {
+  return {
+    type: SyncMessageType.PEER_REMOVED,
+    timestamp: Date.now(),
+    reason,
   };
 }

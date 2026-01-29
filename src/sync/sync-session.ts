@@ -20,6 +20,7 @@ import {
   type BlobHashesMessage,
   type BlobRequestMessage,
   type BlobDataMessage,
+  type PeerRemovedMessage,
 } from "./types";
 import {
   serializeMessage,
@@ -34,6 +35,7 @@ import {
   createBlobRequestMessage,
   createBlobDataMessage,
   createBlobSyncCompleteMessage,
+  createPeerRemovedMessage,
 } from "./messages";
 import { EventEmitter } from "../utils/events";
 
@@ -61,7 +63,7 @@ export interface SyncSessionConfig {
   ourTicket?: string;
 }
 
-const DEFAULT_CONFIG: Omit<Required<SyncSessionConfig>, "encryption"> & {
+const DEFAULT_CONFIG: Omit<Required<SyncSessionConfig>, "encryption" | "ourTicket"> & {
   peerIsReadOnly: boolean;
   allowVaultAdoption: boolean;
 } = {
@@ -77,6 +79,7 @@ interface SyncSessionEvents extends Record<string, unknown> {
   "state:change": SyncSessionState;
   "sync:complete": void;
   "ticket:received": string;
+  "peer:removed": string | undefined; // reason
   error: Error;
 }
 
@@ -88,8 +91,9 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
   private stream: SyncStream | null = null;
   private pingSeq = 0;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
-  private config: Omit<Required<SyncSessionConfig>, "encryption"> & {
+  private config: Omit<Required<SyncSessionConfig>, "encryption" | "ourTicket"> & {
     encryption?: EncryptionService;
+    ourTicket?: string;
   };
   private aborted = false;
   private unsubscribeLocalUpdates: (() => void) | null = null;
@@ -258,6 +262,22 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       await this.sendMessage(createUpdatesMessage(updates, 0)); // opCount unknown
     } catch (error) {
       this.logger.error("Failed to send update:", error);
+    }
+  }
+
+  /**
+   * Notify the peer that we are removing them.
+   */
+  async sendPeerRemoved(reason?: string): Promise<void> {
+    if (!this.stream) {
+      this.logger.warn("Cannot send peer removed: no stream");
+      return;
+    }
+
+    try {
+      await this.sendMessage(createPeerRemovedMessage(reason));
+    } catch (error) {
+      this.logger.error("Failed to send peer removed:", error);
     }
   }
 
@@ -653,6 +673,14 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
             const errorMsg = message as { message: string };
             this.logger.error("Peer error:", errorMsg.message);
             this.setState("error");
+            return;
+          }
+
+          case SyncMessageType.PEER_REMOVED: {
+            const removedMsg = message as PeerRemovedMessage;
+            this.logger.info("Peer removed us:", removedMsg.reason || "no reason given");
+            this.emit("peer:removed", removedMsg.reason);
+            this.setState("closed");
             return;
           }
 

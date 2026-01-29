@@ -175,9 +175,30 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   }
 
   /**
-   * Remove a peer.
+   * Remove a peer and notify them.
    */
   async removePeer(nodeId: string): Promise<void> {
+    const session = this.sessions.get(nodeId);
+    if (session) {
+      // Notify the peer before closing
+      await session.sendPeerRemoved("User removed peer");
+      await session.close();
+      this.sessions.delete(nodeId);
+    }
+
+    this.peers.delete(nodeId);
+    this.reconnectAttempts.delete(nodeId);
+
+    await this.savePeers();
+    this.emit("peer:disconnected", { nodeId, reason: "removed" });
+    this.logger.info("Removed peer:", nodeId);
+  }
+
+  /**
+   * Remove a peer locally without notifying them.
+   * Used when we receive a PEER_REMOVED message from the peer.
+   */
+  private async removePeerLocally(nodeId: string): Promise<void> {
     const session = this.sessions.get(nodeId);
     if (session) {
       await session.close();
@@ -188,7 +209,8 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     this.reconnectAttempts.delete(nodeId);
 
     await this.savePeers();
-    this.logger.info("Removed peer:", nodeId);
+    this.emit("peer:disconnected", { nodeId, reason: "removed by peer" });
+    this.logger.info("Peer removed us:", nodeId);
   }
 
   /**
@@ -535,6 +557,13 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       );
     });
 
+    // Handle peer removing us
+    session.on("peer:removed", () => {
+      this.removePeerLocally(peer.nodeId).catch((err) =>
+        this.logger.error("Failed to remove peer locally:", err),
+      );
+    });
+
     session.on("error", (error) => {
       this.emit("peer:error", { nodeId: peer.nodeId, error });
     });
@@ -602,6 +631,13 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       peer.ticket = ticket;
       this.savePeers().catch((err) =>
         this.logger.error("Failed to save peer ticket:", err),
+      );
+    });
+
+    // Handle peer removing us
+    session.on("peer:removed", () => {
+      this.removePeerLocally(peer.nodeId).catch((err) =>
+        this.logger.error("Failed to remove peer locally:", err),
       );
     });
 
