@@ -190,7 +190,12 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
       );
 
     // Device hostname (from system, not editable)
-    const hostname = os.hostname() || (Platform.isMobile ? "Mobile Device" : "Desktop");
+    let hostname: string;
+    try {
+      hostname = os.hostname() || (Platform.isMobile ? "Mobile Device" : "Desktop");
+    } catch {
+      hostname = Platform.isMobile ? "Mobile Device" : "Desktop";
+    }
     new Setting(container)
       .setName("Hostname")
       .setDesc("Your device's system hostname (shared with peers)")

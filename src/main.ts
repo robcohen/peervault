@@ -167,8 +167,13 @@ export default class PeerVaultPlugin extends Plugin {
     await this.transport.initialize();
 
     // Initialize peer manager with blob store for binary sync
-    // Get hostname - on mobile, os.hostname() returns empty string, so use platform name
-    const hostname = os.hostname() || (Platform.isMobile ? "Mobile Device" : "Desktop");
+    // Get hostname - on mobile, os module may not work, so wrap in try-catch
+    let hostname: string;
+    try {
+      hostname = os.hostname() || (Platform.isMobile ? "Mobile Device" : "Desktop");
+    } catch {
+      hostname = Platform.isMobile ? "Mobile Device" : "Desktop";
+    }
 
     this.peerManager = new PeerManager(
       this.transport,
