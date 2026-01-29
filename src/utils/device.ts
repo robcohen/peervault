@@ -7,6 +7,74 @@
 import { Platform } from "obsidian";
 
 /**
+ * Word list for generating memorable device names from node IDs.
+ * 256 words = 8 bits per word, 3 words = 24 bits = 16M combinations.
+ * Curated for memorability: short, distinct, easy to pronounce.
+ */
+const WORD_LIST = [
+  // Animals (64)
+  "ant", "ape", "bat", "bear", "bee", "bird", "boar", "bug",
+  "bull", "calf", "cat", "clam", "cob", "cod", "cow", "crab",
+  "crow", "deer", "dog", "dove", "duck", "eel", "elk", "emu",
+  "fish", "flea", "fly", "fox", "frog", "goat", "hawk", "hen",
+  "hog", "jay", "lamb", "lark", "lion", "lynx", "mole", "moth",
+  "mouse", "mule", "newt", "owl", "ox", "pig", "pike", "pony",
+  "pug", "ram", "rat", "seal", "slug", "swan", "toad", "trout",
+  "wasp", "whale", "wolf", "worm", "wren", "yak", "zebra", "finch",
+  // Colors & Nature (64)
+  "red", "blue", "gold", "gray", "jade", "navy", "pink", "plum",
+  "rose", "ruby", "sage", "sand", "teal", "aqua", "bone", "coal",
+  "corn", "dawn", "dew", "dusk", "fern", "fire", "foam", "frost",
+  "glow", "haze", "ice", "iron", "leaf", "lime", "mint", "moon",
+  "moss", "oak", "palm", "peak", "pine", "rain", "reef", "rock",
+  "root", "snow", "soil", "star", "stem", "stone", "sun", "tide",
+  "tree", "vine", "wave", "wind", "wood", "brook", "cave", "clay",
+  "cliff", "cloud", "coast", "coral", "creek", "delta", "field", "flame",
+  // Objects (64)
+  "axe", "bag", "ball", "bell", "boat", "book", "boot", "bowl",
+  "box", "brick", "broom", "brush", "cake", "card", "cart", "chair",
+  "chest", "clock", "cloth", "coin", "cone", "cord", "cork", "crown",
+  "cup", "desk", "dish", "door", "drum", "flag", "fork", "gate",
+  "gear", "gift", "glass", "globe", "glove", "gong", "hat", "helm",
+  "hook", "horn", "jar", "key", "kite", "knob", "lamp", "lens",
+  "lock", "mask", "mill", "nail", "nest", "note", "oar", "pan",
+  "pen", "pipe", "plug", "pot", "ring", "rope", "sail", "shelf",
+  // Actions & Qualities (64)
+  "bold", "brave", "calm", "cool", "crisp", "dark", "deep", "dry",
+  "fair", "fast", "firm", "flat", "free", "fresh", "full", "glad",
+  "good", "grand", "great", "half", "hard", "high", "holy", "hot",
+  "keen", "kind", "late", "lean", "left", "light", "live", "long",
+  "loud", "low", "main", "mild", "near", "neat", "new", "nice",
+  "odd", "old", "open", "pale", "plain", "prime", "pure", "quick",
+  "rare", "raw", "rich", "ripe", "safe", "sharp", "short", "slim",
+  "slow", "small", "smart", "soft", "solid", "spare", "sweet", "swift",
+];
+
+/**
+ * Generate a memorable 3-word name from a node ID.
+ * The name is deterministic - same node ID always produces the same words.
+ *
+ * @param nodeId - The peer's node ID (hex string or any unique identifier)
+ * @returns A hyphenated 3-word name like "bold-fox-rain"
+ */
+export function nodeIdToWords(nodeId: string): string {
+  // Simple hash: take bytes from different parts of the node ID
+  // Node IDs are typically 64+ hex chars, we just need 3 bytes (24 bits)
+  const cleaned = nodeId.replace(/[^a-fA-F0-9]/g, "");
+
+  // Use different positions in the ID for variety
+  const byte1 = parseInt(cleaned.slice(0, 2) || "00", 16) % 256;
+  const byte2 = parseInt(cleaned.slice(16, 18) || cleaned.slice(2, 4) || "00", 16) % 256;
+  const byte3 = parseInt(cleaned.slice(32, 34) || cleaned.slice(4, 6) || "00", 16) % 256;
+
+  const word1 = WORD_LIST[byte1 % WORD_LIST.length];
+  const word2 = WORD_LIST[byte2 % WORD_LIST.length];
+  const word3 = WORD_LIST[byte3 % WORD_LIST.length];
+
+  return `${word1}-${word2}-${word3}`;
+}
+
+/**
  * Known iPhone model identifiers mapped to marketing names.
  * Based on https://gist.github.com/adamawolf/3048717
  */

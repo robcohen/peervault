@@ -9,6 +9,7 @@ import type PeerVaultPlugin from "../main";
 import type { PeerGroup, GroupSyncPolicy } from "../peer/groups";
 import { DEFAULT_SYNC_POLICY } from "../peer/groups";
 import { STATUS_ICONS } from "./status-icons";
+import { nodeIdToWords } from "../utils/device";
 
 /** Color presets for groups */
 const COLOR_PRESETS = [
@@ -453,7 +454,7 @@ export class GroupPeersModal extends Modal {
       const stateIcon = this.getStateIcon(peer.state);
       const displayName = peer.hostname
         ? (peer.nickname ? `${peer.hostname} (${peer.nickname})` : peer.hostname)
-        : "Unknown Device";
+        : (peer.nickname || nodeIdToWords(peer.nodeId));
       new Setting(container)
         .setName(`${stateIcon} ${displayName}`)
         .setDesc(`${peer.nodeId.substring(0, 8)}...`)
@@ -485,7 +486,7 @@ export class GroupPeersModal extends Modal {
       const stateIcon = this.getStateIcon(peer.state);
       const displayName = peer.hostname
         ? (peer.nickname ? `${peer.hostname} (${peer.nickname})` : peer.hostname)
-        : "Unknown Device";
+        : (peer.nickname || nodeIdToWords(peer.nodeId));
       new Setting(container)
         .setName(`${stateIcon} ${displayName}`)
         .setDesc(`${peer.nodeId.substring(0, 8)}...`)

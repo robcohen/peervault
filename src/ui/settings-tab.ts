@@ -6,7 +6,7 @@
 
 import { App, PluginSettingTab, Setting, Notice } from "obsidian";
 import type PeerVaultPlugin from "../main";
-import { getDeviceHostname } from "../utils/device";
+import { getDeviceHostname, nodeIdToWords } from "../utils/device";
 import { getEncryptionService } from "../crypto";
 import { getConflictTracker } from "../core/conflict-tracker";
 import { EncryptionModal } from "./encryption-modal";
@@ -199,20 +199,21 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
         text.setDisabled(true);
       });
 
-    // Device nickname (user-defined, optional)
+    // Device nickname (user-defined, or auto-generated from node ID)
+    const autoNickname = nodeIdToWords(this.plugin.getNodeId());
     new Setting(container)
       .setName("Device nickname")
-      .setDesc("Optional friendly name shown to other devices")
+      .setDesc(`Friendly name shown to peers. Auto-generated: "${autoNickname}"`)
       .addText((text) => {
         text
-          .setPlaceholder("e.g., Work Laptop")
+          .setPlaceholder(autoNickname)
           .setValue(this.plugin.settings.deviceNickname ?? "")
           .onChange(async (value) => {
             this.plugin.settings.deviceNickname = value || undefined;
             await this.plugin.saveSettings();
-            // Update peer manager config
+            // Update peer manager config with user value or auto-generated
             if (this.plugin.peerManager) {
-              (this.plugin.peerManager as any).config.nickname = value || undefined;
+              (this.plugin.peerManager as any).config.nickname = value || autoNickname;
             }
           });
       });
@@ -302,7 +303,7 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
 
         const displayName = peer.hostname
           ? (peer.nickname ? `${peer.hostname} (${peer.nickname})` : peer.hostname)
-          : "Unknown Device";
+          : (peer.nickname || nodeIdToWords(peer.nodeId));
         new Setting(container)
           .setName(`${stateIcon} ${displayName}`)
           .setDesc(`${stateText} • ${peer.nodeId.substring(0, 8)}...`)

@@ -8,6 +8,7 @@ import { App, Modal, Notice, Setting } from "obsidian";
 import type PeerVaultPlugin from "../main";
 import type { SyncStatus } from "../types";
 import { STATUS_ICONS } from "./status-icons";
+import { nodeIdToWords } from "../utils/device";
 
 /** Sync progress info */
 export interface SyncProgress {
@@ -334,7 +335,7 @@ export class ConnectionStatusModal extends Modal {
       name.setText(
         peer.hostname
           ? (peer.nickname ? `${peer.hostname} (${peer.nickname})` : peer.hostname)
-          : peer.nodeId.substring(0, 8) + "...",
+          : (peer.nickname || nodeIdToWords(peer.nodeId)),
       );
 
       // State

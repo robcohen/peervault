@@ -8,6 +8,7 @@ import { App, Modal, Notice, Setting } from "obsidian";
 import type PeerVaultPlugin from "../main";
 import type { PeerInfo } from "../types";
 import { STATUS_ICONS, getStatusLabel } from "./status-icons";
+import { nodeIdToWords } from "../utils/device";
 
 export class PeerVaultStatusModal extends Modal {
   plugin: PeerVaultPlugin;
@@ -215,7 +216,7 @@ export class PeerVaultStatusModal extends Modal {
     info.createSpan({
       text: peer.hostname
         ? (peer.nickname ? `${peer.hostname} (${peer.nickname})` : peer.hostname)
-        : peer.nodeId.substring(0, 8) + "...",
+        : (peer.nickname || nodeIdToWords(peer.nodeId)),
       cls: "peervault-peer-name",
     });
 

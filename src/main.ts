@@ -5,7 +5,7 @@
  */
 
 import { Plugin, Notice } from "obsidian";
-import { getDeviceHostname } from "./utils/device";
+import { getDeviceHostname, nodeIdToWords } from "./utils/device";
 import type { PeerVaultSettings, SyncStatus, PeerInfo } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
 import { DocumentManager, waitForLoroWasm } from "./core/document-manager";
@@ -170,6 +170,10 @@ export default class PeerVaultPlugin extends Plugin {
     // Get hostname - uses os.hostname() on desktop, platform/model detection on mobile
     const hostname = getDeviceHostname();
 
+    // Use user-defined nickname, or auto-generate from node ID (e.g., "bold-fox-rain")
+    const nodeId = this.transport.getNodeId();
+    const nickname = this.settings.deviceNickname || nodeIdToWords(nodeId);
+
     this.peerManager = new PeerManager(
       this.transport,
       this.documentManager,
@@ -179,7 +183,7 @@ export default class PeerVaultPlugin extends Plugin {
         autoSyncInterval: this.settings.syncInterval * 1000,
         autoReconnect: true,
         hostname,
-        nickname: this.settings.deviceNickname,
+        nickname,
       },
       this.blobStore,
     );
