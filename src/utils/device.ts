@@ -296,6 +296,7 @@ export function getDeviceHostname(): string {
   if (Platform.isAndroidApp) {
     // Try to extract Android device model from userAgent
     // Format: "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/..."
+    // WebView format: "Mozilla/5.0 (Linux; Android 13; K; wv) AppleWebKit/..."
     const userAgent = navigator.userAgent;
     const androidMatch = userAgent.match(/Android\s+[\d.]+;\s*([^)]+)\)/);
     if (androidMatch?.[1]) {
@@ -303,7 +304,11 @@ export function getDeviceHostname(): string {
       let model = androidMatch[1].trim();
       // Remove "Build/..." suffix if present
       model = model.replace(/\s*Build\/.*$/, "").trim();
-      if (model && model !== "wv") {
+      // Remove WebView indicator and other garbage
+      model = model.replace(/;\s*wv\s*$/i, "").trim();
+      model = model.replace(/^K\s*;?\s*/i, "").trim(); // "K" is Android 14+ privacy placeholder
+      // Only use if we have a real model name (not empty, not just punctuation)
+      if (model && model.length > 2 && !/^[;\s]+$/.test(model)) {
         return model;
       }
     }
