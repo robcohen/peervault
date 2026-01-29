@@ -36,6 +36,9 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
   private showIds = false;
   private editingNickname = false;
 
+  // Collapsible sections
+  private expandedSections = new Set<string>(["sync"]); // sync expanded by default
+
   constructor(app: App, plugin: PeerVaultPlugin) {
     super(app, plugin);
     this.plugin = plugin;
@@ -757,7 +760,23 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
   }
 
   private renderSyncSection(container: HTMLElement): void {
-    container.createEl("h3", { text: "Sync Settings" });
+    const isExpanded = this.expandedSections.has("sync");
+
+    new Setting(container)
+      .setName("Sync Settings")
+      .setHeading()
+      .addExtraButton((btn) =>
+        btn
+          .setIcon(isExpanded ? "chevron-up" : "chevron-down")
+          .setTooltip(isExpanded ? "Collapse" : "Expand")
+          .onClick(() => {
+            if (isExpanded) this.expandedSections.delete("sync");
+            else this.expandedSections.add("sync");
+            this.display();
+          }),
+      );
+
+    if (!isExpanded) return;
 
     new Setting(container)
       .setName("Sync now")
@@ -841,7 +860,23 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
   }
 
   private renderStorageSection(container: HTMLElement): void {
-    container.createEl("h3", { text: "Storage & Maintenance" });
+    const isExpanded = this.expandedSections.has("storage");
+
+    new Setting(container)
+      .setName("Storage & Maintenance")
+      .setHeading()
+      .addExtraButton((btn) =>
+        btn
+          .setIcon(isExpanded ? "chevron-up" : "chevron-down")
+          .setTooltip(isExpanded ? "Collapse" : "Expand")
+          .onClick(() => {
+            if (isExpanded) this.expandedSections.delete("storage");
+            else this.expandedSections.add("storage");
+            this.display();
+          }),
+      );
+
+    if (!isExpanded) return;
 
     // GC enabled toggle
     new Setting(container)
@@ -951,7 +986,23 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
   }
 
   private renderAdvancedSection(container: HTMLElement): void {
-    container.createEl("h3", { text: "Advanced" });
+    const isExpanded = this.expandedSections.has("advanced");
+
+    new Setting(container)
+      .setName("Advanced")
+      .setHeading()
+      .addExtraButton((btn) =>
+        btn
+          .setIcon(isExpanded ? "chevron-up" : "chevron-down")
+          .setTooltip(isExpanded ? "Collapse" : "Expand")
+          .onClick(() => {
+            if (isExpanded) this.expandedSections.delete("advanced");
+            else this.expandedSections.add("advanced");
+            this.display();
+          }),
+      );
+
+    if (!isExpanded) return;
 
     new Setting(container)
       .setName("Show status bar")
