@@ -27,7 +27,7 @@ const PEERS_STORAGE_KEY = "peervault-peers";
 const DEFAULT_CONFIG: Required<PeerManagerConfig> = {
   autoSyncInterval: 60000, // 1 minute
   autoReconnect: true,
-  maxReconnectAttempts: 5,
+  maxReconnectAttempts: 10,
   reconnectBackoff: 1000,
 };
 
@@ -255,18 +255,23 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     await this.savePeers();
     this.emit("peer:connected", peer);
 
-    // Start sync session - WE initiate (open stream) rather than waiting
-    // This is because the other side may have already timed out waiting
-    // while we were showing the pairing request to the user
+    // Don't initiate sync here. The initiator (other device) is already
+    // in a reconnect cycle after its first attempt timed out while we
+    // were showing the pairing request UI. When it reconnects,
+    // handleIncomingConnection will see a now-known peer and start
+    // an acceptor sync session. This avoids a deadlock where both
+    // sides try to be initiators on separate streams.
+    //
+    // Close the stale connection from the initial attempt - the
+    // reconnecting peer will create a fresh one.
     try {
-      await this.startSyncSession(connection, peer);
-      return peer;
-    } catch (error) {
-      this.logger.error("Failed to sync after accepting pairing:", error);
-      this.updatePeerState(nodeId, "error");
-      // Don't throw - peer is already saved, sync can retry later
-      return peer;
+      await connection.close();
+    } catch {
+      // Connection may already be closed, that's fine
     }
+
+    this.updatePeerState(nodeId, "connecting");
+    return peer;
   }
 
   /**
@@ -593,8 +598,8 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       return;
     }
 
-    // Exponential backoff
-    const delay = this.config.reconnectBackoff * Math.pow(2, attempts - 1);
+    // Exponential backoff, capped at 30s
+    const delay = Math.min(this.config.reconnectBackoff * Math.pow(2, attempts - 1), 30000);
     this.logger.info(
       `Reconnecting to ${nodeId} in ${delay}ms (attempt ${attempts})`,
     );
