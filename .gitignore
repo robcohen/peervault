@@ -63,3 +63,7 @@ data.json
 test-results/
 playwright-report/
 playwright/.cache/
+
+# Temp files
+.direnv/
+peervault-*.tar.gz
