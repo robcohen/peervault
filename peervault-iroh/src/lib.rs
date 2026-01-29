@@ -231,6 +231,26 @@ impl WasmConnection {
         true
     }
 
+    /// Get the round-trip time (RTT) in milliseconds.
+    /// Returns 0 if not available.
+    #[wasm_bindgen(js_name = getRttMs)]
+    pub fn get_rtt_ms(&self) -> f64 {
+        self.connection.rtt().as_secs_f64() * 1000.0
+    }
+
+    /// Get connection statistics as JSON string.
+    #[wasm_bindgen(js_name = getStats)]
+    pub fn get_stats(&self) -> String {
+        let rtt = self.connection.rtt();
+        let remote_id = self.connection.remote_id().to_string();
+
+        format!(
+            r#"{{"rttMs": {}, "remoteId": "{}"}}"#,
+            rtt.as_secs_f64() * 1000.0,
+            remote_id
+        )
+    }
+
     /// Close the connection.
     #[wasm_bindgen]
     pub async fn close(&self) -> Result<(), JsValue> {

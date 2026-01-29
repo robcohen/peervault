@@ -1154,6 +1154,51 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
           }
         }),
       );
+
+    // Custom relay server
+    new Setting(container)
+      .setName("Custom relay server")
+      .setDesc("Use a relay server closer to you for lower latency. Leave empty for default (US-based).")
+      .addText((text) =>
+        text
+          .setPlaceholder("https://relay.example.com")
+          .setValue(this.plugin.settings.relayServers[0] ?? "")
+          .onChange(async (value) => {
+            if (value.trim()) {
+              this.plugin.settings.relayServers = [value.trim()];
+            } else {
+              this.plugin.settings.relayServers = [];
+            }
+            await this.plugin.saveSettings();
+            new Notice("Restart plugin to use new relay");
+          }),
+      );
+
+    // Connection stats
+    this.renderConnectionStats(container);
+  }
+
+  private renderConnectionStats(container: HTMLElement): void {
+    const peers = this.plugin.peerManager?.getPeers() ?? [];
+    const connectedPeers = peers.filter((p) => p.state === "synced" || p.state === "syncing");
+
+    if (connectedPeers.length === 0) {
+      new Setting(container)
+        .setName("Connection latency")
+        .setDesc("No active connections");
+      return;
+    }
+
+    // Get RTT for each connected peer
+    for (const peer of connectedPeers) {
+      const rtt = this.plugin.peerManager?.getPeerRtt(peer.nodeId);
+      const rttText = rtt !== undefined ? `${Math.round(rtt)}ms` : "measuring...";
+      const displayName = peer.hostname || peer.nickname || peer.nodeId.substring(0, 8);
+
+      new Setting(container)
+        .setName(`Latency: ${displayName}`)
+        .setDesc(`Round-trip time: ${rttText}`);
+    }
   }
 
   private renderDangerZone(container: HTMLElement): void {

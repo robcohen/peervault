@@ -47,6 +47,8 @@ interface WasmConnection {
   openStream(): Promise<WasmStream>;
   acceptStream(): Promise<WasmStream>;
   isConnected(): boolean;
+  getRttMs(): number;
+  getStats(): string;
   close(): Promise<void>;
   free(): void;
 }
@@ -456,6 +458,15 @@ class IrohPeerConnection implements PeerConnection {
 
   isConnected(): boolean {
     return this.state === "connected" && this.wasmConn.isConnected();
+  }
+
+  getRttMs(): number | undefined {
+    try {
+      const rtt = this.wasmConn.getRttMs();
+      return rtt > 0 ? rtt : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   onStateChange(callback: (state: ConnectionState) => void): void {

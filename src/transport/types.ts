@@ -113,6 +113,12 @@ export interface PeerConnection {
    * Register callback for incoming streams.
    */
   onStream(callback: (stream: SyncStream) => void): void;
+
+  /**
+   * Get the round-trip time (RTT) in milliseconds.
+   * Returns undefined if not available.
+   */
+  getRttMs(): number | undefined;
 }
 
 /**

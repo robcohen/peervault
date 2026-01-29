@@ -235,6 +235,14 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   }
 
   /**
+   * Get the round-trip time (RTT) in milliseconds for a peer.
+   */
+  getPeerRtt(nodeId: string): number | undefined {
+    const connection = this.transport.getConnection(nodeId);
+    return connection?.getRttMs();
+  }
+
+  /**
    * Update peer nickname.
    */
   async setNickname(nodeId: string, nickname: string): Promise<void> {
