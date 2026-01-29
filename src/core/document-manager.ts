@@ -289,8 +289,47 @@ export class DocumentManager {
    * Import updates from a peer.
    */
   importUpdates(updates: Uint8Array): void {
+    // Capture state before import to detect changes
+    const pathsBefore = new Set(this.pathCache.keys());
+    const contentHashesBefore = new Map<string, string>();
+    for (const path of pathsBefore) {
+      const content = this.getTextContent(path);
+      if (content) {
+        contentHashesBefore.set(path, content);
+      }
+    }
+
+    // Import the updates
     this.doc.import(updates);
     this.rebuildPathCache();
+
+    // Detect changes and emit events
+    const pathsAfter = new Set(this.pathCache.keys());
+
+    // Check for new files
+    for (const path of pathsAfter) {
+      if (!pathsBefore.has(path)) {
+        this.emitFileChange({ type: "create", path, origin: "remote" });
+      }
+    }
+
+    // Check for deleted files
+    for (const path of pathsBefore) {
+      if (!pathsAfter.has(path)) {
+        this.emitFileChange({ type: "delete", path, origin: "remote" });
+      }
+    }
+
+    // Check for modified files
+    for (const path of pathsAfter) {
+      if (pathsBefore.has(path)) {
+        const contentBefore = contentHashesBefore.get(path);
+        const contentAfter = this.getTextContent(path);
+        if (contentBefore !== contentAfter) {
+          this.emitFileChange({ type: "modify", path, origin: "remote" });
+        }
+      }
+    }
   }
 
   /**
