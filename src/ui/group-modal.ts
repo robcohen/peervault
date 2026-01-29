@@ -451,8 +451,9 @@ export class GroupPeersModal extends Modal {
 
     for (const peer of peersInGroup) {
       const stateIcon = this.getStateIcon(peer.state);
+      const displayName = peer.nickname ?? peer.hostname ?? "Unknown Device";
       new Setting(container)
-        .setName(`${stateIcon} ${peer.name || "Unknown Device"}`)
+        .setName(`${stateIcon} ${displayName}`)
         .setDesc(`${peer.nodeId.substring(0, 8)}...`)
         .addButton((btn) =>
           btn.setButtonText("Remove").onClick(() => {
@@ -480,8 +481,9 @@ export class GroupPeersModal extends Modal {
 
     for (const peer of availablePeers) {
       const stateIcon = this.getStateIcon(peer.state);
+      const displayName = peer.nickname ?? peer.hostname ?? "Unknown Device";
       new Setting(container)
-        .setName(`${stateIcon} ${peer.name || "Unknown Device"}`)
+        .setName(`${stateIcon} ${displayName}`)
         .setDesc(`${peer.nodeId.substring(0, 8)}...`)
         .addButton((btn) =>
           btn

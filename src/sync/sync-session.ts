@@ -61,9 +61,12 @@ export interface SyncSessionConfig {
 
   /** Our connection ticket to send to peer for bidirectional reconnection */
   ourTicket?: string;
+
+  /** Our hostname to send to peer for display */
+  ourHostname?: string;
 }
 
-const DEFAULT_CONFIG: Omit<Required<SyncSessionConfig>, "encryption" | "ourTicket"> & {
+const DEFAULT_CONFIG: Omit<Required<SyncSessionConfig>, "encryption" | "ourTicket" | "ourHostname"> & {
   peerIsReadOnly: boolean;
   allowVaultAdoption: boolean;
 } = {
@@ -79,6 +82,7 @@ interface SyncSessionEvents extends Record<string, unknown> {
   "state:change": SyncSessionState;
   "sync:complete": void;
   "ticket:received": string;
+  "hostname:received": string;
   "peer:removed": string | undefined; // reason
   error: Error;
 }
@@ -91,9 +95,10 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
   private stream: SyncStream | null = null;
   private pingSeq = 0;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
-  private config: Omit<Required<SyncSessionConfig>, "encryption" | "ourTicket"> & {
+  private config: Omit<Required<SyncSessionConfig>, "encryption" | "ourTicket" | "ourHostname"> & {
     encryption?: EncryptionService;
     ourTicket?: string;
+    ourHostname?: string;
   };
   private aborted = false;
   private unsubscribeLocalUpdates: (() => void) | null = null;
@@ -194,6 +199,11 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
         this.emit("ticket:received", peerVersionInfo.ticket);
       }
 
+      // Emit peer's hostname if received (for display)
+      if (peerVersionInfo.hostname) {
+        this.emit("hostname:received", peerVersionInfo.hostname);
+      }
+
       // Validate vault ID
       let ourVaultId = this.documentManager.getVaultId();
       if (peerVersionInfo.vaultId !== ourVaultId) {
@@ -212,12 +222,13 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
         }
       }
 
-      // Send our version info (include our ticket for bidirectional reconnection)
+      // Send our version info (include our ticket and hostname)
       await this.sendMessage(
         createVersionInfoMessage(
           ourVaultId,
           this.documentManager.getVersionBytes(),
           this.config.ourTicket,
+          this.config.ourHostname,
         ),
       );
 
@@ -321,9 +332,9 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     const vaultId = this.documentManager.getVaultId();
     const versionBytes = this.documentManager.getVersionBytes();
 
-    // Send our version info (include our ticket for bidirectional reconnection)
+    // Send our version info (include our ticket and hostname)
     await this.sendMessage(
-      createVersionInfoMessage(vaultId, versionBytes, this.config.ourTicket),
+      createVersionInfoMessage(vaultId, versionBytes, this.config.ourTicket, this.config.ourHostname),
     );
 
     // Wait for peer's version info
@@ -346,6 +357,11 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     // Emit peer's ticket if received (for bidirectional reconnection)
     if (peerVersionInfo.ticket) {
       this.emit("ticket:received", peerVersionInfo.ticket);
+    }
+
+    // Emit peer's hostname if received (for display)
+    if (peerVersionInfo.hostname) {
+      this.emit("hostname:received", peerVersionInfo.hostname);
     }
 
     this.logger.debug("Version exchange complete");

@@ -213,7 +213,7 @@ export class PeerVaultStatusModal extends Modal {
     // Peer info
     const info = item.createDiv({ cls: "peervault-peer-info" });
     info.createSpan({
-      text: peer.name || peer.nodeId.substring(0, 8) + "...",
+      text: peer.nickname ?? peer.hostname ?? peer.nodeId.substring(0, 8) + "...",
       cls: "peervault-peer-name",
     });
 

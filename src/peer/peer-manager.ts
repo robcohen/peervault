@@ -24,7 +24,7 @@ import { PeerErrors } from "../errors";
 
 const PEERS_STORAGE_KEY = "peervault-peers";
 
-const DEFAULT_CONFIG: Required<PeerManagerConfig> = {
+const DEFAULT_CONFIG: Omit<Required<PeerManagerConfig>, "hostname"> = {
   autoSyncInterval: 60000, // 1 minute
   autoReconnect: true,
   maxReconnectAttempts: 10,
@@ -51,7 +51,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   private sessions = new Map<string, SyncSession>();
   private reconnectAttempts = new Map<string, number>();
   private pendingPairingRequests = new Map<string, { request: PairingRequest; connection: PeerConnection }>();
-  private config: Required<PeerManagerConfig>;
+  private config: Omit<Required<PeerManagerConfig>, "hostname"> & { hostname?: string };
   private autoSyncTimer: ReturnType<typeof setInterval> | null = null;
   private status: "idle" | "syncing" | "offline" | "error" = "idle";
   private groupManager!: PeerGroupManager;
@@ -127,7 +127,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   /**
    * Add a new peer using their connection ticket.
    */
-  async addPeer(ticket: string, name?: string): Promise<PeerInfo> {
+  async addPeer(ticket: string, nickname?: string): Promise<PeerInfo> {
     try {
       this.setStatus("syncing");
 
@@ -140,13 +140,13 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       if (peer) {
         // Update existing peer
         peer.ticket = ticket;
-        if (name) peer.name = name;
+        if (nickname) peer.nickname = nickname;
         peer.lastSeen = Date.now();
       } else {
         // Create new peer
         peer = {
           nodeId,
-          name,
+          nickname,
           state: "connecting",
           ticket,
           firstSeen: Date.now(),
@@ -228,12 +228,12 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   }
 
   /**
-   * Update peer name.
+   * Update peer nickname.
    */
-  async renamePeer(nodeId: string, name: string): Promise<void> {
+  async setNickname(nodeId: string, nickname: string): Promise<void> {
     const peer = this.peers.get(nodeId);
     if (peer) {
-      peer.name = name;
+      peer.nickname = nickname;
       await this.savePeers();
     }
   }
@@ -248,7 +248,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   /**
    * Accept a pairing request from an unknown peer.
    */
-  async acceptPairingRequest(nodeId: string, name?: string): Promise<PeerInfo> {
+  async acceptPairingRequest(nodeId: string, nickname?: string): Promise<PeerInfo> {
     const pending = this.pendingPairingRequests.get(nodeId);
     if (!pending) {
       throw PeerErrors.unknownPeer(nodeId);
@@ -260,7 +260,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     // Create peer info
     const peer: PeerInfo = {
       nodeId,
-      name,
+      nickname,
       state: "connecting",
       firstSeen: Date.now(),
       lastSeen: Date.now(),
@@ -324,13 +324,15 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
    */
   getPeerSyncStates(): Array<{
     peerId: string;
-    peerName?: string;
+    peerHostname?: string;
+    peerNickname?: string;
     lastSyncTime: number;
     isConnected: boolean;
   }> {
     return Array.from(this.peers.values()).map((peer) => ({
       peerId: peer.nodeId,
-      peerName: peer.name,
+      peerHostname: peer.hostname,
+      peerNickname: peer.nickname,
       lastSyncTime: peer.lastSynced ?? peer.firstSeen,
       isConnected: peer.state === "synced" || peer.state === "syncing",
     }));
@@ -515,7 +517,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       peer.nodeId,
       this.documentManager,
       this.logger,
-      { peerIsReadOnly: syncPolicy.readOnly, ourTicket },
+      { peerIsReadOnly: syncPolicy.readOnly, ourTicket, ourHostname: this.config.hostname },
       this.blobStore,
     );
 
@@ -548,6 +550,15 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       peer.ticket = ticket;
       this.savePeers().catch((err) =>
         this.logger.error("Failed to save peer ticket:", err),
+      );
+    });
+
+    // Store peer's hostname when received (for display)
+    session.on("hostname:received", (hostname) => {
+      this.logger.debug(`Received hostname from peer ${peer.nodeId.slice(0, 8)}: ${hostname}`);
+      peer.hostname = hostname;
+      this.savePeers().catch((err) =>
+        this.logger.error("Failed to save peer hostname:", err),
       );
     });
 
@@ -594,7 +605,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       peer.nodeId,
       this.documentManager,
       this.logger,
-      { peerIsReadOnly: syncPolicy.readOnly, allowVaultAdoption: isFirstSync, ourTicket },
+      { peerIsReadOnly: syncPolicy.readOnly, allowVaultAdoption: isFirstSync, ourTicket, ourHostname: this.config.hostname },
       this.blobStore,
     );
 
@@ -625,6 +636,15 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       peer.ticket = ticket;
       this.savePeers().catch((err) =>
         this.logger.error("Failed to save peer ticket:", err),
+      );
+    });
+
+    // Store peer's hostname when received (for display)
+    session.on("hostname:received", (hostname) => {
+      this.logger.debug(`Received hostname from peer ${peer.nodeId.slice(0, 8)}: ${hostname}`);
+      peer.hostname = hostname;
+      this.savePeers().catch((err) =>
+        this.logger.error("Failed to save peer hostname:", err),
       );
     });
 
@@ -734,13 +754,23 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     try {
       const data = await this.storage.read(PEERS_STORAGE_KEY);
       if (data) {
-        const stored: StoredPeerInfo[] = JSON.parse(
-          new TextDecoder().decode(data),
-        );
+        const stored = JSON.parse(new TextDecoder().decode(data)) as Array<
+          StoredPeerInfo & { name?: string }
+        >;
         for (const sp of stored) {
+          // Migrate old 'name' field to 'nickname'
+          const nickname = sp.nickname ?? sp.name;
           this.peers.set(sp.nodeId, {
-            ...sp,
+            nodeId: sp.nodeId,
+            hostname: sp.hostname,
+            nickname,
             state: "offline", // All peers start offline
+            ticket: sp.ticket,
+            firstSeen: sp.firstSeen,
+            lastSynced: sp.lastSynced,
+            lastSeen: sp.lastSeen,
+            trusted: sp.trusted,
+            groupIds: sp.groupIds,
           });
         }
         this.logger.debug(`Loaded ${this.peers.size} stored peers`);
@@ -754,12 +784,14 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     const stored: StoredPeerInfo[] = Array.from(this.peers.values()).map(
       (p) => ({
         nodeId: p.nodeId,
-        name: p.name,
+        hostname: p.hostname,
+        nickname: p.nickname,
         ticket: p.ticket,
         firstSeen: p.firstSeen,
         lastSynced: p.lastSynced,
         lastSeen: p.lastSeen,
         trusted: p.trusted,
+        groupIds: p.groupIds,
       }),
     );
 

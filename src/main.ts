@@ -202,7 +202,7 @@ export default class PeerVaultPlugin extends Plugin {
 
       // Get peer info for notification
       const peer = this.peerManager.getPeers().find((p) => p.nodeId === nodeId);
-      const peerName = peer?.name ?? "Unknown Device";
+      const peerName = peer?.nickname ?? peer?.hostname ?? "Unknown Device";
 
       // Record edits for conflict tracking
       const tracker = getConflictTracker();
@@ -530,7 +530,8 @@ export default class PeerVaultPlugin extends Plugin {
     // Convert peer manager PeerInfo to types.ts PeerInfo
     return this.peerManager.getPeers().map((p) => ({
       nodeId: p.nodeId,
-      name: p.name ?? "Unknown Device",
+      hostname: p.hostname,
+      nickname: p.nickname,
       deviceType: "unknown" as const,
       lastSeen: p.lastSeen ?? p.firstSeen,
       connectionState:

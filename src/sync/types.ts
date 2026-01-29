@@ -68,6 +68,8 @@ export interface VersionInfoMessage extends SyncMessage {
   vaultId: string;
   /** Optional connection ticket for bidirectional reconnection */
   ticket?: string;
+  /** Device hostname for display */
+  hostname?: string;
 }
 
 /** Snapshot request message - for new peers requesting full document */

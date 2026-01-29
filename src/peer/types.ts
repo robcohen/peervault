@@ -18,8 +18,11 @@ export interface PeerInfo {
   /** Peer's node ID */
   nodeId: string;
 
-  /** User-friendly name (if set) */
-  name?: string;
+  /** Peer's hostname (sent by them during sync) */
+  hostname?: string;
+
+  /** User-friendly nickname (set locally) */
+  nickname?: string;
 
   /** Last known state */
   state: PeerState;
@@ -46,7 +49,8 @@ export interface PeerInfo {
 /** Serialized peer info for storage */
 export interface StoredPeerInfo {
   nodeId: string;
-  name?: string;
+  hostname?: string;
+  nickname?: string;
   ticket?: string;
   firstSeen: number;
   lastSynced?: number;
@@ -90,4 +94,7 @@ export interface PeerManagerConfig {
 
   /** Reconnect backoff base (ms) */
   reconnectBackoff?: number;
+
+  /** Our device hostname to share with peers */
+  hostname?: string;
 }

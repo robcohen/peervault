@@ -104,8 +104,10 @@ export interface SnapshotMeta {
 export interface PeerInfo {
   /** Unique peer identifier (Iroh NodeId) */
   nodeId: string;
-  /** Human-readable name */
-  name: string;
+  /** Device hostname (sent by peer) */
+  hostname?: string;
+  /** User-friendly nickname (set locally) */
+  nickname?: string;
   /** Device type */
   deviceType: "desktop" | "mobile" | "tablet" | "unknown";
   /** Last seen timestamp */

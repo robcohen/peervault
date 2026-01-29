@@ -271,8 +271,9 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
           peer.connectionState.charAt(0).toUpperCase() +
           peer.connectionState.slice(1);
 
+        const displayName = peer.nickname ?? peer.hostname ?? "Unknown Device";
         new Setting(container)
-          .setName(`${stateIcon} ${peer.name || "Unknown Device"}`)
+          .setName(`${stateIcon} ${displayName}`)
           .setDesc(`${stateText} • ${peer.nodeId.substring(0, 8)}...`)
           .addExtraButton((btn) =>
             btn
@@ -281,7 +282,7 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
               .onClick(async () => {
                 const confirmed = await showConfirm(this.app, {
                   title: "Remove Device",
-                  message: `Remove "${peer.name || "this device"}" from sync?`,
+                  message: `Remove "${displayName}" from sync?`,
                   confirmText: "Remove",
                   isDestructive: true,
                 });

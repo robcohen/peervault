@@ -128,10 +128,13 @@ export function deserializeMessage(data: Uint8Array): AnySyncMessage {
  * - bytes: versionBytes
  * - u32: ticket length (0 if no ticket, for backward compat)
  * - bytes: ticket (UTF-8, optional)
+ * - u16: hostname length (0 if none, for backward compat)
+ * - bytes: hostname (UTF-8, optional)
  */
 function serializeVersionInfo(msg: VersionInfoMessage): Uint8Array {
   const vaultIdBytes = TEXT_ENCODER.encode(msg.vaultId);
   const ticketBytes = msg.ticket ? TEXT_ENCODER.encode(msg.ticket) : null;
+  const hostnameBytes = msg.hostname ? TEXT_ENCODER.encode(msg.hostname) : null;
   const totalLength =
     1 +
     8 +
@@ -140,7 +143,9 @@ function serializeVersionInfo(msg: VersionInfoMessage): Uint8Array {
     4 +
     msg.versionBytes.length +
     4 +
-    (ticketBytes?.length || 0);
+    (ticketBytes?.length || 0) +
+    2 +
+    (hostnameBytes?.length || 0);
 
   const buffer = new ArrayBuffer(totalLength);
   const view = new DataView(buffer);
@@ -166,6 +171,14 @@ function serializeVersionInfo(msg: VersionInfoMessage): Uint8Array {
   offset += 4;
   if (ticketBytes) {
     bytes.set(ticketBytes, offset);
+    offset += ticketBytes.length;
+  }
+
+  // Hostname (optional, for display)
+  view.setUint16(offset, hostnameBytes?.length || 0, false);
+  offset += 2;
+  if (hostnameBytes) {
+    bytes.set(hostnameBytes, offset);
   }
 
   return bytes;
@@ -195,6 +208,17 @@ function deserializeVersionInfo(
     offset += 4;
     if (ticketLen > 0 && offset + ticketLen <= data.length) {
       ticket = TEXT_DECODER.decode(data.slice(offset, offset + ticketLen));
+      offset += ticketLen;
+    }
+  }
+
+  // Hostname (optional, for backward compat with older clients)
+  let hostname: string | undefined;
+  if (offset + 2 <= data.length) {
+    const hostnameLen = view.getUint16(offset, false);
+    offset += 2;
+    if (hostnameLen > 0 && offset + hostnameLen <= data.length) {
+      hostname = TEXT_DECODER.decode(data.slice(offset, offset + hostnameLen));
     }
   }
 
@@ -204,6 +228,7 @@ function deserializeVersionInfo(
     vaultId,
     versionBytes,
     ticket,
+    hostname,
   };
 }
 
@@ -567,6 +592,7 @@ export function createVersionInfoMessage(
   vaultId: string,
   versionBytes: Uint8Array,
   ticket?: string,
+  hostname?: string,
 ): VersionInfoMessage {
   return {
     type: SyncMessageType.VERSION_INFO,
@@ -574,6 +600,7 @@ export function createVersionInfoMessage(
     vaultId,
     versionBytes,
     ticket,
+    hostname,
   };
 }
 

@@ -409,7 +409,7 @@ export class FileHistoryModal extends Modal {
     try {
       const peers = this.plugin.getConnectedPeers();
       const peer = peers.find((p) => p.nodeId === peerId);
-      return peer?.name;
+      return peer?.nickname ?? peer?.hostname;
     } catch {
       return undefined;
     }
