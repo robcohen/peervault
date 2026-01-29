@@ -277,22 +277,16 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     await this.savePeers();
     this.emit("peer:connected", peer);
 
-    // Don't initiate sync here. The initiator (other device) is already
-    // in a reconnect cycle after its first attempt timed out while we
-    // were showing the pairing request UI. When it reconnects,
-    // handleIncomingConnection will see a now-known peer and start
-    // an acceptor sync session. This avoids a deadlock where both
-    // sides try to be initiators on separate streams.
-    //
-    // Close the stale connection from the initial attempt - the
-    // reconnecting peer will create a fresh one.
+    // Continue with the existing connection - the initiator already opened
+    // a stream and is waiting for us to accept it and respond.
+    // We become the acceptor in this sync session.
     try {
-      await connection.close();
-    } catch {
-      // Connection may already be closed, that's fine
+      await this.handleIncomingSyncSession(connection, peer);
+    } catch (error) {
+      this.logger.error("Failed to start sync after accepting pairing:", error);
+      this.updatePeerState(nodeId, "error");
     }
 
-    this.updatePeerState(nodeId, "connecting");
     return peer;
   }
 
