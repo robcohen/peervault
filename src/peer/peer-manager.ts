@@ -89,6 +89,13 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     // Load stored peers
     await this.loadPeers();
 
+    // Clean up stale peer IDs from groups
+    const validPeerIds = new Set(this.peers.keys());
+    const cleaned = this.groupManager.cleanupStalePeers(validPeerIds);
+    if (cleaned > 0) {
+      this.logger.info(`Cleaned up ${cleaned} stale peer(s) from groups`);
+    }
+
     // Handle incoming connections
     this.transport.onIncomingConnection(async (conn) => {
       await this.handleIncomingConnection(conn);

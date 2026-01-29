@@ -366,6 +366,23 @@ export class PeerGroupManager extends EventEmitter<PeerGroupEvents> {
   }
 
   /**
+   * Remove stale peer IDs from groups that don't exist in the peers list.
+   */
+  cleanupStalePeers(validPeerIds: Set<string>): number {
+    let removed = 0;
+    for (const group of this.getGroups()) {
+      const stalePeers = group.peerIds.filter((id) => !validPeerIds.has(id));
+      if (stalePeers.length > 0) {
+        const newPeerIds = group.peerIds.filter((id) => validPeerIds.has(id));
+        this.updateGroup(group.id, { peerIds: newPeerIds });
+        removed += stalePeers.length;
+        this.logger.info("Cleaned up stale peers from group:", group.id, stalePeers);
+      }
+    }
+    return removed;
+  }
+
+  /**
    * Get all peers that belong to any group.
    */
   getAllGroupedPeers(): string[] {
