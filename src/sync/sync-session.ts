@@ -8,7 +8,6 @@ import type { SyncStream } from "../transport";
 import type { DocumentManager } from "../core/document-manager";
 import type { BlobStore } from "../core/blob-store";
 import type { Logger } from "../utils/logger";
-import type { EncryptionService } from "../crypto";
 import { SyncErrors, TransportErrors } from "../errors";
 import {
   SyncMessageType,
@@ -50,9 +49,6 @@ export interface SyncSessionConfig {
   /** Max retry attempts for sync */
   maxRetries?: number;
 
-  /** Encryption service for E2E encryption */
-  encryption?: EncryptionService;
-
   /** If true, don't import updates from this peer (they can only receive) */
   peerIsReadOnly?: boolean;
 
@@ -69,7 +65,7 @@ export interface SyncSessionConfig {
   ourNickname?: string;
 }
 
-const DEFAULT_CONFIG: Omit<Required<SyncSessionConfig>, "encryption" | "ourTicket" | "ourHostname" | "ourNickname"> & {
+const DEFAULT_CONFIG: Omit<Required<SyncSessionConfig>, "ourTicket" | "ourHostname" | "ourNickname"> & {
   peerIsReadOnly: boolean;
   allowVaultAdoption: boolean;
 } = {
@@ -98,8 +94,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
   private stream: SyncStream | null = null;
   private pingSeq = 0;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
-  private config: Omit<Required<SyncSessionConfig>, "encryption" | "ourTicket" | "ourHostname" | "ourNickname"> & {
-    encryption?: EncryptionService;
+  private config: Omit<Required<SyncSessionConfig>, "ourTicket" | "ourHostname" | "ourNickname"> & {
     ourTicket: string;
     ourHostname: string;
     ourNickname?: string;
@@ -121,13 +116,6 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       ourTicket: config.ourTicket,
       ourHostname: config.ourHostname,
     };
-  }
-
-  /**
-   * Set the encryption service (can be set after construction).
-   */
-  setEncryption(encryption: EncryptionService | undefined): void {
-    this.config.encryption = encryption;
   }
 
   /**
@@ -786,13 +774,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       throw TransportErrors.streamClosed("sync-session");
     }
 
-    let bytes = serializeMessage(message);
-
-    // Encrypt if encryption is enabled
-    if (this.config.encryption?.isEnabled()) {
-      bytes = await this.config.encryption.encrypt(bytes);
-    }
-
+    const bytes = serializeMessage(message);
     await this.stream.send(bytes);
   }
 
@@ -801,13 +783,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       throw TransportErrors.streamClosed("sync-session");
     }
 
-    let bytes = await this.stream.receive();
-
-    // Decrypt if encryption is enabled
-    if (this.config.encryption?.isEnabled()) {
-      bytes = await this.config.encryption.decrypt(bytes);
-    }
-
+    const bytes = await this.stream.receive();
     return deserializeMessage(bytes);
   }
 }

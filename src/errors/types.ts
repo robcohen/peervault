@@ -41,9 +41,6 @@ export enum ErrorCategory {
   /** Peer connection/management */
   PEER = "peer",
 
-  /** Encryption operations */
-  CRYPTO = "crypto",
-
   /** Plugin configuration */
   CONFIG = "config",
 

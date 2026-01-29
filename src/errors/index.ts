@@ -14,7 +14,6 @@ export {
   SyncErrors,
   TransportErrors,
   PeerErrors,
-  CryptoErrors,
   ConfigErrors,
   PlatformErrors,
 } from "./catalog";

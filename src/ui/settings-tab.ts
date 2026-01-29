@@ -7,9 +7,7 @@
 import { App, PluginSettingTab, Setting, Notice } from "obsidian";
 import type PeerVaultPlugin from "../main";
 import { getDeviceHostname, nodeIdToWords } from "../utils/device";
-import { getEncryptionService } from "../crypto";
 import { getConflictTracker } from "../core/conflict-tracker";
-import { EncryptionModal } from "./encryption-modal";
 import { SelectiveSyncModal } from "./selective-sync-modal";
 import { ConflictModal } from "./conflict-modal";
 import { FileHistoryModal } from "./file-history-modal";
@@ -58,9 +56,6 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
 
     // Devices Section (includes groups)
     this.renderDevicesSection(containerEl);
-
-    // Security Section
-    this.renderSecuritySection(containerEl);
 
     // Sync Section
     this.renderSyncSection(containerEl);
@@ -713,52 +708,6 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
     });
   }
 
-  private renderSecuritySection(container: HTMLElement): void {
-    container.createEl("h3", { text: "Security" });
-
-    const encryption = getEncryptionService();
-    const isEnabled = this.plugin.settings.encryptionEnabled;
-    const isUnlocked = encryption.isEnabled();
-
-    let statusText: string;
-    let statusClass: string;
-
-    if (!isEnabled) {
-      statusText = "Disabled";
-      statusClass = "peervault-status-disabled";
-    } else if (isUnlocked) {
-      statusText = "Enabled & Unlocked";
-      statusClass = "peervault-status-unlocked";
-    } else {
-      statusText = "Enabled (Locked)";
-      statusClass = "peervault-status-locked";
-    }
-
-    new Setting(container)
-      .setName("End-to-end encryption")
-      .setDesc(`Status: ${statusText}`)
-      .addButton((btn) =>
-        btn.setButtonText(isEnabled ? "Manage" : "Enable").onClick(() => {
-          new EncryptionModal(this.app, this.plugin).open();
-        }),
-      );
-
-    if (isEnabled && !isUnlocked) {
-      new Setting(container)
-        .setClass("peervault-warning-setting")
-        .setName("Encryption is locked")
-        .setDesc("Enter your password to unlock encryption and sync securely")
-        .addButton((btn) =>
-          btn
-            .setButtonText("Unlock")
-            .setCta()
-            .onClick(() => {
-              new EncryptionModal(this.app, this.plugin).open();
-            }),
-        );
-    }
-  }
-
   private renderSyncSection(container: HTMLElement): void {
     const isExpanded = this.expandedSections.has("sync");
 
@@ -1084,15 +1033,6 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
 
   private async resetPlugin(): Promise<void> {
     try {
-      // Clear encryption
-      const encryption = getEncryptionService();
-      encryption.clearKey();
-
-      // Clear settings
-      this.plugin.settings.encryptionEnabled = false;
-      this.plugin.settings.encryptedKey = undefined;
-      this.plugin.settings.keySalt = undefined;
-
       // Remove all peers
       if (this.plugin.peerManager) {
         const peers = this.plugin.peerManager.getPeers();

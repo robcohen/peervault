@@ -244,14 +244,6 @@ export interface PeerVaultSettings {
   relayServers: string[];
   /** Transport type for P2P connections */
   transportType: TransportType;
-  /** Enable end-to-end encryption for sync */
-  encryptionEnabled: boolean;
-  /** Enable encryption at rest (local storage) */
-  storageEncrypted: boolean;
-  /** Encrypted encryption key (encrypted with password-derived key) */
-  encryptedKey?: string;
-  /** Salt for password-based key derivation */
-  keySalt?: string;
   /** Garbage collection configuration */
   gcEnabled: boolean;
   /** Maximum document size in MB before GC runs (default: 50) */
@@ -273,8 +265,6 @@ export const DEFAULT_SETTINGS: PeerVaultSettings = {
   debugMode: false,
   relayServers: [],
   transportType: "iroh",
-  encryptionEnabled: false,
-  storageEncrypted: false,
   gcEnabled: true,
   gcMaxDocSizeMB: 50,
   gcMinHistoryDays: 30,

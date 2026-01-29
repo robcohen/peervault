@@ -10,7 +10,6 @@ import type { PeerVaultSettings, SyncStatus, PeerInfo } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
 import { DocumentManager, waitForLoroWasm } from "./core/document-manager";
 import { ObsidianStorageAdapter } from "./core/storage-adapter";
-import { EncryptedStorageAdapter } from "./core/encrypted-storage-adapter";
 import { BlobStore } from "./core/blob-store";
 import { VaultSync } from "./core/vault-sync";
 import { EventEmitter } from "./utils/events";
@@ -25,10 +24,8 @@ import {
   updateSyncProgress,
   FileHistoryModal,
   SelectiveSyncModal,
-  EncryptionModal,
   ConflictModal,
 } from "./ui";
-import { getEncryptionService } from "./crypto";
 import {
   initConflictTracker,
   getConflictTracker,
@@ -47,8 +44,7 @@ import { ConfigErrors } from "./errors";
 export default class PeerVaultPlugin extends Plugin {
   settings!: PeerVaultSettings;
   documentManager!: DocumentManager;
-  storage!: EncryptedStorageAdapter;
-  private baseStorage!: ObsidianStorageAdapter;
+  storage!: ObsidianStorageAdapter;
   blobStore!: BlobStore;
   vaultSync!: VaultSync;
   transport!: Transport;
@@ -77,18 +73,10 @@ export default class PeerVaultPlugin extends Plugin {
     // Load settings
     await this.loadSettings();
 
-    // Initialize storage adapters
-    this.baseStorage = new ObsidianStorageAdapter(this);
+    // Initialize storage adapter
+    this.storage = new ObsidianStorageAdapter(this);
 
-    // Wrap with encrypted storage adapter
-    // The encryption service will be unlocked later via the UI if needed
-    const encryptionService = getEncryptionService();
-    this.storage = new EncryptedStorageAdapter(
-      this.baseStorage,
-      encryptionService,
-    );
-
-    // Run schema migrations if needed (uses encrypted storage)
+    // Run schema migrations if needed
     const migrationRunner = new MigrationRunner(
       this.storage,
       MIGRATIONS,
@@ -435,15 +423,6 @@ export default class PeerVaultPlugin extends Plugin {
       name: "Configure selective sync",
       callback: () => {
         new SelectiveSyncModal(this.app, this).open();
-      },
-    });
-
-    // Encryption settings command
-    this.addCommand({
-      id: "encryption-settings",
-      name: "Encryption settings",
-      callback: () => {
-        new EncryptionModal(this.app, this).open();
       },
     });
 

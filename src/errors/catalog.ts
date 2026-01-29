@@ -292,68 +292,6 @@ export const PeerErrors = {
 };
 
 /**
- * Crypto-related errors.
- */
-export const CryptoErrors = {
-  keyNotSet: () =>
-    new PeerVaultError(
-      "Encryption key not set",
-      "CRYPTO_KEY_NOT_SET",
-      ErrorCategory.CRYPTO,
-      ErrorSeverity.ERROR,
-      false,
-    ),
-
-  invalidKey: (reason: string) =>
-    new PeerVaultError(
-      `Invalid encryption key: ${reason}`,
-      "CRYPTO_INVALID_KEY",
-      ErrorCategory.CRYPTO,
-      ErrorSeverity.ERROR,
-      false,
-      { reason },
-    ),
-
-  decryptionFailed: (reason: string) =>
-    new PeerVaultError(
-      `Decryption failed: ${reason}`,
-      "CRYPTO_DECRYPT_FAILED",
-      ErrorCategory.CRYPTO,
-      ErrorSeverity.ERROR,
-      false,
-      { reason },
-    ),
-
-  encryptionFailed: (reason: string) =>
-    new PeerVaultError(
-      `Encryption failed: ${reason}`,
-      "CRYPTO_ENCRYPT_FAILED",
-      ErrorCategory.CRYPTO,
-      ErrorSeverity.ERROR,
-      false,
-      { reason },
-    ),
-
-  passwordRequired: () =>
-    new PeerVaultError(
-      "Password required to unlock encryption",
-      "CRYPTO_PASSWORD_REQUIRED",
-      ErrorCategory.CRYPTO,
-      ErrorSeverity.WARNING,
-      true,
-    ),
-
-  wrongPassword: () =>
-    new PeerVaultError(
-      "Incorrect password",
-      "CRYPTO_WRONG_PASSWORD",
-      ErrorCategory.CRYPTO,
-      ErrorSeverity.WARNING,
-      true,
-    ),
-};
-
-/**
  * Configuration-related errors.
  */
 export const ConfigErrors = {

@@ -9,7 +9,6 @@ export {
   ObsidianStorageAdapter,
   MemoryStorageAdapter,
 } from "./storage-adapter";
-export { EncryptedStorageAdapter } from "./encrypted-storage-adapter";
 export {
   BlobStore,
   isBinaryFile,
