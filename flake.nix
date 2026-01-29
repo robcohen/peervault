@@ -42,6 +42,10 @@
             wasm-pack
             wasm-bindgen-cli
 
+            # WASM cross-compilation (required for ring crate)
+            # See: https://github.com/n0-computer/iroh/discussions/3200
+            llvmPackages.clang-unwrapped
+
             # Python via uv
             uv
             python312
@@ -92,6 +96,10 @@
             # Rust/Cargo setup
             export CARGO_HOME="$PWD/.cargo"
             export PATH="$CARGO_HOME/bin:$PATH"
+
+            # WASM cross-compilation: use clang for ring crate
+            # This fixes "env" imports in WASM that cause LinkError at runtime
+            export CC_wasm32_unknown_unknown=clang
 
             # Node modules binaries
             export PATH="$PWD/node_modules/.bin:$PATH"

@@ -5,6 +5,61 @@
 default:
     @just --list
 
+# ============================================================================
+# WASM Build Commands (Iroh networking layer)
+# ============================================================================
+
+# Build Iroh WASM module (requires nix develop shell for clang)
+wasm:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Building Iroh WASM module..."
+    cd peervault-iroh
+    # CC_wasm32_unknown_unknown should be set by flake.nix shellHook
+    if [ -z "${CC_wasm32_unknown_unknown:-}" ]; then
+        echo "Warning: CC_wasm32_unknown_unknown not set. Run 'nix develop' first."
+        echo "Attempting build anyway..."
+    fi
+    wasm-pack build --target web --release
+    echo "WASM build complete: peervault-iroh/pkg/"
+
+# Clean and rebuild WASM from scratch
+wasm-clean:
+    rm -rf peervault-iroh/target peervault-iroh/pkg
+    just wasm
+
+# Verify WASM has no "env" imports (ring native code)
+wasm-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    WASM_FILE="peervault-iroh/pkg/peervault_iroh_bg.wasm"
+    if [ ! -f "$WASM_FILE" ]; then
+        echo "Error: WASM not found. Run 'just wasm' first."
+        exit 1
+    fi
+    echo "Checking WASM for native code imports..."
+    bun -e "
+    const fs = require('fs');
+    const wasmBytes = fs.readFileSync('$WASM_FILE');
+    WebAssembly.compile(wasmBytes).then(module => {
+        const imports = WebAssembly.Module.imports(module);
+        const envImports = imports.filter(i => i.module === 'env');
+        console.log('Total imports:', imports.length);
+        console.log('Env imports:', envImports.length);
+        if (envImports.length > 0) {
+            console.log('ERROR: WASM has native code imports:');
+            envImports.slice(0, 5).forEach(i => console.log('  -', i.name));
+            process.exit(1);
+        } else {
+            console.log('OK: WASM is clean (no env imports)');
+        }
+    });
+    "
+
+# ============================================================================
+# Main Build Commands
+# ============================================================================
+
 # Initialize the project (first-time setup)
 init:
     bun init -y

@@ -5,9 +5,10 @@
 PeerVault is an Obsidian plugin for P2P vault sync using Loro CRDTs and Iroh transport. No servers required.
 
 - **Stack**: TypeScript, Obsidian API, Loro CRDT (WASM), Iroh networking (WASM)
-- **Build**: esbuild via `node esbuild.config.mjs`
-- **Type check**: `npx tsc --noEmit`
-- **Package manager**: Uses Node.js (not Bun) for Obsidian plugin compatibility
+- **Build**: `bun run build` or `just build`
+- **Type check**: `bun run check` or `just check`
+- **Package manager**: Bun (with Node.js available for Obsidian compatibility)
+- **Dev shell**: `nix develop` (provides all tooling including Rust/WASM)
 
 ## Build & Release
 
@@ -15,8 +16,36 @@ See `RELEASING.md` for the full release checklist.
 
 Quick build:
 ```sh
-node esbuild.config.mjs
+just build        # Build plugin
+just wasm         # Rebuild Iroh WASM (if needed)
+just wasm-check   # Verify WASM has no native imports
 ```
+
+## WASM Build (peervault-iroh)
+
+The Iroh networking layer is a Rust crate compiled to WASM. **Requires NixOS/nix develop shell.**
+
+### Why Nix is Required
+The `ring` crate (cryptography) contains C code that must be cross-compiled to WASM. On NixOS, the standard clang wrapper adds incompatible flags. The solution:
+
+1. Use `llvmPackages.clang-unwrapped` (no wrapper)
+2. Set `CC_wasm32_unknown_unknown=clang` for the `cc` crate
+
+This is configured in `flake.nix` shellHook.
+
+### Building WASM
+```sh
+nix develop                    # Enter dev shell (sets CC_wasm32_unknown_unknown)
+just wasm                      # Build with wasm-pack
+just wasm-check                # Verify no "env" imports
+```
+
+### Troubleshooting
+- **"env" imports in WASM**: Ring compiled native code instead of WASM. Ensure `CC_wasm32_unknown_unknown=clang` is set.
+- **wasm-opt errors**: Disabled via `Cargo.toml` metadata (`wasm-opt = false`).
+- **LinkError at runtime**: Check WASM with `just wasm-check`. Should show "0 env imports".
+
+See `docs/wasm-build.md` for detailed documentation.
 
 ## Architecture
 
@@ -105,7 +134,7 @@ Settings > PeerVault > Advanced > "Copy Logs" - copies last 200 log entries to c
 
 ## Known Issues & Gotchas
 
-- **Ring crate WASM**: Needs `cargo build` + `wasm-bindgen` (not `wasm-pack`). Pin `wasm-bindgen = "=0.2.105"`.
+- **Ring crate WASM**: Must use clang cross-compiler. See "WASM Build" section above. Pin `wasm-bindgen = "=0.2.105"`.
 - **WASM Connection**: `iroh::endpoint::Connection` is Clone - do NOT wrap in Mutex (causes deadlock on accept_bi/open_bi).
 - **versions.json**: Must be updated with every release for BRAT compatibility.
 - **dist/manifest.json**: Auto-copied by build from root `manifest.json`.

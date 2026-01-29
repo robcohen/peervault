@@ -7,6 +7,9 @@ description = "WASM bindings for Iroh P2P networking in PeerVault"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
 [dependencies]
 # Iroh for P2P networking (default-features = false for WASM compatibility)
 iroh = { version = "0.95", default-features = false }
@@ -45,3 +48,4 @@ debug = false
 lto = true
 opt-level = "z"
 panic = "abort"
+
