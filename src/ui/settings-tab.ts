@@ -772,6 +772,23 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
     container.createEl("h3", { text: "Sync Settings" });
 
     new Setting(container)
+      .setName("Sync now")
+      .setDesc("Manually trigger a sync with all connected devices")
+      .addButton((btn) =>
+        btn
+          .setButtonText("Sync Now")
+          .setCta()
+          .onClick(async () => {
+            try {
+              await this.plugin.sync();
+              new Notice("Sync completed");
+            } catch (error) {
+              new Notice(`Sync failed: ${error}`);
+            }
+          }),
+      );
+
+    new Setting(container)
       .setName("Auto-sync")
       .setDesc("Automatically sync changes with connected devices")
       .addToggle((toggle) =>
