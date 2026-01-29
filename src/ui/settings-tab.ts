@@ -32,6 +32,10 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
   // Group expansion state
   private expandedGroups = new Set<string>();
 
+  // Status section state
+  private showIds = false;
+  private editingNickname = false;
+
   constructor(app: App, plugin: PeerVaultPlugin) {
     super(app, plugin);
     this.plugin = plugin;
@@ -45,9 +49,6 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
     containerEl.addClass("peervault-settings");
 
     containerEl.createEl("h2", { text: "PeerVault Settings" });
-
-    // Quick Actions Section
-    this.renderQuickActions(containerEl);
 
     // Status Section
     this.renderStatusSection(containerEl);
@@ -123,43 +124,23 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
     }
   }
 
-  private renderQuickActions(container: HTMLElement): void {
-    const section = container.createDiv({
-      cls: "peervault-quick-actions-section",
-    });
-
-    new Setting(section)
-      .setName("Quick Actions")
-      .setDesc("Common tasks")
-      .addButton((btn) =>
-        btn
-          .setButtonText("Sync Now")
-          .setCta()
-          .onClick(async () => {
-            try {
-              await this.plugin.sync();
-              new Notice("Sync completed");
-            } catch (error) {
-              new Notice(`Sync failed: ${error}`);
-            }
-          }),
-      );
-  }
-
   private renderStatusSection(container: HTMLElement): void {
     container.createEl("h3", { text: "Status" });
 
-    // Connection status
-    const status = this.plugin.getStatus();
+    // Get stats
     const peers = this.plugin.getConnectedPeers();
     const connectedCount = peers.filter(
-      (p) =>
-        p.connectionState === "connected" || p.connectionState === "syncing",
+      (p) => p.connectionState === "connected" || p.connectionState === "syncing",
     ).length;
+    const fileCount = this.plugin.documentManager?.listAllPaths().length ?? 0;
+    const hostname = getDeviceHostname();
+    const autoNickname = nodeIdToWords(this.plugin.getNodeId());
+    const nickname = this.plugin.settings.deviceNickname || autoNickname;
 
+    // Line 1: Connection stats
     new Setting(container)
-      .setName("Connection")
-      .setDesc(`${connectedCount} of ${peers.length} device(s) connected`)
+      .setName(`${connectedCount}/${peers.length} devices connected`)
+      .setDesc(`${fileCount} files synced`)
       .addExtraButton((btn) =>
         btn
           .setIcon("refresh-cw")
@@ -167,124 +148,131 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
           .onClick(() => this.display()),
       );
 
-    // Node ID
-    new Setting(container)
-      .setName("Node ID")
-      .setDesc("Your unique device identifier")
-      .addText((text) => {
-        const nodeId = this.plugin.getNodeId();
-        text.setValue(nodeId.substring(0, 16) + "...");
-        text.setDisabled(true);
-        text.inputEl.style.fontFamily = "var(--font-monospace)";
-        text.inputEl.style.fontSize = "12px";
-      })
+    // Line 2: This device identity
+    if (this.editingNickname) {
+      // Editing mode
+      const currentNickname = this.plugin.settings.deviceNickname ?? "";
+      let pendingNickname = currentNickname;
+
+      new Setting(container)
+        .setName("Edit nickname")
+        .setDesc(`Auto-generated: "${autoNickname}"`)
+        .addText((text) => {
+          text
+            .setPlaceholder(autoNickname)
+            .setValue(currentNickname)
+            .onChange((value) => {
+              pendingNickname = value.trim();
+            });
+        })
+        .addButton((btn) =>
+          btn
+            .setButtonText("Save")
+            .setCta()
+            .onClick(async () => {
+              btn.setButtonText("Saving...");
+              btn.setDisabled(true);
+
+              this.plugin.settings.deviceNickname = pendingNickname || undefined;
+              await this.plugin.saveSettings();
+
+              const newNickname = pendingNickname || autoNickname;
+              if (this.plugin.peerManager) {
+                (this.plugin.peerManager as any).config.nickname = newNickname;
+              }
+
+              try {
+                const peerManager = this.plugin.peerManager;
+                if (peerManager) {
+                  for (const peer of peerManager.getPeers()) {
+                    const session = (peerManager as any).sessions.get(peer.nodeId);
+                    if (session) await session.close();
+                  }
+                  await peerManager.syncAll();
+                }
+                new Notice("Nickname updated");
+              } catch {
+                new Notice("Nickname saved");
+              }
+
+              this.editingNickname = false;
+              this.display();
+            }),
+        )
+        .addButton((btn) =>
+          btn.setButtonText("Cancel").onClick(() => {
+            this.editingNickname = false;
+            this.display();
+          }),
+        );
+    } else {
+      // Display mode
+      new Setting(container)
+        .setName(`This device: ${hostname}`)
+        .setDesc(`Nickname: ${nickname}`)
+        .addExtraButton((btn) =>
+          btn
+            .setIcon("pencil")
+            .setTooltip("Edit nickname")
+            .onClick(() => {
+              this.editingNickname = true;
+              this.display();
+            }),
+        );
+    }
+
+    // Line 3: IDs (collapsible)
+    const idSetting = new Setting(container)
+      .setName("IDs")
+      .setDesc(this.showIds ? "Node and vault identifiers" : "Show node and vault IDs")
       .addExtraButton((btn) =>
         btn
-          .setIcon("copy")
-          .setTooltip("Copy full ID")
+          .setIcon(this.showIds ? "chevron-up" : "chevron-down")
+          .setTooltip(this.showIds ? "Hide" : "Show")
           .onClick(() => {
-            navigator.clipboard.writeText(this.plugin.getNodeId());
-            new Notice("Node ID copied");
+            this.showIds = !this.showIds;
+            this.display();
           }),
       );
 
-    // Device hostname (from system, not editable)
-    const hostname = getDeviceHostname();
-    new Setting(container)
-      .setName("Hostname")
-      .setDesc("Your device's system hostname (shared with peers)")
-      .addText((text) => {
-        text.setValue(hostname);
-        text.setDisabled(true);
-      });
+    if (this.showIds) {
+      const nodeId = this.plugin.getNodeId();
+      const vaultId = this.plugin.documentManager?.getVaultId() ?? "Not initialized";
 
-    // Device nickname (user-defined, or auto-generated from node ID)
-    const autoNickname = nodeIdToWords(this.plugin.getNodeId());
-    const currentNickname = this.plugin.settings.deviceNickname ?? "";
-    let pendingNickname = currentNickname;
+      new Setting(container)
+        .setName("Node ID")
+        .setDesc(nodeId.substring(0, 20) + "...")
+        .addExtraButton((btn) =>
+          btn
+            .setIcon("copy")
+            .setTooltip("Copy")
+            .onClick(() => {
+              navigator.clipboard.writeText(nodeId);
+              new Notice("Node ID copied");
+            }),
+        );
 
-    const nicknameSetting = new Setting(container)
-      .setName("Device nickname")
-      .setDesc(`Friendly name shown to peers. Auto-generated: "${autoNickname}"`)
-      .addText((text) => {
-        text
-          .setPlaceholder(autoNickname)
-          .setValue(currentNickname)
-          .onChange((value) => {
-            pendingNickname = value.trim();
-          });
-      })
-      .addButton((btn) =>
-        btn
-          .setButtonText("Save")
-          .onClick(async () => {
-            btn.setButtonText("Saving...");
-            btn.setDisabled(true);
+      new Setting(container)
+        .setName("Vault ID")
+        .setDesc(vaultId.substring(0, 20) + "...")
+        .addExtraButton((btn) =>
+          btn
+            .setIcon("copy")
+            .setTooltip("Copy")
+            .onClick(() => {
+              navigator.clipboard.writeText(vaultId);
+              new Notice("Vault ID copied");
+            }),
+        );
+    }
 
-            // Save the nickname
-            this.plugin.settings.deviceNickname = pendingNickname || undefined;
-            await this.plugin.saveSettings();
-
-            // Update peer manager config
-            const newNickname = pendingNickname || autoNickname;
-            if (this.plugin.peerManager) {
-              (this.plugin.peerManager as any).config.nickname = newNickname;
-            }
-
-            // Force reconnect to push the new nickname (live sessions skip resync)
-            try {
-              const peerManager = this.plugin.peerManager;
-              if (peerManager) {
-                // Close all sessions to force VERSION_INFO exchange with new nickname
-                for (const peer of peerManager.getPeers()) {
-                  const session = (peerManager as any).sessions.get(peer.nodeId);
-                  if (session) {
-                    await session.close();
-                  }
-                }
-                // Now sync will create new sessions
-                await peerManager.syncAll();
-              }
-              btn.setButtonText("✓ Saved");
-              new Notice("Nickname updated and synced to peers");
-            } catch {
-              btn.setButtonText("✓ Saved");
-              new Notice("Nickname saved (will sync on next connection)");
-            }
-
-            // Reset button after delay
-            setTimeout(() => {
-              btn.setButtonText("Save");
-              btn.setDisabled(false);
-            }, 2000);
-          }),
-      );
-
-    // Vault ID
-    new Setting(container)
-      .setName("Vault ID")
-      .setDesc("Shared identifier for this vault")
-      .addText((text) => {
-        const vaultId = this.plugin.documentManager?.getVaultId() ?? "Not initialized";
-        text.setValue(vaultId.length > 8 ? vaultId.substring(0, 8) + "..." : vaultId);
-        text.setDisabled(true);
-        text.inputEl.style.fontFamily = "var(--font-monospace)";
-        text.inputEl.style.fontSize = "12px";
-      });
-
-    // Files tracked
-    const fileCount = this.plugin.documentManager?.listAllPaths().length ?? 0;
-    new Setting(container)
-      .setName("Files tracked")
-      .setDesc(`${fileCount} file(s) in sync`);
-
-    // Conflicts
+    // Conflicts (only if present)
     const tracker = getConflictTracker();
     const conflictCount = tracker.getConflictCount();
     if (conflictCount > 0) {
       new Setting(container)
         .setName("Concurrent edits")
-        .setDesc(`${conflictCount} file(s) with recent concurrent edits`)
+        .setDesc(`${conflictCount} file(s) need review`)
         .addButton((btn) =>
           btn
             .setButtonText("Review")
