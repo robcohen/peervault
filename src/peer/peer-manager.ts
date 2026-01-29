@@ -637,6 +637,14 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   // ===========================================================================
 
   private startAutoSync(): void {
+    // Sync after a short delay on startup to allow incoming connections to arrive first
+    setTimeout(() => {
+      this.syncAll().catch((err) => {
+        this.logger.error("Initial auto sync failed:", err);
+      });
+    }, 3000);
+
+    // Then sync periodically
     this.autoSyncTimer = setInterval(() => {
       this.syncAll().catch((err) => {
         this.logger.error("Auto sync failed:", err);
