@@ -4,9 +4,9 @@
  * Plugin settings UI for PeerVault configuration.
  */
 
-import { App, PluginSettingTab, Setting, Notice, Platform } from "obsidian";
-import * as os from "os";
+import { App, PluginSettingTab, Setting, Notice } from "obsidian";
 import type PeerVaultPlugin from "../main";
+import { getDeviceHostname } from "../utils/device";
 import { getEncryptionService } from "../crypto";
 import { getConflictTracker } from "../core/conflict-tracker";
 import { EncryptionModal } from "./encryption-modal";
@@ -190,12 +190,7 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
       );
 
     // Device hostname (from system, not editable)
-    let hostname: string;
-    try {
-      hostname = os.hostname() || (Platform.isMobile ? "Mobile Device" : "Desktop");
-    } catch {
-      hostname = Platform.isMobile ? "Mobile Device" : "Desktop";
-    }
+    const hostname = getDeviceHostname();
     new Setting(container)
       .setName("Hostname")
       .setDesc("Your device's system hostname (shared with peers)")
