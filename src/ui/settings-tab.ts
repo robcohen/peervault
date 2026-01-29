@@ -231,9 +231,20 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
               (this.plugin.peerManager as any).config.nickname = newNickname;
             }
 
-            // Sync with peers to push the new nickname
+            // Force reconnect to push the new nickname (live sessions skip resync)
             try {
-              await this.plugin.peerManager?.syncAll();
+              const peerManager = this.plugin.peerManager;
+              if (peerManager) {
+                // Close all sessions to force VERSION_INFO exchange with new nickname
+                for (const peer of peerManager.getPeers()) {
+                  const session = (peerManager as any).sessions.get(peer.nodeId);
+                  if (session) {
+                    await session.close();
+                  }
+                }
+                // Now sync will create new sessions
+                await peerManager.syncAll();
+              }
               btn.setButtonText("✓ Saved");
               new Notice("Nickname updated and synced to peers");
             } catch {
