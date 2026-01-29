@@ -200,22 +200,54 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
 
     // Device nickname (user-defined, or auto-generated from node ID)
     const autoNickname = nodeIdToWords(this.plugin.getNodeId());
-    new Setting(container)
+    const currentNickname = this.plugin.settings.deviceNickname ?? "";
+    let pendingNickname = currentNickname;
+
+    const nicknameSetting = new Setting(container)
       .setName("Device nickname")
       .setDesc(`Friendly name shown to peers. Auto-generated: "${autoNickname}"`)
       .addText((text) => {
         text
           .setPlaceholder(autoNickname)
-          .setValue(this.plugin.settings.deviceNickname ?? "")
-          .onChange(async (value) => {
-            this.plugin.settings.deviceNickname = value || undefined;
-            await this.plugin.saveSettings();
-            // Update peer manager config with user value or auto-generated
-            if (this.plugin.peerManager) {
-              (this.plugin.peerManager as any).config.nickname = value || autoNickname;
-            }
+          .setValue(currentNickname)
+          .onChange((value) => {
+            pendingNickname = value.trim();
           });
-      });
+      })
+      .addButton((btn) =>
+        btn
+          .setButtonText("Save")
+          .onClick(async () => {
+            btn.setButtonText("Saving...");
+            btn.setDisabled(true);
+
+            // Save the nickname
+            this.plugin.settings.deviceNickname = pendingNickname || undefined;
+            await this.plugin.saveSettings();
+
+            // Update peer manager config
+            const newNickname = pendingNickname || autoNickname;
+            if (this.plugin.peerManager) {
+              (this.plugin.peerManager as any).config.nickname = newNickname;
+            }
+
+            // Sync with peers to push the new nickname
+            try {
+              await this.plugin.peerManager?.syncAll();
+              btn.setButtonText("✓ Saved");
+              new Notice("Nickname updated and synced to peers");
+            } catch {
+              btn.setButtonText("✓ Saved");
+              new Notice("Nickname saved (will sync on next connection)");
+            }
+
+            // Reset button after delay
+            setTimeout(() => {
+              btn.setButtonText("Save");
+              btn.setDisabled(false);
+            }, 2000);
+          }),
+      );
 
     // Vault ID
     new Setting(container)
