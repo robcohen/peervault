@@ -62,6 +62,8 @@ export interface VersionInfoMessage extends SyncMessage {
   versionBytes: Uint8Array;
   /** Vault ID for validation */
   vaultId: string;
+  /** Optional connection ticket for bidirectional reconnection */
+  ticket?: string;
 }
 
 /** Snapshot request message - for new peers requesting full document */

@@ -491,12 +491,15 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     // Get effective sync policy for this peer
     const syncPolicy = this.groupManager.getEffectiveSyncPolicy(peer.nodeId);
 
+    // Generate our ticket for bidirectional reconnection
+    const ourTicket = await this.transport.generateTicket();
+
     // Create new session with blob store for binary sync
     const session = new SyncSession(
       peer.nodeId,
       this.documentManager,
       this.logger,
-      { peerIsReadOnly: syncPolicy.readOnly },
+      { peerIsReadOnly: syncPolicy.readOnly, ourTicket },
       this.blobStore,
     );
 
@@ -521,6 +524,15 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       );
       this.emit("peer:synced", peer.nodeId);
       this.reconnectAttempts.set(peer.nodeId, 0);
+    });
+
+    // Store peer's ticket when received (for bidirectional reconnection)
+    session.on("ticket:received", (ticket) => {
+      this.logger.debug(`Received ticket from peer ${peer.nodeId.slice(0, 8)}`);
+      peer.ticket = ticket;
+      this.savePeers().catch((err) =>
+        this.logger.error("Failed to save peer ticket:", err),
+      );
     });
 
     session.on("error", (error) => {
@@ -551,12 +563,15 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     // Allow vault adoption on first sync (peer has never synced before)
     const isFirstSync = peer.lastSynced === undefined;
 
+    // Generate our ticket for bidirectional reconnection
+    const ourTicket = await this.transport.generateTicket();
+
     // Create new session with blob store for binary sync
     const session = new SyncSession(
       peer.nodeId,
       this.documentManager,
       this.logger,
-      { peerIsReadOnly: syncPolicy.readOnly, allowVaultAdoption: isFirstSync },
+      { peerIsReadOnly: syncPolicy.readOnly, allowVaultAdoption: isFirstSync, ourTicket },
       this.blobStore,
     );
 
@@ -579,6 +594,15 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
         this.logger.error("Failed to save peers:", err),
       );
       this.emit("peer:synced", peer.nodeId);
+    });
+
+    // Store peer's ticket when received (for bidirectional reconnection)
+    session.on("ticket:received", (ticket) => {
+      this.logger.debug(`Received ticket from peer ${peer.nodeId.slice(0, 8)}`);
+      peer.ticket = ticket;
+      this.savePeers().catch((err) =>
+        this.logger.error("Failed to save peer ticket:", err),
+      );
     });
 
     session.on("error", (error) => {

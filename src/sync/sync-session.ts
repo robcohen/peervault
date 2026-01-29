@@ -56,6 +56,9 @@ export interface SyncSessionConfig {
 
   /** If true, adopt peer's vault ID on first sync instead of rejecting on mismatch */
   allowVaultAdoption?: boolean;
+
+  /** Our connection ticket to send to peer for bidirectional reconnection */
+  ourTicket?: string;
 }
 
 const DEFAULT_CONFIG: Omit<Required<SyncSessionConfig>, "encryption"> & {
@@ -73,6 +76,7 @@ const DEFAULT_CONFIG: Omit<Required<SyncSessionConfig>, "encryption"> & {
 interface SyncSessionEvents extends Record<string, unknown> {
   "state:change": SyncSessionState;
   "sync:complete": void;
+  "ticket:received": string;
   error: Error;
 }
 
@@ -181,6 +185,11 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
 
       const peerVersionInfo = peerMessage as VersionInfoMessage;
 
+      // Emit peer's ticket if received (for bidirectional reconnection)
+      if (peerVersionInfo.ticket) {
+        this.emit("ticket:received", peerVersionInfo.ticket);
+      }
+
       // Validate vault ID
       let ourVaultId = this.documentManager.getVaultId();
       if (peerVersionInfo.vaultId !== ourVaultId) {
@@ -199,11 +208,12 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
         }
       }
 
-      // Send our version info
+      // Send our version info (include our ticket for bidirectional reconnection)
       await this.sendMessage(
         createVersionInfoMessage(
           ourVaultId,
           this.documentManager.getVersionBytes(),
+          this.config.ourTicket,
         ),
       );
 
@@ -291,8 +301,10 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     const vaultId = this.documentManager.getVaultId();
     const versionBytes = this.documentManager.getVersionBytes();
 
-    // Send our version info
-    await this.sendMessage(createVersionInfoMessage(vaultId, versionBytes));
+    // Send our version info (include our ticket for bidirectional reconnection)
+    await this.sendMessage(
+      createVersionInfoMessage(vaultId, versionBytes, this.config.ourTicket),
+    );
 
     // Wait for peer's version info
     const peerMessage = await this.receiveMessage();
@@ -309,6 +321,11 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
         createErrorMessage(SyncErrorCode.VAULT_MISMATCH, "Vault ID mismatch"),
       );
       throw SyncErrors.vaultMismatch(vaultId, peerVersionInfo.vaultId);
+    }
+
+    // Emit peer's ticket if received (for bidirectional reconnection)
+    if (peerVersionInfo.ticket) {
+      this.emit("ticket:received", peerVersionInfo.ticket);
     }
 
     this.logger.debug("Version exchange complete");

@@ -121,11 +121,21 @@ export function deserializeMessage(data: Uint8Array): AnySyncMessage {
  * - bytes: vaultId (UTF-8)
  * - u32: versionBytes length
  * - bytes: versionBytes
+ * - u32: ticket length (0 if no ticket, for backward compat)
+ * - bytes: ticket (UTF-8, optional)
  */
 function serializeVersionInfo(msg: VersionInfoMessage): Uint8Array {
   const vaultIdBytes = TEXT_ENCODER.encode(msg.vaultId);
+  const ticketBytes = msg.ticket ? TEXT_ENCODER.encode(msg.ticket) : null;
   const totalLength =
-    1 + 8 + 4 + vaultIdBytes.length + 4 + msg.versionBytes.length;
+    1 +
+    8 +
+    4 +
+    vaultIdBytes.length +
+    4 +
+    msg.versionBytes.length +
+    4 +
+    (ticketBytes?.length || 0);
 
   const buffer = new ArrayBuffer(totalLength);
   const view = new DataView(buffer);
@@ -144,6 +154,14 @@ function serializeVersionInfo(msg: VersionInfoMessage): Uint8Array {
   view.setUint32(offset, msg.versionBytes.length, false);
   offset += 4;
   bytes.set(msg.versionBytes, offset);
+  offset += msg.versionBytes.length;
+
+  // Ticket (optional, for bidirectional reconnection)
+  view.setUint32(offset, ticketBytes?.length || 0, false);
+  offset += 4;
+  if (ticketBytes) {
+    bytes.set(ticketBytes, offset);
+  }
 
   return bytes;
 }
@@ -163,12 +181,24 @@ function deserializeVersionInfo(
   const versionBytesLen = view.getUint32(offset, false);
   offset += 4;
   const versionBytes = data.slice(offset, offset + versionBytesLen);
+  offset += versionBytesLen;
+
+  // Ticket (optional, for backward compat with older clients)
+  let ticket: string | undefined;
+  if (offset + 4 <= data.length) {
+    const ticketLen = view.getUint32(offset, false);
+    offset += 4;
+    if (ticketLen > 0 && offset + ticketLen <= data.length) {
+      ticket = TEXT_DECODER.decode(data.slice(offset, offset + ticketLen));
+    }
+  }
 
   return {
     type: SyncMessageType.VERSION_INFO,
     timestamp,
     vaultId,
     versionBytes,
+    ticket,
   };
 }
 
@@ -531,12 +561,14 @@ function deserializeError(data: Uint8Array, timestamp: number): ErrorMessage {
 export function createVersionInfoMessage(
   vaultId: string,
   versionBytes: Uint8Array,
+  ticket?: string,
 ): VersionInfoMessage {
   return {
     type: SyncMessageType.VERSION_INFO,
     timestamp: Date.now(),
     vaultId,
     versionBytes,
+    ticket,
   };
 }
 
