@@ -9,6 +9,11 @@
 
 import { App, Modal, Setting, Notice } from "obsidian";
 import type PeerVaultPlugin from "../main";
+import {
+  generateQRCode,
+  scanQRFromImage,
+  scanQRFromClipboard,
+} from "./utils/qr-utils";
 
 export type PairingTab = "show" | "scan" | "manual";
 
@@ -118,7 +123,7 @@ export class PairingModal extends Modal {
 
     // QR Code
     const qrContainer = container.createDiv({ cls: "peervault-qr-container" });
-    await this.generateQRCode(qrContainer, this.myTicket);
+    await generateQRCode(qrContainer, this.myTicket, { width: 220 });
 
     // Ticket display
     const ticketSection = container.createDiv({
@@ -144,36 +149,6 @@ export class PairingModal extends Modal {
     );
   }
 
-  private async generateQRCode(
-    container: HTMLElement,
-    data: string,
-  ): Promise<void> {
-    try {
-      const QRCode = await import("qrcode");
-      const canvas = container.createEl("canvas", {
-        cls: "peervault-qr-canvas",
-      });
-
-      // Check if dark mode is active
-      const isDark = document.body.classList.contains("theme-dark");
-
-      await QRCode.toCanvas(canvas, data, {
-        width: 220,
-        margin: 2,
-        color: {
-          dark: isDark ? "#ffffff" : "#000000",
-          light: isDark ? "#1e1e1e" : "#ffffff",
-        },
-        errorCorrectionLevel: "M",
-      });
-    } catch (error) {
-      container.createEl("p", {
-        text: "QR code generation failed. Use the ticket below.",
-        cls: "peervault-qr-error",
-      });
-      this.plugin.logger.error("QR code generation failed:", error);
-    }
-  }
 
   // ===========================================================================
   // Scan QR Tab
@@ -257,13 +232,9 @@ export class PairingModal extends Modal {
 
   private async processQRImage(file: File): Promise<void> {
     try {
-      const imageData = await this.loadImageData(file);
-      const jsQR = (await import("jsqr")).default;
-
-      const code = jsQR(imageData.data, imageData.width, imageData.height);
-
-      if (code) {
-        this.ticketInput = code.data;
+      const result = await scanQRFromImage(file);
+      if (result) {
+        this.ticketInput = result;
         new Notice("QR code detected!");
         await this.handleConnect();
       } else {
@@ -276,75 +247,30 @@ export class PairingModal extends Modal {
     }
   }
 
-  private async loadImageData(file: File): Promise<ImageData> {
-    return new Promise((resolve, reject) => {
-      const img = new Image();
-      const objectUrl = URL.createObjectURL(file);
-      img.onload = () => {
-        URL.revokeObjectURL(objectUrl); // Clean up to prevent memory leak
-        const canvas = document.createElement("canvas");
-        canvas.width = img.width;
-        canvas.height = img.height;
-        const ctx = canvas.getContext("2d");
-        if (!ctx) {
-          reject(new Error("Could not get canvas context"));
-          return;
-        }
-        ctx.drawImage(img, 0, 0);
-        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        resolve(imageData);
-      };
-      img.onerror = () => {
-        URL.revokeObjectURL(objectUrl); // Clean up on error too
-        reject(new Error("Failed to load image"));
-      };
-      img.src = objectUrl;
-    });
-  }
-
   private async pasteFromClipboard(): Promise<void> {
     try {
-      const clipboardItems = await navigator.clipboard.read();
+      // First try scanning for QR image in clipboard
+      const qrResult = await scanQRFromClipboard();
+      if (qrResult) {
+        this.ticketInput = qrResult;
+        new Notice("QR code detected from clipboard!");
+        await this.handleConnect();
+        return;
+      }
 
-      for (const item of clipboardItems) {
-        // Check for image types
-        const imageType = item.types.find((type) => type.startsWith("image/"));
-        if (imageType) {
-          const blob = await item.getType(imageType);
-          const file = new File([blob], "clipboard.png", { type: imageType });
-          await this.processQRImage(file);
-          return;
-        }
-
-        // Check for text (might be a ticket)
-        if (item.types.includes("text/plain")) {
-          const blob = await item.getType("text/plain");
-          const text = await blob.text();
-          if (text.startsWith("iroh://")) {
-            this.ticketInput = text.trim();
-            new Notice("Ticket detected from clipboard!");
-            await this.handleConnect();
-            return;
-          }
-        }
+      // Fallback: check for text ticket
+      const text = await navigator.clipboard.readText();
+      if (text.startsWith("iroh://")) {
+        this.ticketInput = text.trim();
+        new Notice("Ticket detected from clipboard!");
+        await this.handleConnect();
+        return;
       }
 
       new Notice("No QR image or ticket found in clipboard");
     } catch (error) {
-      // Fallback for browsers that don't support clipboard.read()
-      try {
-        const text = await navigator.clipboard.readText();
-        if (text.startsWith("iroh://")) {
-          this.ticketInput = text.trim();
-          new Notice("Ticket detected from clipboard!");
-          await this.handleConnect();
-        } else {
-          new Notice("No ticket found in clipboard. Try copying an image.");
-        }
-      } catch {
-        this.plugin.logger.error("Clipboard access denied:", error);
-        new Notice("Could not access clipboard. Please use file upload.");
-      }
+      this.plugin.logger.error("Clipboard access denied:", error);
+      new Notice("Could not access clipboard. Please use file upload.");
     }
   }
 

@@ -396,6 +396,24 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     return this.status;
   }
 
+  /**
+   * Set the local device's display nickname.
+   */
+  setOwnNickname(nickname: string | undefined): void {
+    this.config.nickname = nickname;
+  }
+
+  /**
+   * Close the sync session for a specific peer.
+   */
+  async closeSession(nodeId: string): Promise<void> {
+    const session = this.sessions.get(nodeId);
+    if (session) {
+      await session.close();
+      this.sessions.delete(nodeId);
+    }
+  }
+
   // ===========================================================================
   // Manual Sync
   // ===========================================================================

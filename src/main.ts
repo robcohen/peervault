@@ -385,8 +385,8 @@ export default class PeerVaultPlugin extends Plugin {
       name: "Manage devices (add/remove)",
       callback: () => {
         // Open settings tab
-        (this.app as any).setting.open();
-        (this.app as any).setting.openTabById("peervault");
+        this.app.setting.open();
+        this.app.setting.openTabById("peervault");
       },
     });
 

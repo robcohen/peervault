@@ -14,7 +14,13 @@ import { FileHistoryModal } from "./file-history-modal";
 import { GroupModal } from "./group-modal";
 import { showConfirm } from "./confirm-modal";
 import { STATUS_ICONS } from "./status-icons";
-import { DEFAULT_GROUP_ID } from "../peer/groups";
+import { DEFAULT_GROUP_ID, type PeerGroup } from "../peer/groups";
+import {
+  generateQRCode,
+  scanQRFromImage,
+  openQRFilePicker,
+  scanQRFromClipboard,
+} from "./utils/qr-utils";
 
 export class PeerVaultSettingsTab extends PluginSettingTab {
   plugin: PeerVaultPlugin;
@@ -178,15 +184,14 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
 
               const newNickname = pendingNickname || autoNickname;
               if (this.plugin.peerManager) {
-                (this.plugin.peerManager as any).config.nickname = newNickname;
+                this.plugin.peerManager.setOwnNickname(newNickname);
               }
 
               try {
                 const peerManager = this.plugin.peerManager;
                 if (peerManager) {
                   for (const peer of peerManager.getPeers()) {
-                    const session = (peerManager as any).sessions.get(peer.nodeId);
-                    if (session) await session.close();
+                    await peerManager.closeSession(peer.nodeId);
                   }
                   await peerManager.syncAll();
                 }
@@ -433,7 +438,7 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
     peer: { nodeId: string; hostname?: string; nickname?: string; state: string },
     userGroups: { id: string; name: string; icon: string; peerIds: string[] }[],
   ): void {
-    const stateIcon = this.getStateIcon(peer.state as any);
+    const stateIcon = this.getStateIcon(peer.state);
     const displayName = peer.hostname
       ? (peer.nickname ? `${peer.hostname} (${peer.nickname})` : peer.hostname)
       : (peer.nickname || nodeIdToWords(peer.nodeId));
@@ -493,7 +498,7 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
     group: { id: string; peerIds: string[] },
     isDefaultGroup: boolean,
   ): void {
-    const stateIcon = this.getStateIcon(peer.state as any);
+    const stateIcon = this.getStateIcon(peer.state);
     const displayName = peer.hostname
       ? (peer.nickname ? `${peer.hostname} (${peer.nickname})` : peer.hostname)
       : (peer.nickname || nodeIdToWords(peer.nodeId));
@@ -540,7 +545,7 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
 
   private renderInlineGroupSettings(
     container: HTMLElement,
-    group: { id: string; name: string; syncPolicy: { readOnly: boolean; excludedFolders: string[]; autoConnect: boolean; priority: number } },
+    group: PeerGroup,
     isDefaultGroup: boolean,
   ): void {
     const settingsDiv = container.createDiv({ cls: "peervault-group-settings" });
@@ -556,7 +561,7 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
           .setIcon("pencil")
           .setTooltip("Edit excluded folders")
           .onClick(() => {
-            new GroupModal(this.app, this.plugin, group as any, () => {
+            new GroupModal(this.app, this.plugin, group, () => {
               this.display();
             }).open();
           }),
@@ -633,7 +638,10 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
 
       // QR Code
       const qrContainer = qrSection.createDiv({ cls: "peervault-qr-container-small" });
-      this.generateQRCode(qrContainer, this.myTicket);
+      generateQRCode(qrContainer, this.myTicket, {
+        width: 160,
+        canvasClass: "peervault-qr-canvas-small",
+      });
 
       // Copy ticket button
       new Setting(qrSection)
@@ -749,84 +757,16 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
     );
   }
 
-  private async generateQRCode(container: HTMLElement, data: string): Promise<void> {
-    try {
-      const QRCode = await import("qrcode");
-      const canvas = container.createEl("canvas", { cls: "peervault-qr-canvas-small" });
-
-      const isDark = document.body.classList.contains("theme-dark");
-      await QRCode.toCanvas(canvas, data, {
-        width: 160,
-        margin: 2,
-        color: {
-          dark: isDark ? "#ffffff" : "#000000",
-          light: isDark ? "#1e1e1e" : "#ffffff",
-        },
-        errorCorrectionLevel: "M",
-      });
-    } catch (error) {
-      container.createEl("p", {
-        text: "QR code generation failed",
-        cls: "peervault-error-text",
-      });
+  private async openQRScanner(): Promise<void> {
+    const result = await openQRFilePicker();
+    if (result) {
+      this.ticketInput = result;
+      this.showAddDevice = true;
+      new Notice("QR code detected!");
+      this.display();
+    } else {
+      new Notice("No QR code found in image");
     }
-  }
-
-  private openQRScanner(): void {
-    const input = document.createElement("input");
-    input.type = "file";
-    input.accept = "image/*";
-    input.onchange = async () => {
-      const file = input.files?.[0];
-      if (file) {
-        await this.processQRImage(file);
-      }
-    };
-    input.click();
-  }
-
-  private async processQRImage(file: File): Promise<void> {
-    try {
-      const imageData = await this.loadImageData(file);
-      const jsQR = (await import("jsqr")).default;
-      const code = jsQR(imageData.data, imageData.width, imageData.height);
-
-      if (code) {
-        this.ticketInput = code.data;
-        this.showAddDevice = true;
-        new Notice("QR code detected!");
-        this.display();
-      } else {
-        new Notice("No QR code found in image");
-      }
-    } catch (error) {
-      new Notice(`Failed to process image: ${error}`);
-    }
-  }
-
-  private async loadImageData(file: File): Promise<ImageData> {
-    return new Promise((resolve, reject) => {
-      const img = new Image();
-      const objectUrl = URL.createObjectURL(file);
-      img.onload = () => {
-        URL.revokeObjectURL(objectUrl);
-        const canvas = document.createElement("canvas");
-        canvas.width = img.width;
-        canvas.height = img.height;
-        const ctx = canvas.getContext("2d");
-        if (!ctx) {
-          reject(new Error("Could not get canvas context"));
-          return;
-        }
-        ctx.drawImage(img, 0, 0);
-        resolve(ctx.getImageData(0, 0, canvas.width, canvas.height));
-      };
-      img.onerror = () => {
-        URL.revokeObjectURL(objectUrl);
-        reject(new Error("Failed to load image"));
-      };
-      img.src = objectUrl;
-    });
   }
 
   private openCameraScanner(): void {

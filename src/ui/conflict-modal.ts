@@ -10,6 +10,7 @@ import {
   getConflictTracker,
   type ConflictInfo,
 } from "../core/conflict-tracker";
+import { timeAgo } from "./utils/time-utils";
 
 /**
  * Modal showing files with concurrent edit conflicts.
@@ -89,8 +90,7 @@ export class ConflictModal extends Modal {
 
     // Details
     const details = item.createDiv({ cls: "peervault-conflict-details" });
-    const timeAgo = this.formatTimeAgo(conflict.timestamp);
-    details.setText(`Detected ${timeAgo}`);
+    details.setText(`Detected ${timeAgo(conflict.timestamp)}`);
 
     // Peers involved
     const peers = item.createDiv({ cls: "peervault-conflict-peers" });
@@ -173,11 +173,4 @@ export class ConflictModal extends Modal {
     }
   }
 
-  private formatTimeAgo(timestamp: number): string {
-    const seconds = Math.floor((Date.now() - timestamp) / 1000);
-    if (seconds < 60) return "just now";
-    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
-    if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
-    return `${Math.floor(seconds / 86400)}d ago`;
-  }
 }

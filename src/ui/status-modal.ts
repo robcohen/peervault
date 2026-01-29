@@ -9,6 +9,7 @@ import type PeerVaultPlugin from "../main";
 import type { PeerInfo } from "../types";
 import { STATUS_ICONS, getStatusLabel } from "./status-icons";
 import { nodeIdToWords } from "../utils/device";
+import { timeAgo } from "./utils/time-utils";
 
 export class PeerVaultStatusModal extends Modal {
   plugin: PeerVaultPlugin;
@@ -229,7 +230,7 @@ export class PeerVaultStatusModal extends Modal {
     // Last seen
     if (peer.lastSeen) {
       const lastSeen = item.createDiv({ cls: "peervault-peer-lastseen" });
-      const ago = this.timeAgo(peer.lastSeen);
+      const ago = timeAgo(peer.lastSeen);
       lastSeen.setText(`Last seen: ${ago}`);
     }
   }
@@ -244,8 +245,8 @@ export class PeerVaultStatusModal extends Modal {
         btn.setButtonText("Open Settings").onClick(() => {
           this.close();
           // Open settings tab
-          (this.app as any).setting.open();
-          (this.app as any).setting.openTabById("peervault");
+          this.app.setting.open();
+          this.app.setting.openTabById("peervault");
         }),
       );
 
@@ -265,12 +266,4 @@ export class PeerVaultStatusModal extends Modal {
       );
   }
 
-  private timeAgo(timestamp: number): string {
-    const seconds = Math.floor((Date.now() - timestamp) / 1000);
-
-    if (seconds < 60) return "just now";
-    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
-    if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
-    return `${Math.floor(seconds / 86400)}d ago`;
-  }
 }
