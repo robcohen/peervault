@@ -102,6 +102,11 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
   private aborted = false;
   private unsubscribeLocalUpdates: (() => void) | null = null;
 
+  // Micro-batching for reduced latency
+  private pendingUpdates: Uint8Array[] = [];
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly BATCH_DELAY_MS = 15;
+
   constructor(
     private peerId: string,
     private documentManager: DocumentManager,
@@ -259,6 +264,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
 
   /**
    * Send a local update to the peer (for live sync).
+   * Uses micro-batching to combine rapid updates within 15ms window.
    */
   async sendUpdate(updates: Uint8Array): Promise<void> {
     if (this.state !== "live" || !this.stream) {
@@ -266,11 +272,55 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       return;
     }
 
-    try {
-      await this.sendMessage(createUpdatesMessage(updates, 0)); // opCount unknown
-    } catch (error) {
-      this.logger.error("Failed to send update:", error);
+    // Add to pending batch
+    this.pendingUpdates.push(updates);
+
+    // Schedule flush if not already scheduled
+    if (!this.flushTimer) {
+      this.flushTimer = setTimeout(() => {
+        this.flushUpdates().catch((err) => {
+          this.logger.error("Failed to flush updates:", err);
+        });
+      }, this.BATCH_DELAY_MS);
     }
+  }
+
+  /**
+   * Flush all pending updates as a single combined message.
+   */
+  private async flushUpdates(): Promise<void> {
+    this.flushTimer = null;
+
+    if (this.pendingUpdates.length === 0 || this.state !== "live" || !this.stream) {
+      return;
+    }
+
+    // Combine all pending updates into one
+    const combined = this.concatenateUpdates(this.pendingUpdates);
+    this.pendingUpdates = [];
+
+    try {
+      await this.sendMessage(createUpdatesMessage(combined, 0));
+    } catch (error) {
+      this.logger.error("Failed to send batched update:", error);
+    }
+  }
+
+  /**
+   * Concatenate multiple Uint8Array updates into one.
+   */
+  private concatenateUpdates(arrays: Uint8Array[]): Uint8Array {
+    if (arrays.length === 0) return new Uint8Array(0);
+    if (arrays.length === 1) return arrays[0]!;
+
+    const totalLength = arrays.reduce((sum, arr) => sum + arr.length, 0);
+    const result = new Uint8Array(totalLength);
+    let offset = 0;
+    for (const arr of arrays) {
+      result.set(arr, offset);
+      offset += arr.length;
+    }
+    return result;
   }
 
   /**
@@ -296,6 +346,21 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     this.aborted = true;
     this.stopPingTimer();
     this.stopLocalUpdateSubscription();
+
+    // Clear micro-batch timer and flush any pending updates
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    // Try to flush pending updates before closing
+    if (this.pendingUpdates.length > 0 && this.stream) {
+      try {
+        await this.flushUpdates();
+      } catch {
+        // Ignore flush errors on close
+      }
+    }
+    this.pendingUpdates = [];
 
     if (this.stream) {
       try {
