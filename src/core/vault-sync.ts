@@ -25,7 +25,7 @@ export interface VaultSyncConfig {
 const DEFAULT_CONFIG: VaultSyncConfig = {
   excludedFolders: [".obsidian/plugins", ".obsidian/themes"],
   maxFileSize: 100 * 1024 * 1024, // 100 MB
-  debounceMs: 500,
+  debounceMs: 150, // Reduced from 500 for lower latency
 };
 
 /**
