@@ -27,8 +27,8 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
   private myTicket = "";
   private ticketInput = "";
 
-  // Group expansion state (all start collapsed)
-  private expandedGroups = new Set<string>();
+  // Group expansion state (All Devices expanded by default)
+  private expandedGroups = new Set<string>(["all-devices"]);
 
   // Drag and drop state
   private draggedPeerId: string | null = null;
