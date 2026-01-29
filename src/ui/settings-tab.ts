@@ -31,7 +31,6 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
   private expandedGroups = new Set<string>();
 
   // Status section state
-  private showIds = false;
   private editingNickname = false;
 
   // Collapsible sections
@@ -215,51 +214,6 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
             .onClick(() => {
               this.editingNickname = true;
               this.display();
-            }),
-        );
-    }
-
-    // Line 3: IDs (collapsible)
-    const idSetting = new Setting(container)
-      .setName("IDs")
-      .setDesc(this.showIds ? "Node and vault identifiers" : "Show node and vault IDs")
-      .addExtraButton((btn) =>
-        btn
-          .setIcon(this.showIds ? "chevron-up" : "chevron-down")
-          .setTooltip(this.showIds ? "Hide" : "Show")
-          .onClick(() => {
-            this.showIds = !this.showIds;
-            this.display();
-          }),
-      );
-
-    if (this.showIds) {
-      const nodeId = this.plugin.getNodeId();
-      const vaultId = this.plugin.documentManager?.getVaultId() ?? "Not initialized";
-
-      new Setting(container)
-        .setName("Node ID")
-        .setDesc(nodeId.substring(0, 20) + "...")
-        .addExtraButton((btn) =>
-          btn
-            .setIcon("copy")
-            .setTooltip("Copy")
-            .onClick(() => {
-              navigator.clipboard.writeText(nodeId);
-              new Notice("Node ID copied");
-            }),
-        );
-
-      new Setting(container)
-        .setName("Vault ID")
-        .setDesc(vaultId.substring(0, 20) + "...")
-        .addExtraButton((btn) =>
-          btn
-            .setIcon("copy")
-            .setTooltip("Copy")
-            .onClick(() => {
-              navigator.clipboard.writeText(vaultId);
-              new Notice("Vault ID copied");
             }),
         );
     }
@@ -952,6 +906,36 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
       );
 
     if (!isExpanded) return;
+
+    // Node ID
+    const nodeId = this.plugin.getNodeId();
+    new Setting(container)
+      .setName("Node ID")
+      .setDesc(nodeId.substring(0, 20) + "...")
+      .addExtraButton((btn) =>
+        btn
+          .setIcon("copy")
+          .setTooltip("Copy")
+          .onClick(() => {
+            navigator.clipboard.writeText(nodeId);
+            new Notice("Node ID copied");
+          }),
+      );
+
+    // Vault ID
+    const vaultId = this.plugin.documentManager?.getVaultId() ?? "Not initialized";
+    new Setting(container)
+      .setName("Vault ID")
+      .setDesc(vaultId.substring(0, 20) + "...")
+      .addExtraButton((btn) =>
+        btn
+          .setIcon("copy")
+          .setTooltip("Copy")
+          .onClick(() => {
+            navigator.clipboard.writeText(vaultId);
+            new Notice("Vault ID copied");
+          }),
+      );
 
     new Setting(container)
       .setName("Show status bar")
