@@ -547,12 +547,15 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     // Get effective sync policy for this peer
     const syncPolicy = this.groupManager.getEffectiveSyncPolicy(peer.nodeId);
 
+    // Allow vault adoption on first sync (peer has never synced before)
+    const isFirstSync = peer.lastSynced === undefined;
+
     // Create new session with blob store for binary sync
     const session = new SyncSession(
       peer.nodeId,
       this.documentManager,
       this.logger,
-      { peerIsReadOnly: syncPolicy.readOnly },
+      { peerIsReadOnly: syncPolicy.readOnly, allowVaultAdoption: isFirstSync },
       this.blobStore,
     );
 

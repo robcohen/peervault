@@ -558,6 +558,13 @@ export class DocumentManager {
   }
 
   /**
+   * Set the vault ID (used when adopting a peer's vault ID during first sync).
+   */
+  setVaultId(vaultId: string): void {
+    this.meta.set("vaultId", vaultId);
+  }
+
+  /**
    * Get the underlying Loro document (for advanced operations).
    */
   getLoro(): LoroDoc {

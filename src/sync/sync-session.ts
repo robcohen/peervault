@@ -53,15 +53,20 @@ export interface SyncSessionConfig {
 
   /** If true, don't import updates from this peer (they can only receive) */
   peerIsReadOnly?: boolean;
+
+  /** If true, adopt peer's vault ID on first sync instead of rejecting on mismatch */
+  allowVaultAdoption?: boolean;
 }
 
 const DEFAULT_CONFIG: Omit<Required<SyncSessionConfig>, "encryption"> & {
   peerIsReadOnly: boolean;
+  allowVaultAdoption: boolean;
 } = {
   pingInterval: 30000,
   pingTimeout: 10000,
   maxRetries: 3,
   peerIsReadOnly: false,
+  allowVaultAdoption: false,
 };
 
 /** Sync session events */
@@ -177,12 +182,21 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       const peerVersionInfo = peerMessage as VersionInfoMessage;
 
       // Validate vault ID
-      const ourVaultId = this.documentManager.getVaultId();
+      let ourVaultId = this.documentManager.getVaultId();
       if (peerVersionInfo.vaultId !== ourVaultId) {
-        await this.sendMessage(
-          createErrorMessage(SyncErrorCode.VAULT_MISMATCH, "Vault ID mismatch"),
-        );
-        throw SyncErrors.vaultMismatch(ourVaultId, peerVersionInfo.vaultId);
+        if (this.config.allowVaultAdoption) {
+          // First sync with this peer - adopt their vault ID
+          this.logger.info(
+            `Adopting peer's vault ID: ${peerVersionInfo.vaultId} (was: ${ourVaultId})`,
+          );
+          this.documentManager.setVaultId(peerVersionInfo.vaultId);
+          ourVaultId = peerVersionInfo.vaultId;
+        } else {
+          await this.sendMessage(
+            createErrorMessage(SyncErrorCode.VAULT_MISMATCH, "Vault ID mismatch"),
+          );
+          throw SyncErrors.vaultMismatch(ourVaultId, peerVersionInfo.vaultId);
+        }
       }
 
       // Send our version info
