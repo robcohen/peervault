@@ -13,7 +13,7 @@ import { EncryptionModal } from "./encryption-modal";
 import { SelectiveSyncModal } from "./selective-sync-modal";
 import { ConflictModal } from "./conflict-modal";
 import { FileHistoryModal } from "./file-history-modal";
-import { GroupModal, GroupPeersModal } from "./group-modal";
+import { GroupModal } from "./group-modal";
 import { showConfirm } from "./confirm-modal";
 import { STATUS_ICONS } from "./status-icons";
 import { DEFAULT_GROUP_ID } from "../peer/groups";
@@ -28,6 +28,9 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
   private showAddDevice = false;
   private myTicket = "";
   private ticketInput = "";
+
+  // Group expansion state
+  private expandedGroups = new Set<string>();
 
   constructor(app: App, plugin: PeerVaultPlugin) {
     super(app, plugin);
@@ -49,11 +52,8 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
     // Status Section
     this.renderStatusSection(containerEl);
 
-    // Devices Section
+    // Devices Section (includes groups)
     this.renderDevicesSection(containerEl);
-
-    // Peer Groups Section
-    this.renderPeerGroupsSection(containerEl);
 
     // Security Section
     this.renderSecuritySection(containerEl);
@@ -299,6 +299,9 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
   private renderDevicesSection(container: HTMLElement): void {
     container.createEl("h3", { text: "Devices" });
 
+    const groupManager = this.plugin.peerManager?.getGroupManager();
+    const allPeers = this.plugin.peerManager?.getPeers() ?? [];
+
     // 1. Pending pairing requests (most important - show first)
     const pairingRequests = this.plugin.peerManager?.getPendingPairingRequests() ?? [];
     if (pairingRequests.length > 0) {
@@ -334,43 +337,71 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
       }
     }
 
-    // 2. Connected devices
-    const peers = this.plugin.getConnectedPeers();
-    if (peers.length > 0) {
-      for (const peer of peers) {
-        const stateIcon = this.getStateIcon(peer.connectionState);
-        const stateText =
-          peer.connectionState.charAt(0).toUpperCase() +
-          peer.connectionState.slice(1);
+    // 2. Render groups with their devices
+    if (groupManager) {
+      const groups = groupManager.getGroups();
 
-        const displayName = peer.hostname
-          ? (peer.nickname ? `${peer.hostname} (${peer.nickname})` : peer.hostname)
-          : (peer.nickname || nodeIdToWords(peer.nodeId));
-        new Setting(container)
-          .setName(`${stateIcon} ${displayName}`)
-          .setDesc(`${stateText} • ${peer.nodeId.substring(0, 8)}...`)
+      for (const group of groups) {
+        const isExpanded = this.expandedGroups.has(group.id);
+        const peersInGroup = allPeers.filter((p) => group.peerIds.includes(p.nodeId));
+        const isDefault = group.id === DEFAULT_GROUP_ID;
+
+        // Group header (collapsible)
+        const groupHeader = new Setting(container)
+          .setName(`${group.icon} ${group.name}`)
+          .setDesc(`${peersInGroup.length} device(s)`)
+          .setClass("peervault-group-header")
           .addExtraButton((btn) =>
             btn
-              .setIcon("trash")
-              .setTooltip("Remove device")
-              .onClick(async () => {
-                const confirmed = await showConfirm(this.app, {
-                  title: "Remove Device",
-                  message: `Remove "${displayName}" from sync?`,
-                  confirmText: "Remove",
-                  isDestructive: true,
-                });
-                if (confirmed) {
-                  await this.plugin.peerManager.removePeer(peer.nodeId);
-                  new Notice("Device removed");
-                  this.display();
+              .setIcon(isExpanded ? "chevron-up" : "chevron-down")
+              .setTooltip(isExpanded ? "Collapse" : "Expand")
+              .onClick(() => {
+                if (isExpanded) {
+                  this.expandedGroups.delete(group.id);
+                } else {
+                  this.expandedGroups.add(group.id);
                 }
+                this.display();
               }),
           );
+
+        // If expanded, show devices and settings
+        if (isExpanded) {
+          const groupContent = container.createDiv({ cls: "peervault-group-content" });
+
+          // Devices in this group
+          if (peersInGroup.length === 0) {
+            groupContent.createEl("p", {
+              text: "No devices in this group",
+              cls: "peervault-empty-state",
+            });
+          } else {
+            for (const peer of peersInGroup) {
+              this.renderDeviceInGroup(groupContent, peer, group, isDefault);
+            }
+          }
+
+          // Inline group settings
+          this.renderInlineGroupSettings(groupContent, group, isDefault);
+        }
       }
+
+      // 3. Create Group button
+      new Setting(container)
+        .addButton((btn) =>
+          btn
+            .setButtonText("+ Create Group")
+            .onClick(() => {
+              new GroupModal(this.app, this.plugin, undefined, () => {
+                this.display();
+              }).open();
+            }),
+        );
     }
 
-    // 3. Add Device section (collapsible)
+    // 4. Add Device section (collapsible)
+    container.createEl("div", { cls: "peervault-section-divider" });
+
     const addDeviceHeader = new Setting(container)
       .setName("Add Device")
       .setDesc(this.showAddDevice ? "Pair a new device" : "Click to expand")
@@ -384,12 +415,128 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
           }),
       );
 
-    if (peers.length === 0 && pairingRequests.length === 0) {
+    if (allPeers.length === 0 && pairingRequests.length === 0) {
       addDeviceHeader.setDesc("No devices paired yet. Expand to add one.");
     }
 
     if (this.showAddDevice) {
       this.renderAddDeviceSection(container);
+    }
+  }
+
+  private renderDeviceInGroup(
+    container: HTMLElement,
+    peer: { nodeId: string; hostname?: string; nickname?: string; state: string },
+    group: { id: string; peerIds: string[] },
+    isDefaultGroup: boolean,
+  ): void {
+    const stateIcon = this.getStateIcon(peer.state as any);
+    const displayName = peer.hostname
+      ? (peer.nickname ? `${peer.hostname} (${peer.nickname})` : peer.hostname)
+      : (peer.nickname || nodeIdToWords(peer.nodeId));
+
+    const setting = new Setting(container)
+      .setName(`${stateIcon} ${displayName}`)
+      .setDesc(peer.nodeId.substring(0, 8) + "...")
+      .setClass("peervault-device-item");
+
+    // Remove from group button (not for default group)
+    if (!isDefaultGroup) {
+      setting.addExtraButton((btn) =>
+        btn
+          .setIcon("x")
+          .setTooltip("Remove from group")
+          .onClick(() => {
+            this.plugin.peerManager?.getGroupManager()?.removePeerFromGroup(group.id, peer.nodeId);
+            new Notice("Device removed from group");
+            this.display();
+          }),
+      );
+    }
+
+    // Delete device button
+    setting.addExtraButton((btn) =>
+      btn
+        .setIcon("trash")
+        .setTooltip("Delete device")
+        .onClick(async () => {
+          const confirmed = await showConfirm(this.app, {
+            title: "Remove Device",
+            message: `Remove "${displayName}" from sync entirely?`,
+            confirmText: "Remove",
+            isDestructive: true,
+          });
+          if (confirmed) {
+            await this.plugin.peerManager?.removePeer(peer.nodeId);
+            new Notice("Device removed");
+            this.display();
+          }
+        }),
+    );
+  }
+
+  private renderInlineGroupSettings(
+    container: HTMLElement,
+    group: { id: string; name: string; syncPolicy: { readOnly: boolean; excludedFolders: string[]; autoConnect: boolean; priority: number } },
+    isDefaultGroup: boolean,
+  ): void {
+    const settingsDiv = container.createDiv({ cls: "peervault-group-settings" });
+    settingsDiv.createEl("div", { text: "Group Settings", cls: "peervault-settings-label" });
+
+    // Excluded folders display
+    const excludedCount = group.syncPolicy.excludedFolders.length;
+    new Setting(settingsDiv)
+      .setName("Excluded folders")
+      .setDesc(excludedCount > 0 ? group.syncPolicy.excludedFolders.join(", ") : "None")
+      .addExtraButton((btn) =>
+        btn
+          .setIcon("pencil")
+          .setTooltip("Edit excluded folders")
+          .onClick(() => {
+            new GroupModal(this.app, this.plugin, group as any, () => {
+              this.display();
+            }).open();
+          }),
+      );
+
+    // Read-only toggle
+    new Setting(settingsDiv)
+      .setName("Read-only")
+      .setDesc("Devices can receive but not send changes")
+      .addToggle((toggle) =>
+        toggle.setValue(group.syncPolicy.readOnly).onChange((value) => {
+          const groupManager = this.plugin.peerManager?.getGroupManager();
+          if (groupManager) {
+            groupManager.updateGroup(group.id, {
+              syncPolicy: { ...group.syncPolicy, readOnly: value },
+            });
+            new Notice(value ? "Group set to read-only" : "Group set to read-write");
+          }
+        }),
+      );
+
+    // Delete group button (not for default)
+    if (!isDefaultGroup) {
+      new Setting(settingsDiv)
+        .addButton((btn) =>
+          btn
+            .setButtonText("Delete Group")
+            .setWarning()
+            .onClick(async () => {
+              const confirmed = await showConfirm(this.app, {
+                title: "Delete Group",
+                message: `Delete "${group.name}"? Devices will remain but won't be in this group.`,
+                confirmText: "Delete",
+                isDestructive: true,
+              });
+              if (confirmed) {
+                this.plugin.peerManager?.getGroupManager()?.deleteGroup(group.id);
+                this.expandedGroups.delete(group.id);
+                new Notice("Group deleted");
+                this.display();
+              }
+            }),
+        );
     }
   }
 
@@ -572,102 +719,6 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
         reject(new Error("Failed to load image"));
       };
       img.src = objectUrl;
-    });
-  }
-
-  private renderPeerGroupsSection(container: HTMLElement): void {
-    container.createEl("h3", { text: "Device Groups" });
-
-    const groupManager = this.plugin.peerManager?.getGroupManager();
-    if (!groupManager) {
-      new Setting(container)
-        .setName("Groups unavailable")
-        .setDesc("Peer manager not initialized");
-      return;
-    }
-
-    const groups = groupManager.getGroups();
-
-    // List existing groups
-    for (const group of groups) {
-      const isDefault = group.id === DEFAULT_GROUP_ID;
-      const peerCount = group.peerIds.length;
-      const excludedCount = group.syncPolicy.excludedFolders.length;
-
-      let desc = `${peerCount} device(s)`;
-      if (excludedCount > 0) {
-        desc += ` • ${excludedCount} folder(s) excluded`;
-      }
-      if (group.syncPolicy.readOnly) {
-        desc += " • Read-only";
-      }
-
-      const setting = new Setting(container)
-        .setName(`${group.icon} ${group.name}`)
-        .setDesc(desc);
-
-      // Manage peers button
-      setting.addExtraButton((btn) =>
-        btn
-          .setIcon("users")
-          .setTooltip("Manage devices")
-          .onClick(() => {
-            new GroupPeersModal(this.app, this.plugin, group).open();
-          }),
-      );
-
-      // Edit button
-      setting.addExtraButton((btn) =>
-        btn
-          .setIcon("pencil")
-          .setTooltip("Edit group")
-          .onClick(() => {
-            new GroupModal(this.app, this.plugin, group, () => {
-              this.display();
-            }).open();
-          }),
-      );
-
-      // Delete button (not for default group)
-      if (!isDefault) {
-        setting.addExtraButton((btn) =>
-          btn
-            .setIcon("trash")
-            .setTooltip("Delete group")
-            .onClick(async () => {
-              const confirmed = await showConfirm(this.app, {
-                title: "Delete Group",
-                message: `Delete group "${group.name}"?\n\nDevices will remain but won't be in this group.`,
-                confirmText: "Delete",
-                isDestructive: true,
-              });
-              if (confirmed) {
-                try {
-                  groupManager.deleteGroup(group.id);
-                  new Notice(`Group "${group.name}" deleted`);
-                  this.display();
-                } catch (error) {
-                  new Notice(`Failed to delete group: ${error}`);
-                }
-              }
-            }),
-        );
-      }
-    }
-
-    // Create new group button
-    new Setting(container).addButton((btn) =>
-      btn.setButtonText("Create Group").onClick(() => {
-        new GroupModal(this.app, this.plugin, undefined, () => {
-          this.display();
-        }).open();
-      }),
-    );
-
-    // Help text
-    container.createEl("p", {
-      text: "Groups let you organize devices and apply different sync policies to each group.",
-      cls: "peervault-help-text setting-item-description",
     });
   }
 

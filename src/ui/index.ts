@@ -25,5 +25,5 @@ export { FileHistoryModal, type FileVersion } from "./file-history-modal";
 export { SelectiveSyncModal } from "./selective-sync-modal";
 export { EncryptionModal } from "./encryption-modal";
 export { ConflictModal } from "./conflict-modal";
-export { GroupModal, GroupPeersModal } from "./group-modal";
+export { GroupModal } from "./group-modal";
 export { STATUS_ICONS, getPeerStateIcon, getStatusLabel } from "./status-icons";
