@@ -6,10 +6,11 @@
 
 import { App, Modal, Notice, Setting } from "obsidian";
 import type PeerVaultPlugin from "../main";
-import type { SyncStatus } from "../types";
+import { UI_LIMITS, type SyncStatus } from "../types";
 import { STATUS_ICONS } from "./status-icons";
 import { nodeIdToWords } from "../utils/device";
 import { timeAgo } from "./utils/time-utils";
+import { formatUserError } from "../utils/validation";
 
 /** Sync progress info */
 export interface SyncProgress {
@@ -384,7 +385,7 @@ export class ConnectionStatusModal extends Modal {
 
     const list = section.createDiv({ cls: "peervault-error-list" });
 
-    for (const error of errors.slice(0, 5)) {
+    for (const error of errors.slice(0, UI_LIMITS.maxDisplayedErrors)) {
       const item = list.createDiv({ cls: "peervault-error-item" });
 
       const header = item.createDiv({ cls: "peervault-error-header" });
@@ -424,8 +425,17 @@ export class ConnectionStatusModal extends Modal {
           .setButtonText("Sync Now")
           .setCta()
           .onClick(async () => {
-            this.close();
-            await this.plugin.sync();
+            btn.setDisabled(true);
+            btn.setButtonText("Syncing...");
+            try {
+              await this.plugin.sync();
+              new Notice("Sync completed");
+              this.close();
+            } catch (error) {
+              new Notice(`Sync failed: ${formatUserError(error)}`);
+              btn.setDisabled(false);
+              btn.setButtonText("Sync Now");
+            }
           }),
       )
       .addButton((btn) =>

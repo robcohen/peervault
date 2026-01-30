@@ -180,6 +180,16 @@ export const SyncErrors = {
       true,
       { messageType },
     ),
+
+  timeout: (details: string) =>
+    new PeerVaultError(
+      `Sync timeout: ${details}`,
+      "SYNC_TIMEOUT",
+      ErrorCategory.SYNC,
+      ErrorSeverity.ERROR,
+      true,
+      { details },
+    ),
 };
 
 /**

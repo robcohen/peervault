@@ -6,21 +6,25 @@
 
 import { App, Platform, PluginSettingTab, Setting, Notice, Modal } from "obsidian";
 import type PeerVaultPlugin from "../main";
-import { getDeviceHostname, nodeIdToWords } from "../utils/device";
-import { getConflictTracker } from "../core/conflict-tracker";
-import { SelectiveSyncModal } from "./selective-sync-modal";
-import { ConflictModal } from "./conflict-modal";
-import { FileHistoryModal } from "./file-history-modal";
+import { nodeIdToWords } from "../utils/device";
 import { GroupModal } from "./group-modal";
 import { showConfirm } from "./confirm-modal";
 import { STATUS_ICONS } from "./status-icons";
 import { DEFAULT_GROUP_ID, type PeerGroup } from "../peer/groups";
+import { formatUserError } from "../utils/validation";
 import {
   generateQRCode,
-  scanQRFromImage,
   openQRFilePicker,
-  scanQRFromClipboard,
 } from "./utils/qr-utils";
+import {
+  renderStatusSection,
+  resetStatusSectionState,
+  renderSyncSection,
+  renderStorageSection,
+  renderAdvancedSection,
+  renderDangerZone,
+  type SectionContext,
+} from "./settings";
 
 export class PeerVaultSettingsTab extends PluginSettingTab {
   plugin: PeerVaultPlugin;
@@ -39,11 +43,18 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
   // Drag and drop state
   private draggedPeerId: string | null = null;
 
-  // Status section state
-  private editingNickname = false;
-
   // Collapsible sections (all start collapsed)
   private expandedSections = new Set<string>();
+
+  /** Context for section renderers */
+  private getSectionContext(): SectionContext {
+    return {
+      app: this.app,
+      plugin: this.plugin,
+      refresh: () => this.display(),
+      expandedSections: this.expandedSections,
+    };
+  }
 
   constructor(app: App, plugin: PeerVaultPlugin) {
     super(app, plugin);
@@ -59,23 +70,25 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
 
     containerEl.createEl("h2", { text: "PeerVault Settings" });
 
-    // Status Section
-    this.renderStatusSection(containerEl);
+    const ctx = this.getSectionContext();
 
-    // Devices Section (includes groups)
+    // Status Section
+    renderStatusSection(containerEl, ctx);
+
+    // Devices Section (includes groups) - kept inline due to complexity
     this.renderDevicesSection(containerEl);
 
     // Sync Section
-    this.renderSyncSection(containerEl);
+    renderSyncSection(containerEl, ctx);
 
     // Storage & Maintenance Section
-    this.renderStorageSection(containerEl);
+    renderStorageSection(containerEl, ctx);
 
     // Advanced Section
-    this.renderAdvancedSection(containerEl);
+    renderAdvancedSection(containerEl, ctx);
 
     // Danger Zone
-    this.renderDangerZone(containerEl);
+    renderDangerZone(containerEl, ctx);
   }
 
   override hide(): void {
@@ -90,6 +103,9 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
       cleanup();
     }
     this.eventCleanup = [];
+
+    // Reset section states
+    resetStatusSectionState();
   }
 
   private subscribeToEvents(): void {
@@ -130,126 +146,12 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
     }
   }
 
-  private renderStatusSection(container: HTMLElement): void {
-    container.createEl("h3", { text: "Status" });
-
-    // Get stats
-    const peers = this.plugin.getConnectedPeers();
-    const connectedCount = peers.filter(
-      (p) => p.connectionState === "connected" || p.connectionState === "syncing",
-    ).length;
-    const fileCount = this.plugin.documentManager?.listAllPaths().length ?? 0;
-    const hostname = getDeviceHostname();
-    const autoNickname = nodeIdToWords(this.plugin.getNodeId());
-    const nickname = this.plugin.settings.deviceNickname || autoNickname;
-
-    // Line 1: Connection stats
-    new Setting(container)
-      .setName(`${connectedCount}/${peers.length} devices connected`)
-      .setDesc(`${fileCount} files synced`)
-      .addExtraButton((btn) =>
-        btn
-          .setIcon("refresh-cw")
-          .setTooltip("Refresh")
-          .onClick(() => this.display()),
-      );
-
-    // Line 2: This device identity
-    if (this.editingNickname) {
-      // Editing mode
-      const currentNickname = this.plugin.settings.deviceNickname ?? "";
-      let pendingNickname = currentNickname;
-
-      new Setting(container)
-        .setName("Edit nickname")
-        .setDesc(`Auto-generated: "${autoNickname}"`)
-        .addText((text) => {
-          text
-            .setPlaceholder(autoNickname)
-            .setValue(currentNickname)
-            .onChange((value) => {
-              pendingNickname = value.trim();
-            });
-        })
-        .addButton((btn) =>
-          btn
-            .setButtonText("Save")
-            .setCta()
-            .onClick(async () => {
-              btn.setButtonText("Saving...");
-              btn.setDisabled(true);
-
-              this.plugin.settings.deviceNickname = pendingNickname || undefined;
-              await this.plugin.saveSettings();
-
-              const newNickname = pendingNickname || autoNickname;
-              if (this.plugin.peerManager) {
-                this.plugin.peerManager.setOwnNickname(newNickname);
-              }
-
-              try {
-                const peerManager = this.plugin.peerManager;
-                if (peerManager) {
-                  for (const peer of peerManager.getPeers()) {
-                    await peerManager.closeSession(peer.nodeId);
-                  }
-                  await peerManager.syncAll();
-                }
-                new Notice("Nickname updated");
-              } catch {
-                new Notice("Nickname saved");
-              }
-
-              this.editingNickname = false;
-              this.display();
-            }),
-        )
-        .addButton((btn) =>
-          btn.setButtonText("Cancel").onClick(() => {
-            this.editingNickname = false;
-            this.display();
-          }),
-        );
-    } else {
-      // Display mode
-      new Setting(container)
-        .setName(`This device: ${hostname}`)
-        .setDesc(`Nickname: ${nickname}`)
-        .addExtraButton((btn) =>
-          btn
-            .setIcon("pencil")
-            .setTooltip("Edit nickname")
-            .onClick(() => {
-              this.editingNickname = true;
-              this.display();
-            }),
-        );
-    }
-
-    // Conflicts (only if present)
-    const tracker = getConflictTracker();
-    const conflictCount = tracker.getConflictCount();
-    if (conflictCount > 0) {
-      new Setting(container)
-        .setName("Concurrent edits")
-        .setDesc(`${conflictCount} file(s) need review`)
-        .addButton((btn) =>
-          btn
-            .setButtonText("Review")
-            .setWarning()
-            .onClick(() => {
-              new ConflictModal(this.app, this.plugin).open();
-            }),
-        );
-    }
-  }
-
   private renderDevicesSection(container: HTMLElement): void {
     container.createEl("h3", { text: "Devices" });
 
     const groupManager = this.plugin.peerManager?.getGroupManager();
     const allPeers = this.plugin.peerManager?.getPeers() ?? [];
-    const userGroups = groupManager?.getGroups().filter((g) => g.id !== DEFAULT_GROUP_ID) ?? [];
+    const userGroups = (groupManager?.getGroups() ?? []).filter((g) => g.id !== DEFAULT_GROUP_ID);
 
     // 1. Pending pairing requests (most important - show first)
     const pairingRequests = this.plugin.peerManager?.getPendingPairingRequests() ?? [];
@@ -272,15 +174,19 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
                 await this.plugin.peerManager?.acceptPairingRequest(request.nodeId);
                 new Notice("Device paired successfully!");
               } catch (error) {
-                new Notice(`Failed to accept: ${error}`);
+                new Notice(`Failed to accept: ${formatUserError(error)}`);
               }
             }),
         );
 
         setting.addButton((btn) =>
           btn.setButtonText("Deny").onClick(async () => {
-            await this.plugin.peerManager?.denyPairingRequest(request.nodeId);
-            new Notice("Pairing denied");
+            try {
+              await this.plugin.peerManager?.denyPairingRequest(request.nodeId);
+              new Notice("Pairing denied");
+            } catch (error) {
+              new Notice(`Failed to deny: ${formatUserError(error)}`);
+            }
           }),
         );
       }
@@ -316,7 +222,10 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
         });
       } else {
         for (const peer of allPeers) {
-          this.renderDeviceInAllDevices(allDevicesContent, peer, userGroups);
+          this.renderDevice(allDevicesContent, peer, {
+            draggable: true,
+            showDragHint: userGroups.length > 0,
+          });
         }
       }
     }
@@ -387,7 +296,7 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
             });
           } else {
             for (const peer of peersInGroup) {
-              this.renderDeviceInGroup(groupContent, peer, group, false);
+              this.renderDevice(groupContent, peer, { group, isDefaultGroup: false });
             }
           }
 
@@ -523,28 +432,6 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
     );
   }
 
-  /** @deprecated Use renderDevice with { draggable: true, showDragHint: true } */
-  private renderDeviceInAllDevices(
-    container: HTMLElement,
-    peer: { nodeId: string; hostname?: string; nickname?: string; state: string },
-    userGroups: { id: string; name: string; icon: string; peerIds: string[] }[],
-  ): void {
-    this.renderDevice(container, peer, {
-      draggable: true,
-      showDragHint: userGroups.length > 0,
-    });
-  }
-
-  /** @deprecated Use renderDevice with group context */
-  private renderDeviceInGroup(
-    container: HTMLElement,
-    peer: { nodeId: string; hostname?: string; nickname?: string; state: string },
-    group: { id: string; peerIds: string[] },
-    isDefaultGroup: boolean,
-  ): void {
-    this.renderDevice(container, peer, { group, isDefaultGroup });
-  }
-
   private renderInlineGroupSettings(
     container: HTMLElement,
     group: PeerGroup,
@@ -627,7 +514,7 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
               try {
                 this.myTicket = await this.plugin.generateInvite();
               } catch (error) {
-                new Notice(`Failed to generate invite: ${error}`);
+                new Notice(`Failed to generate invite: ${formatUserError(error)}`);
                 this.showMyQR = false;
               }
             }
@@ -659,12 +546,24 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
     section.createEl("div", { cls: "peervault-section-divider" });
 
     const isValidTicket = (ticket: string): boolean => {
-      if (!ticket || ticket.length < 20) return false;
+      if (!ticket || ticket.length < 20) {
+        this.plugin.logger.debug("Ticket validation failed: too short or empty");
+        return false;
+      }
       try {
         const parsed = JSON.parse(ticket);
         // Must have id (node ID) and addrs array
-        return typeof parsed.id === "string" && parsed.id.length > 0 && Array.isArray(parsed.addrs);
-      } catch {
+        const valid = typeof parsed.id === "string" && parsed.id.length > 0 && Array.isArray(parsed.addrs);
+        if (!valid) {
+          this.plugin.logger.debug("Ticket validation failed: missing id or addrs", {
+            hasId: typeof parsed.id === "string",
+            idLength: parsed.id?.length ?? 0,
+            hasAddrs: Array.isArray(parsed.addrs),
+          });
+        }
+        return valid;
+      } catch (err) {
+        this.plugin.logger.debug("Ticket validation failed: JSON parse error", err);
         return false;
       }
     };
@@ -728,7 +627,7 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
               this.showAddDevice = false;
               this.display();
             } catch (error) {
-              new Notice(`Connection failed: ${error}`);
+              new Notice(`Connection failed: ${formatUserError(error)}`);
               btn.setButtonText("Connect");
               updateValidation();
             }
@@ -778,429 +677,6 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
       this.display();
     });
     modal.open();
-  }
-
-  private renderSyncSection(container: HTMLElement): void {
-    const isExpanded = this.expandedSections.has("sync");
-
-    new Setting(container)
-      .setName("Sync Settings")
-      .setHeading()
-      .addExtraButton((btn) =>
-        btn
-          .setIcon(isExpanded ? "chevron-up" : "chevron-down")
-          .setTooltip(isExpanded ? "Collapse" : "Expand")
-          .onClick(() => {
-            if (isExpanded) this.expandedSections.delete("sync");
-            else this.expandedSections.add("sync");
-            this.display();
-          }),
-      );
-
-    if (!isExpanded) return;
-
-    new Setting(container)
-      .setName("Sync now")
-      .setDesc("Manually trigger a sync with all connected devices")
-      .addButton((btn) =>
-        btn
-          .setButtonText("Sync Now")
-          .setCta()
-          .onClick(async () => {
-            try {
-              await this.plugin.sync();
-              new Notice("Sync completed");
-            } catch (error) {
-              new Notice(`Sync failed: ${error}`);
-            }
-          }),
-      );
-
-    new Setting(container)
-      .setName("Auto-sync")
-      .setDesc("Automatically sync changes with connected devices")
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.autoSync)
-          .onChange(async (value) => {
-            this.plugin.settings.autoSync = value;
-            await this.plugin.saveSettings();
-          }),
-      );
-
-    new Setting(container)
-      .setName("Sync interval")
-      .setDesc("How often to sync (seconds, 0 = real-time)")
-      .addSlider((slider) =>
-        slider
-          .setLimits(0, 300, 10)
-          .setValue(this.plugin.settings.syncInterval)
-          .setDynamicTooltip()
-          .onChange(async (value) => {
-            this.plugin.settings.syncInterval = value;
-            await this.plugin.saveSettings();
-          }),
-      );
-
-    new Setting(container)
-      .setName("Selective sync")
-      .setDesc("Choose which folders to sync")
-      .addButton((btn) =>
-        btn.setButtonText("Configure").onClick(() => {
-          new SelectiveSyncModal(this.app, this.plugin).open();
-        }),
-      );
-
-    // Show current exclusions summary
-    const excluded = this.plugin.settings.excludedFolders;
-    if (excluded.length > 0) {
-      const summary =
-        excluded.slice(0, 3).join(", ") +
-        (excluded.length > 3 ? ` +${excluded.length - 3} more` : "");
-      new Setting(container)
-        .setName("Excluded folders")
-        .setDesc(summary)
-        .addExtraButton((btn) =>
-          btn
-            .setIcon("pencil")
-            .setTooltip("Edit")
-            .onClick(() => {
-              new SelectiveSyncModal(this.app, this.plugin).open();
-            }),
-        );
-    }
-
-    new Setting(container)
-      .setName("File history")
-      .setDesc("View and restore previous versions of files")
-      .addButton((btn) =>
-        btn.setButtonText("Open").onClick(() => {
-          new FileHistoryModal(this.app, this.plugin).open();
-        }),
-      );
-  }
-
-  private renderStorageSection(container: HTMLElement): void {
-    const isExpanded = this.expandedSections.has("storage");
-
-    new Setting(container)
-      .setName("Storage & Maintenance")
-      .setHeading()
-      .addExtraButton((btn) =>
-        btn
-          .setIcon(isExpanded ? "chevron-up" : "chevron-down")
-          .setTooltip(isExpanded ? "Collapse" : "Expand")
-          .onClick(() => {
-            if (isExpanded) this.expandedSections.delete("storage");
-            else this.expandedSections.add("storage");
-            this.display();
-          }),
-      );
-
-    if (!isExpanded) return;
-
-    // GC enabled toggle
-    new Setting(container)
-      .setName("Garbage collection")
-      .setDesc("Automatically compact documents and clean up unused data")
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.gcEnabled)
-          .onChange(async (value) => {
-            this.plugin.settings.gcEnabled = value;
-            await this.plugin.saveSettings();
-          }),
-      );
-
-    // Only show detailed settings if GC is enabled
-    if (this.plugin.settings.gcEnabled) {
-      // Max document size
-      new Setting(container)
-        .setName("Compact when larger than")
-        .setDesc("Document size threshold for automatic compaction (MB)")
-        .addSlider((slider) =>
-          slider
-            .setLimits(10, 200, 10)
-            .setValue(this.plugin.settings.gcMaxDocSizeMB)
-            .setDynamicTooltip()
-            .onChange(async (value) => {
-              this.plugin.settings.gcMaxDocSizeMB = value;
-              await this.plugin.saveSettings();
-            }),
-        );
-
-      // Minimum history days
-      new Setting(container)
-        .setName("Preserve history for")
-        .setDesc("Minimum days of edit history to keep")
-        .addSlider((slider) =>
-          slider
-            .setLimits(7, 365, 7)
-            .setValue(this.plugin.settings.gcMinHistoryDays)
-            .setDynamicTooltip()
-            .onChange(async (value) => {
-              this.plugin.settings.gcMinHistoryDays = value;
-              await this.plugin.saveSettings();
-            }),
-        );
-
-      // Peer consensus
-      new Setting(container)
-        .setName("Require peer sync before cleanup")
-        .setDesc("Only clean up data that has been synced to other devices")
-        .addToggle((toggle) =>
-          toggle
-            .setValue(this.plugin.settings.gcRequirePeerConsensus)
-            .onChange(async (value) => {
-              this.plugin.settings.gcRequirePeerConsensus = value;
-              await this.plugin.saveSettings();
-            }),
-        );
-    }
-
-    // Manual GC button
-    new Setting(container)
-      .setName("Run maintenance now")
-      .setDesc("Manually run garbage collection to free up space")
-      .addButton((btn) =>
-        btn.setButtonText("Run").onClick(async () => {
-          if (!this.plugin.gc) {
-            new Notice("Garbage collector not available");
-            return;
-          }
-
-          btn.setButtonText("Running...");
-          btn.setDisabled(true);
-
-          try {
-            const stats = await this.plugin.gc.run();
-            const docSavedKB = Math.round(
-              (stats.beforeSize - stats.afterSize) / 1024,
-            );
-            const blobSavedKB = Math.round(stats.blobBytesReclaimed / 1024);
-            new Notice(
-              `Maintenance complete:\n` +
-                `• Document: saved ${docSavedKB} KB\n` +
-                `• Blobs: cleaned ${stats.blobsRemoved} (${blobSavedKB} KB)`,
-            );
-          } catch (error) {
-            this.plugin.logger.error("Manual GC failed:", error);
-            new Notice(`Maintenance failed: ${error}`);
-          } finally {
-            btn.setButtonText("Run");
-            btn.setDisabled(false);
-          }
-        }),
-      );
-
-    // Storage info
-    if (this.plugin.documentManager) {
-      const docSize = this.plugin.documentManager.getDocumentSize?.();
-      if (docSize !== undefined) {
-        const sizeKB = Math.round(docSize / 1024);
-        const sizeMB = (docSize / (1024 * 1024)).toFixed(2);
-        new Setting(container)
-          .setName("Document size")
-          .setDesc(`${sizeKB} KB (${sizeMB} MB)`);
-      }
-    }
-  }
-
-  private renderAdvancedSection(container: HTMLElement): void {
-    const isExpanded = this.expandedSections.has("advanced");
-
-    new Setting(container)
-      .setName("Advanced")
-      .setHeading()
-      .addExtraButton((btn) =>
-        btn
-          .setIcon(isExpanded ? "chevron-up" : "chevron-down")
-          .setTooltip(isExpanded ? "Collapse" : "Expand")
-          .onClick(() => {
-            if (isExpanded) this.expandedSections.delete("advanced");
-            else this.expandedSections.add("advanced");
-            this.display();
-          }),
-      );
-
-    if (!isExpanded) return;
-
-    // Node ID
-    const nodeId = this.plugin.getNodeId();
-    new Setting(container)
-      .setName("Node ID")
-      .setDesc(nodeId.substring(0, 20) + "...")
-      .addExtraButton((btn) =>
-        btn
-          .setIcon("copy")
-          .setTooltip("Copy")
-          .onClick(() => {
-            navigator.clipboard.writeText(nodeId);
-            new Notice("Node ID copied");
-          }),
-      );
-
-    // Vault ID
-    const vaultId = this.plugin.documentManager?.getVaultId() ?? "Not initialized";
-    new Setting(container)
-      .setName("Vault ID")
-      .setDesc(vaultId.substring(0, 20) + "...")
-      .addExtraButton((btn) =>
-        btn
-          .setIcon("copy")
-          .setTooltip("Copy")
-          .onClick(() => {
-            navigator.clipboard.writeText(vaultId);
-            new Notice("Vault ID copied");
-          }),
-      );
-
-    new Setting(container)
-      .setName("Show status bar")
-      .setDesc("Display sync status in the status bar")
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.showStatusBar)
-          .onChange(async (value) => {
-            this.plugin.settings.showStatusBar = value;
-            await this.plugin.saveSettings();
-            new Notice("Restart Obsidian to apply");
-          }),
-      );
-
-    new Setting(container)
-      .setName("Debug mode")
-      .setDesc("Enable verbose logging for troubleshooting")
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.debugMode)
-          .onChange(async (value) => {
-            this.plugin.settings.debugMode = value;
-            await this.plugin.saveSettings();
-          }),
-      );
-
-    // Copy logs for debugging
-    new Setting(container)
-      .setName("Copy debug logs")
-      .setDesc("Copy recent logs to clipboard for troubleshooting")
-      .addButton((btn) =>
-        btn.setButtonText("Copy Logs").onClick(async () => {
-          const { getRecentLogs } = await import("../utils/logger");
-          const logs = getRecentLogs(200);
-          if (logs) {
-            await navigator.clipboard.writeText(logs);
-            new Notice("Logs copied to clipboard!");
-          } else {
-            new Notice("No logs available");
-          }
-        }),
-      );
-
-    // Custom relay server
-    new Setting(container)
-      .setName("Custom relay server")
-      .setDesc("Use a relay server closer to you for lower latency. Leave empty for default (US-based).")
-      .addText((text) =>
-        text
-          .setPlaceholder("https://relay.example.com")
-          .setValue(this.plugin.settings.relayServers[0] ?? "")
-          .onChange(async (value) => {
-            if (value.trim()) {
-              this.plugin.settings.relayServers = [value.trim()];
-            } else {
-              this.plugin.settings.relayServers = [];
-            }
-            await this.plugin.saveSettings();
-            new Notice("Restart plugin to use new relay");
-          }),
-      );
-
-    // Connection stats
-    this.renderConnectionStats(container);
-  }
-
-  private renderConnectionStats(container: HTMLElement): void {
-    const peers = this.plugin.peerManager?.getPeers() ?? [];
-    const connectedPeers = peers.filter((p) => p.state === "synced" || p.state === "syncing");
-
-    if (connectedPeers.length === 0) {
-      new Setting(container)
-        .setName("Connection latency")
-        .setDesc("No active connections");
-      return;
-    }
-
-    // Get RTT for each connected peer
-    for (const peer of connectedPeers) {
-      const rtt = this.plugin.peerManager?.getPeerRtt(peer.nodeId);
-      const rttText = rtt !== undefined ? `${Math.round(rtt)}ms` : "measuring...";
-      const displayName = peer.hostname || peer.nickname || peer.nodeId.substring(0, 8);
-
-      new Setting(container)
-        .setName(`Latency: ${displayName}`)
-        .setDesc(`Round-trip time: ${rttText}`);
-    }
-  }
-
-  private renderDangerZone(container: HTMLElement): void {
-    container.createEl("h3", {
-      text: "Danger Zone",
-      cls: "peervault-danger-header",
-    });
-
-    new Setting(container)
-      .setName("Reset sync data")
-      .setDesc(
-        "Delete all sync data and start fresh. Peers will need to re-pair.",
-      )
-      .addButton((btn) =>
-        btn
-          .setButtonText("Reset")
-          .setWarning()
-          .onClick(async () => {
-            const confirmed = await showConfirm(this.app, {
-              title: "Reset PeerVault",
-              message:
-                "Are you sure you want to reset all PeerVault data?\n\n" +
-                "This will:\n" +
-                "- Remove all paired devices\n" +
-                "- Delete sync history\n" +
-                "- Clear encryption keys\n\n" +
-                "Your vault files will NOT be deleted.",
-              confirmText: "Reset",
-              isDestructive: true,
-            });
-            if (confirmed) {
-              await this.resetPlugin();
-            }
-          }),
-      );
-  }
-
-  private async resetPlugin(): Promise<void> {
-    try {
-      // Remove all peers
-      if (this.plugin.peerManager) {
-        const peers = this.plugin.peerManager.getPeers();
-        for (const peer of peers) {
-          await this.plugin.peerManager.removePeer(peer.nodeId);
-        }
-      }
-
-      // Save settings
-      await this.plugin.saveSettings();
-
-      // Clear stored data
-      await this.plugin.storage.delete("peervault-peers");
-      await this.plugin.storage.delete("peervault-snapshot");
-
-      new Notice("PeerVault data has been reset. Please restart Obsidian.");
-      this.display();
-    } catch (error) {
-      this.plugin.logger.error("Reset failed:", error);
-      new Notice(`Reset failed: ${error}`);
-    }
   }
 
   private getStateIcon(state: string): string {
@@ -1282,7 +758,10 @@ class CameraScannerModal extends Modal {
       // Start scanning
       this.startScanning();
     } catch (error) {
-      statusEl.setText(`Camera error: ${error}`);
+      // Clean up any partially initialized resources
+      this.stopScanning();
+      this.stopCamera();
+      statusEl.setText(`Camera error: ${formatUserError(error)}`);
       statusEl.addClass("peervault-error-text");
     }
   }

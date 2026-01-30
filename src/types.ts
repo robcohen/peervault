@@ -270,3 +270,23 @@ export const DEFAULT_SETTINGS: PeerVaultSettings = {
   gcMinHistoryDays: 30,
   gcRequirePeerConsensus: true,
 };
+
+// ============================================================================
+// UI Display Limits
+// ============================================================================
+
+/** Limits for displaying items in the UI to prevent performance issues */
+export const UI_LIMITS = {
+  /** Max files to track in merge notification conflict tracker */
+  maxTrackedChangedFiles: 50,
+  /** Max files shown in merge notification dialog */
+  maxMergeNotificationFiles: 100,
+  /** Max files shown in the files list for merge notification */
+  maxMergeFilesDisplay: 20,
+  /** Max errors to show in connection status modal */
+  maxDisplayedErrors: 5,
+  /** Max files to show in file history modal */
+  maxFileHistoryFiles: 100,
+  /** Max excluded folders to show inline */
+  maxInlineExcludedFolders: 3,
+} as const;

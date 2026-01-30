@@ -147,8 +147,11 @@ describe("SyncSession", () => {
         states.push(state);
       });
 
-      // Start sync (will fail due to no peer, but should change state)
-      const syncPromise = session.startSync();
+      // Create a mock stream for the test
+      const mockStream = new MockStream();
+
+      // Start sync (will fail due to no peer response, but should change state)
+      const syncPromise = session.startSync(mockStream);
 
       // Give it a moment to start
       await new Promise((resolve) => setTimeout(resolve, 50));

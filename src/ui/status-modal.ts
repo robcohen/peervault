@@ -10,6 +10,7 @@ import type { PeerInfo } from "../types";
 import { STATUS_ICONS, getStatusLabel } from "./status-icons";
 import { nodeIdToWords } from "../utils/device";
 import { timeAgo } from "./utils/time-utils";
+import { formatUserError } from "../utils/validation";
 
 export class PeerVaultStatusModal extends Modal {
   plugin: PeerVaultPlugin;
@@ -192,9 +193,9 @@ export class PeerVaultStatusModal extends Modal {
       try {
         await this.plugin.peerManager?.acceptPairingRequest(request.nodeId);
         new Notice("Pairing accepted");
-        this.onOpen(); // Refresh the modal
+        this.refreshContent(); // Refresh the modal safely
       } catch (error) {
-        new Notice(`Failed to accept: ${error}`);
+        new Notice(`Failed to accept: ${formatUserError(error)}`);
       }
     };
 
@@ -203,9 +204,13 @@ export class PeerVaultStatusModal extends Modal {
       cls: "peervault-btn peervault-btn-deny",
     });
     denyBtn.onclick = async () => {
-      await this.plugin.peerManager?.denyPairingRequest(request.nodeId);
-      new Notice("Pairing denied");
-      this.onOpen(); // Refresh the modal
+      try {
+        await this.plugin.peerManager?.denyPairingRequest(request.nodeId);
+        new Notice("Pairing denied");
+        this.refreshContent(); // Refresh the modal safely
+      } catch (error) {
+        new Notice(`Failed to deny: ${formatUserError(error)}`);
+      }
     };
   }
 
@@ -255,12 +260,17 @@ export class PeerVaultStatusModal extends Modal {
       .setDesc("Manually trigger sync with all connected peers")
       .addButton((btn) =>
         btn.setButtonText("Sync").onClick(async () => {
+          btn.setDisabled(true);
+          btn.setButtonText("Syncing...");
           try {
             await this.plugin.sync();
             new Notice("Sync completed");
             this.close();
           } catch (error) {
-            new Notice(`Sync failed: ${error}`);
+            new Notice(`Sync failed: ${formatUserError(error)}`);
+          } finally {
+            btn.setDisabled(false);
+            btn.setButtonText("Sync");
           }
         }),
       );

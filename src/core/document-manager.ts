@@ -27,13 +27,20 @@ import { isBinaryFile } from "./blob-store";
 import { computeTextEdits } from "../utils/text-diff";
 
 /**
+ * Type for the loro-crdt module with optional WASM ready promise.
+ * The __wasmReady property is added by the build system for async WASM loading.
+ */
+interface LoroModule {
+  __wasmReady?: Promise<void>;
+}
+
+/**
  * Wait for loro-crdt WASM to be initialized.
  * This is required because on mobile, WASM must be loaded asynchronously.
  * Call this before using any loro-crdt functions.
  */
 export async function waitForLoroWasm(): Promise<void> {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const loroModule = (await import("loro-crdt")) as any;
+  const loroModule = (await import("loro-crdt")) as unknown as LoroModule;
   if (loroModule.__wasmReady) {
     await loroModule.__wasmReady;
   }
@@ -84,8 +91,11 @@ export class DocumentManager {
   private meta: LoroMap;
   private pathCache = new Map<string, TreeID>();
   private nodePathCache = new Map<string, string>(); // TreeID string -> path
+  /** Cache of TreeID -> LoroTreeNode for O(1) lookups (invalidated on tree changes) */
+  private nodeCache = new Map<string, LoroTreeNode>();
   private initialized = false;
   private changeCallbacks: Array<(event: FileChangeEvent) => void> = [];
+  private docSubscription: (() => void) | null = null;
 
   constructor(
     private storage: StorageAdapter,
@@ -111,16 +121,32 @@ export class DocumentManager {
       const snapshot = await this.storage.read(SNAPSHOT_KEY);
       if (snapshot) {
         this.logger.info("Loading document from snapshot...");
-        this.doc.import(snapshot);
-        this.rebuildPathCache();
-        this.logger.info("Document loaded successfully");
+        try {
+          this.doc.import(snapshot);
+
+          // Validate the imported snapshot has expected schema
+          const vaultId = this.meta.get("vaultId");
+          if (!vaultId || typeof vaultId !== "string") {
+            throw new Error("Invalid snapshot: missing or invalid vaultId");
+          }
+
+          this.rebuildPathCache();
+          this.logger.info("Document loaded successfully");
+        } catch (importError) {
+          this.logger.error("Failed to load snapshot, starting fresh:", importError);
+          // Reset document state
+          this.doc = new LoroDoc();
+          this.tree = this.doc.getTree("files");
+          this.meta = this.doc.getMap("meta");
+          this.initializeSchema();
+        }
       } else {
         this.logger.info("No existing document found, starting fresh");
         this.initializeSchema();
       }
 
       // Subscribe to document changes
-      this.doc.subscribe((event) => {
+      this.docSubscription = this.doc.subscribe((event) => {
         this.handleDocChange(event);
       });
 
@@ -164,11 +190,21 @@ export class DocumentManager {
 
   /**
    * Rebuild path cache from the document tree.
+   * Also rebuilds node cache for O(1) node lookups.
    */
   private rebuildPathCache(): void {
     this.pathCache.clear();
     this.nodePathCache.clear();
+    this.nodeCache.clear();
 
+    // First, populate node cache with all nodes (including deleted)
+    const allNodes = this.tree.getNodes({ withDeleted: true });
+    for (const node of allNodes) {
+      const nodeIdStr = this.getNodeId(node);
+      this.nodeCache.set(nodeIdStr, node);
+    }
+
+    // Then build path caches from roots (excludes deleted)
     const roots = this.tree.roots();
     for (const root of roots) {
       this.cacheNodePath(root, "");
@@ -263,6 +299,12 @@ export class DocumentManager {
     const newDoc = new LoroDoc();
     newDoc.import(compacted);
 
+    // Unsubscribe from old document before replacing
+    if (this.docSubscription) {
+      this.docSubscription();
+      this.docSubscription = null;
+    }
+
     // Replace current document internals
     this.doc = newDoc;
     this.tree = this.doc.getTree("files");
@@ -272,7 +314,7 @@ export class DocumentManager {
     this.rebuildPathCache();
 
     // Re-subscribe to document changes
-    this.doc.subscribe((event) => {
+    this.docSubscription = this.doc.subscribe((event) => {
       this.handleDocChange(event);
     });
 
@@ -525,10 +567,29 @@ export class DocumentManager {
 
   /**
    * Get a LoroTreeNode by its TreeID.
+   * Uses cache for O(1) lookups instead of O(N) tree scan.
    */
   private getNodeById(nodeId: TreeID): LoroTreeNode | undefined {
+    // Check cache first
+    const cached = this.nodeCache.get(nodeId);
+    if (cached) return cached;
+
+    // Cache miss - rebuild cache and try again
+    this.rebuildNodeCache();
+    return this.nodeCache.get(nodeId);
+  }
+
+  /**
+   * Rebuild the node cache from the tree.
+   * Called on cache miss or after tree structure changes.
+   */
+  private rebuildNodeCache(): void {
+    this.nodeCache.clear();
     const nodes = this.tree.getNodes({ withDeleted: true });
-    return nodes.find((n) => this.getNodeId(n) === nodeId);
+    for (const node of nodes) {
+      const nodeIdStr = this.getNodeId(node);
+      this.nodeCache.set(nodeIdStr, node);
+    }
   }
 
   // ===========================================================================
@@ -587,6 +648,22 @@ export class DocumentManager {
    */
   listAllPaths(): string[] {
     return Array.from(this.pathCache.keys());
+  }
+
+  /**
+   * Get the count of files in the document.
+   * More efficient than listAllPaths().length when you only need the count.
+   */
+  getFileCount(): number {
+    return this.pathCache.size;
+  }
+
+  /**
+   * Iterate over all paths and their node IDs.
+   * More efficient than listAllPaths() + getNodeByPath() when you need both.
+   */
+  *iteratePathsWithNodes(): Generator<[string, TreeID], void, unknown> {
+    yield* this.pathCache.entries();
   }
 
   /**
@@ -951,10 +1028,23 @@ export class DocumentManager {
     return isBinaryFile(path);
   }
 
+  /** Maximum number of change callbacks to prevent memory leaks */
+  private static readonly MAX_CHANGE_CALLBACKS = 100;
+
   /**
    * Subscribe to file change events (for syncing changes to vault).
    */
   onFileChange(callback: (event: FileChangeEvent) => void): () => void {
+    // Prevent unbounded growth of callbacks array
+    if (this.changeCallbacks.length >= DocumentManager.MAX_CHANGE_CALLBACKS) {
+      this.logger.warn(
+        `Maximum change callbacks (${DocumentManager.MAX_CHANGE_CALLBACKS}) reached. ` +
+        "This may indicate a callback leak - ensure unsubscribe functions are called.",
+      );
+      // Remove oldest callback to make room
+      this.changeCallbacks.shift();
+    }
+
     this.changeCallbacks.push(callback);
     return () => {
       const idx = this.changeCallbacks.indexOf(callback);
@@ -1006,8 +1096,12 @@ export class DocumentManager {
   getAllBlobHashes(): string[] {
     const hashes: string[] = [];
 
+    // Iterate directly using the cached nodeIds for better performance
     for (const [path, nodeId] of this.pathCache) {
-      const hash = this.getBlobHash(path);
+      const node = this.getNodeById(nodeId);
+      if (!node) continue;
+
+      const hash = node.data.get("blobHash") as string | undefined;
       if (hash) {
         hashes.push(hash);
       }
@@ -1042,5 +1136,28 @@ export class DocumentManager {
   private handleDocChange(event: unknown): void {
     // Handle document changes from Loro
     this.logger.debug("Document changed:", event);
+  }
+
+  /**
+   * Clean up resources when the DocumentManager is no longer needed.
+   * Call this before discarding the instance to prevent memory leaks.
+   */
+  destroy(): void {
+    // Unsubscribe from document changes
+    if (this.docSubscription) {
+      this.docSubscription();
+      this.docSubscription = null;
+    }
+
+    // Clear all callbacks
+    this.changeCallbacks = [];
+
+    // Clear caches
+    this.pathCache.clear();
+    this.nodePathCache.clear();
+    this.nodeCache.clear();
+
+    this.initialized = false;
+    this.logger.debug("DocumentManager destroyed");
   }
 }

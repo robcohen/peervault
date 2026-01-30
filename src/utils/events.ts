@@ -53,14 +53,19 @@ export class EventEmitter<
 
   /**
    * Emit an event.
+   * Safe to call off() from within a callback - we iterate over a copy.
    */
   emit<K extends keyof Events>(event: K, data: Events[K]): void {
     const callbacks = this.listeners.get(event);
     if (callbacks) {
-      for (const callback of callbacks) {
+      // Copy to array to safely handle removals during iteration
+      const callbacksCopy = Array.from(callbacks);
+      for (const callback of callbacksCopy) {
         try {
           callback(data);
         } catch (error) {
+          // Use console.error since this is a utility class without logger injection
+          // eslint-disable-next-line no-console
           console.error(
             `Error in event handler for "${String(event)}":`,
             error,

@@ -7,7 +7,7 @@
 import { Plugin, Notice } from "obsidian";
 import { getDeviceHostname, nodeIdToWords } from "./utils/device";
 import type { PeerVaultSettings, SyncStatus, PeerInfo } from "./types";
-import { DEFAULT_SETTINGS } from "./types";
+import { DEFAULT_SETTINGS, UI_LIMITS } from "./types";
 import { DocumentManager, waitForLoroWasm } from "./core/document-manager";
 import { ObsidianStorageAdapter } from "./core/storage-adapter";
 import { BlobStore } from "./core/blob-store";
@@ -25,11 +25,13 @@ import {
   FileHistoryModal,
   SelectiveSyncModal,
   ConflictModal,
+  showConfirm,
 } from "./ui";
 import {
   initConflictTracker,
   getConflictTracker,
 } from "./core/conflict-tracker";
+import { formatUserError } from "./utils/validation";
 import {
   IrohTransport,
   initIrohWasm,
@@ -55,6 +57,7 @@ export default class PeerVaultPlugin extends Plugin {
 
   private connectionStatus: ConnectionStatusManager | null = null;
   private syncStatus: SyncStatus = "idle";
+  private peerManagerUnsubscribes: Array<() => void> = [];
 
   override async onload(): Promise<void> {
     // Initialize logger
@@ -179,19 +182,23 @@ export default class PeerVaultPlugin extends Plugin {
     await this.peerManager.initialize();
 
     // Connect peer manager events to plugin status
-    this.peerManager.on("status:change", (status) => {
-      if (status === "syncing") {
-        this.setSyncStatus("syncing");
-      } else if (status === "idle") {
-        this.setSyncStatus("idle");
-      } else if (status === "error") {
-        this.setSyncStatus("error");
-      } else if (status === "offline") {
-        this.setSyncStatus("offline");
-      }
-    });
+    // Store unsubscribe functions for cleanup on plugin unload
+    this.peerManagerUnsubscribes.push(
+      this.peerManager.on("status:change", (status) => {
+        if (status === "syncing") {
+          this.setSyncStatus("syncing");
+        } else if (status === "idle") {
+          this.setSyncStatus("idle");
+        } else if (status === "error") {
+          this.setSyncStatus("error");
+        } else if (status === "offline") {
+          this.setSyncStatus("offline");
+        }
+      }),
+    );
 
-    this.peerManager.on("peer:synced", async (nodeId) => {
+    this.peerManagerUnsubscribes.push(
+      this.peerManager.on("peer:synced", async (nodeId) => {
       this.logger.info("Synced with peer:", nodeId);
       updateSyncProgress(null); // Clear progress
 
@@ -207,8 +214,7 @@ export default class PeerVaultPlugin extends Plugin {
       // Record edits for conflict tracking
       const tracker = getConflictTracker();
       const changedPaths = this.documentManager.listAllPaths();
-      for (const path of changedPaths.slice(0, 50)) {
-        // Limit for performance
+      for (const path of changedPaths.slice(0, UI_LIMITS.maxTrackedChangedFiles)) {
         tracker.recordEdit(path, nodeId, peerName);
       }
 
@@ -229,7 +235,7 @@ export default class PeerVaultPlugin extends Plugin {
             const changedPaths = this.documentManager.listAllPaths();
             recordMerge(
               {
-                changedFiles: changedPaths.slice(0, 100), // Limit to 100 files
+                changedFiles: changedPaths.slice(0, UI_LIMITS.maxMergeNotificationFiles),
                 peerName,
                 peerId: nodeId,
                 timestamp: Date.now(),
@@ -250,25 +256,63 @@ export default class PeerVaultPlugin extends Plugin {
       this.documentManager.save().catch((err) => {
         this.logger.error("Failed to save after sync:", err);
       });
-    });
+    }),
+    );
 
     // Handle peer disconnection
-    this.peerManager.on("peer:disconnected", ({ nodeId }) => {
-      this.logger.info("Peer disconnected:", nodeId);
-      // Update vault sync exclusions when a peer disconnects
-      this.updateVaultSyncPeerExclusions();
-    });
+    this.peerManagerUnsubscribes.push(
+      this.peerManager.on("peer:disconnected", ({ nodeId }) => {
+        this.logger.info("Peer disconnected:", nodeId);
+        // Update vault sync exclusions when a peer disconnects
+        this.updateVaultSyncPeerExclusions();
+      }),
+    );
 
     // Handle peer errors
-    this.peerManager.on("peer:error", ({ nodeId, error }) => {
-      this.logger.error("Peer error:", nodeId, error);
-      recordSyncError({
-        message: error.message || String(error),
-        peerId: nodeId,
-        timestamp: Date.now(),
-        retryable: true,
+    this.peerManagerUnsubscribes.push(
+      this.peerManager.on("peer:error", ({ nodeId, error }) => {
+        this.logger.error("Peer error:", nodeId, error);
+        recordSyncError({
+          message: error.message || String(error),
+          peerId: nodeId,
+          timestamp: Date.now(),
+          retryable: true,
+        });
+      }),
+    );
+
+    // Handle vault adoption requests - show confirmation before adopting peer's vault ID
+    this.peerManagerUnsubscribes.push(
+      this.peerManager.on("vault:adoption-request", async ({ nodeId, peerVaultId, ourVaultId, respond }) => {
+      const peer = this.peerManager.getPeers().find(p => p.nodeId === nodeId);
+      const peerName = peer?.hostname || nodeId.slice(0, 8) + "...";
+
+      this.logger.info(`Vault adoption request from ${peerName}: ${peerVaultId.slice(0, 8)}...`);
+
+      const confirmed = await showConfirm(this.app, {
+        title: "Join Sync Network?",
+        message: `The peer "${peerName}" belongs to a different sync network.
+
+To sync with this peer, this vault will join their sync network. This is required for the first connection between devices.
+
+Your vault ID: ${ourVaultId.slice(0, 12)}...
+Peer's network ID: ${peerVaultId.slice(0, 12)}...
+
+Only accept if you trust this peer and want to sync with them.`,
+        confirmText: "Join Network",
+        cancelText: "Deny",
+        isDestructive: false,
       });
-    });
+
+      if (confirmed) {
+        this.logger.info(`User accepted vault adoption from ${peerName}`);
+      } else {
+        this.logger.info(`User denied vault adoption from ${peerName}`);
+      }
+
+      respond(confirmed);
+    }),
+    );
 
     // Initialize garbage collector
     this.gc = new GarbageCollector(
@@ -303,6 +347,16 @@ export default class PeerVaultPlugin extends Plugin {
   override onunload(): void {
     this.logger.info("Unloading PeerVault plugin...");
 
+    // Unsubscribe from peer manager events (synchronous, prevents listener accumulation)
+    for (const unsubscribe of this.peerManagerUnsubscribes) {
+      try {
+        unsubscribe();
+      } catch (err) {
+        this.logger.debug("Error unsubscribing from peer manager:", err);
+      }
+    }
+    this.peerManagerUnsubscribes = [];
+
     // Stop vault sync (synchronous)
     if (this.vaultSync) {
       this.vaultSync.stop();
@@ -325,9 +379,10 @@ export default class PeerVaultPlugin extends Plugin {
           await this.transport.shutdown();
         }
 
-        // Save document state
+        // Save and destroy document manager
         if (this.documentManager) {
           await this.documentManager.save();
+          this.documentManager.destroy();
         }
 
         this.logger.info("PeerVault async cleanup complete");
@@ -456,7 +511,7 @@ export default class PeerVaultPlugin extends Plugin {
           );
         } catch (error) {
           this.logger.error("GC failed:", error);
-          new Notice(`PeerVault: GC failed - ${error}`);
+          new Notice(`PeerVault: GC failed - ${formatUserError(error)}`);
         }
       },
     });
@@ -557,7 +612,7 @@ export default class PeerVaultPlugin extends Plugin {
     } catch (error) {
       this.logger.error("Sync failed:", error);
       this.setSyncStatus("error");
-      new Notice(`PeerVault: Sync failed - ${error}`);
+      new Notice(`PeerVault: Sync failed - ${formatUserError(error)}`);
     }
   }
 

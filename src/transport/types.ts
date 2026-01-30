@@ -50,8 +50,9 @@ export interface Transport {
 
   /**
    * Register callback for incoming connections.
+   * @returns Unsubscribe function to remove the callback
    */
-  onIncomingConnection(callback: (conn: PeerConnection) => void): void;
+  onIncomingConnection(callback: (conn: PeerConnection) => void): () => void;
 
   /**
    * Get all active connections.
@@ -106,13 +107,15 @@ export interface PeerConnection {
 
   /**
    * Register callback for connection state changes.
+   * @returns Unsubscribe function to remove the callback
    */
-  onStateChange(callback: (state: ConnectionState) => void): void;
+  onStateChange(callback: (state: ConnectionState) => void): () => void;
 
   /**
    * Register callback for incoming streams.
+   * @returns Unsubscribe function to remove the callback
    */
-  onStream(callback: (stream: SyncStream) => void): void;
+  onStream(callback: (stream: SyncStream) => void): () => void;
 
   /**
    * Get the round-trip time (RTT) in milliseconds.

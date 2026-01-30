@@ -24,12 +24,37 @@ import { PeerErrors } from "../errors";
 
 const PEERS_STORAGE_KEY = "peervault-peers";
 
+/** Rate limiting config for pairing requests */
+const PAIRING_RATE_LIMIT = {
+  /** Max pending requests from different peers */
+  maxPendingRequests: 10,
+  /** Max requests from same peer in window */
+  maxRequestsPerPeer: 3,
+  /** Time window for per-peer rate limiting (ms) */
+  windowMs: 60000, // 1 minute
+  /** Base backoff after denial (ms) */
+  denialBackoffBase: 30000, // 30 seconds
+  /** Maximum backoff after repeated denials (ms) */
+  denialBackoffMax: 3600000, // 1 hour
+  /** Max unique peers to track in history (prevents unbounded growth) */
+  maxTrackedPeers: 100,
+};
+
 const DEFAULT_CONFIG: Omit<Required<PeerManagerConfig>, "hostname" | "nickname"> = {
   autoSyncInterval: 30000, // Reduced from 60s for more frequent sync checks
   autoReconnect: true,
   maxReconnectAttempts: 10,
   reconnectBackoff: 500, // Reduced from 1000 for faster reconnection
 };
+
+/** Vault adoption request for user confirmation */
+export interface VaultAdoptionRequest {
+  nodeId: string;
+  peerVaultId: string;
+  ourVaultId: string;
+  /** Call to respond to the adoption request */
+  respond: (accept: boolean) => void;
+}
 
 /** Events from peer manager */
 interface PeerManagerEvents extends Record<string, unknown> {
@@ -40,6 +65,7 @@ interface PeerManagerEvents extends Record<string, unknown> {
   "peer:pairing-request": PairingRequest;
   "peer:pairing-accepted": string;
   "peer:pairing-denied": string;
+  "vault:adoption-request": VaultAdoptionRequest;
   "status:change": "idle" | "syncing" | "offline" | "error";
 }
 
@@ -49,12 +75,31 @@ interface PeerManagerEvents extends Record<string, unknown> {
 export class PeerManager extends EventEmitter<PeerManagerEvents> {
   private peers = new Map<string, PeerInfo>();
   private sessions = new Map<string, SyncSession>();
-  private reconnectAttempts = new Map<string, number>();
-  private pendingPairingRequests = new Map<string, { request: PairingRequest; connection: PeerConnection }>();
+  private reconnectAttempts = new Map<string, { count: number; lastAttempt: number }>();
+  private pendingPairingRequests = new Map<string, {
+    request: PairingRequest;
+    connection: PeerConnection;
+    unsubscribeStateChange: () => void;
+  }>();
+  /** Rate limiting for pairing requests: nodeId -> array of request timestamps */
+  private pairingRequestHistory = new Map<string, number[]>();
+  /** Denial tracking for exponential backoff: nodeId -> { count, lastDenied } */
+  private pairingDenialHistory = new Map<string, { count: number; lastDenied: number }>();
   private config: Omit<Required<PeerManagerConfig>, "hostname" | "nickname"> & { hostname: string; nickname?: string };
   private autoSyncTimer: ReturnType<typeof setInterval> | null = null;
+  private initialSyncTimeout: ReturnType<typeof setTimeout> | null = null;
+  /** Pending reconnect timers by nodeId - tracked so they can be cancelled on shutdown */
+  private reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private status: "idle" | "syncing" | "offline" | "error" = "idle";
   private groupManager!: PeerGroupManager;
+  /** Unsubscribe from incoming connection events */
+  private unsubscribeIncoming: (() => void) | null = null;
+  /** Whether initialize() has been called */
+  private initialized = false;
+  /** Whether shutdown() is in progress */
+  private shuttingDown = false;
+  /** Tickets currently being processed by addPeer to prevent duplicate calls */
+  private pendingAddPeerTickets = new Set<string>();
 
   constructor(
     private transport: Transport,
@@ -80,6 +125,17 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
    * Loads stored peers and sets up connection handlers.
    */
   async initialize(): Promise<void> {
+    // Guard against multiple initialization or initialization during shutdown
+    if (this.initialized) {
+      this.logger.warn("PeerManager already initialized, skipping");
+      return;
+    }
+    if (this.shuttingDown) {
+      this.logger.warn("PeerManager is shutting down, cannot initialize");
+      return;
+    }
+    this.initialized = true;
+
     // Initialize group manager
     this.groupManager = new PeerGroupManager(
       this.documentManager.getLoro(),
@@ -96,8 +152,8 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       this.logger.info(`Cleaned up ${cleaned} stale peer(s) from groups`);
     }
 
-    // Handle incoming connections
-    this.transport.onIncomingConnection(async (conn) => {
+    // Handle incoming connections (store unsubscribe for cleanup)
+    this.unsubscribeIncoming = this.transport.onIncomingConnection(async (conn) => {
       await this.handleIncomingConnection(conn);
     });
 
@@ -113,7 +169,26 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
    * Shut down the peer manager.
    */
   async shutdown(): Promise<void> {
+    // Guard against concurrent shutdown or shutdown when not initialized
+    if (this.shuttingDown) {
+      this.logger.warn("PeerManager already shutting down, skipping");
+      return;
+    }
+    this.shuttingDown = true;
+
     this.stopAutoSync();
+
+    // Cancel all pending reconnect timers
+    for (const timer of this.reconnectTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.reconnectTimers.clear();
+
+    // Unsubscribe from transport events
+    if (this.unsubscribeIncoming) {
+      this.unsubscribeIncoming();
+      this.unsubscribeIncoming = null;
+    }
 
     // Close all sessions
     for (const session of this.sessions.values()) {
@@ -124,6 +199,22 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     // Save peer state
     await this.savePeers();
 
+    // Clean up pending pairing request listeners before clearing
+    for (const pending of this.pendingPairingRequests.values()) {
+      pending.unsubscribeStateChange();
+    }
+
+    // Clear all tracking maps to prevent memory leaks
+    this.reconnectAttempts.clear();
+    this.pairingRequestHistory.clear();
+    this.pairingDenialHistory.clear();
+    this.pendingPairingRequests.clear();
+
+    // Remove all event listeners
+    this.removeAllListeners();
+
+    this.initialized = false;
+    this.shuttingDown = false;
     this.logger.info("PeerManager shut down");
   }
 
@@ -135,6 +226,13 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
    * Add a new peer using their connection ticket.
    */
   async addPeer(ticket: string): Promise<PeerInfo> {
+    // Guard against duplicate concurrent calls with the same ticket
+    if (this.pendingAddPeerTickets.has(ticket)) {
+      this.logger.warn("addPeer already in progress for this ticket, ignoring duplicate call");
+      throw PeerErrors.unknownPeer("Duplicate addPeer call");
+    }
+    this.pendingAddPeerTickets.add(ticket);
+
     try {
       this.setStatus("syncing");
 
@@ -176,6 +274,8 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       this.logger.error("Failed to add peer:", error);
       this.setStatus("error");
       throw error;
+    } finally {
+      this.pendingAddPeerTickets.delete(ticket);
     }
   }
 
@@ -185,10 +285,15 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   async removePeer(nodeId: string): Promise<void> {
     const session = this.sessions.get(nodeId);
     if (session) {
-      // Notify the peer before closing
-      await session.sendPeerRemoved("User removed peer");
-      await session.close();
+      // Always remove from map first to prevent stale references
       this.sessions.delete(nodeId);
+      try {
+        // Notify the peer before closing
+        await session.sendPeerRemoved("User removed peer");
+        await session.close();
+      } catch (err) {
+        this.logger.warn("Error closing session during peer removal:", err);
+      }
     }
 
     this.peers.delete(nodeId);
@@ -207,8 +312,13 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   private async removePeerLocally(nodeId: string): Promise<void> {
     const session = this.sessions.get(nodeId);
     if (session) {
-      await session.close();
+      // Always remove from map first to prevent stale references
       this.sessions.delete(nodeId);
+      try {
+        await session.close();
+      } catch (err) {
+        this.logger.warn("Error closing session during local peer removal:", err);
+      }
     }
 
     this.peers.delete(nodeId);
@@ -269,8 +379,10 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       throw PeerErrors.unknownPeer(nodeId);
     }
 
-    const { connection } = pending;
+    const { connection, unsubscribeStateChange } = pending;
+    unsubscribeStateChange(); // Clean up state change listener
     this.pendingPairingRequests.delete(nodeId);
+    this.clearPairingRateLimit(nodeId);
 
     // Create peer info
     const peer: PeerInfo = {
@@ -314,8 +426,12 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       return; // Already handled or expired
     }
 
-    const { connection } = pending;
+    const { connection, unsubscribeStateChange } = pending;
+    unsubscribeStateChange(); // Clean up state change listener
     this.pendingPairingRequests.delete(nodeId);
+    this.pairingRequestHistory.delete(nodeId);
+    // Record denial for exponential backoff (don't clear denial history!)
+    this.recordPairingDenial(nodeId);
 
     this.logger.info("Denied pairing request from:", nodeId);
     await connection.close();
@@ -424,19 +540,33 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   async syncAll(): Promise<void> {
     this.setStatus("syncing");
 
-    const promises = [];
+    const syncTasks: Array<{ nodeId: string; promise: Promise<void> }> = [];
     for (const peer of this.peers.values()) {
       if (peer.state === "synced" || peer.state === "offline") {
-        promises.push(this.syncPeer(peer.nodeId));
+        syncTasks.push({
+          nodeId: peer.nodeId,
+          promise: this.syncPeer(peer.nodeId),
+        });
       }
     }
 
-    try {
-      await Promise.allSettled(promises);
-      this.setStatus("idle");
-    } catch {
-      this.setStatus("error");
+    const results = await Promise.allSettled(syncTasks.map((t) => t.promise));
+
+    // Log any failures with peer IDs for diagnostics
+    let hasFailures = false;
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i];
+      if (result.status === "rejected") {
+        hasFailures = true;
+        const nodeId = syncTasks[i].nodeId;
+        this.logger.debug(
+          `Sync failed for peer ${nodeId.slice(0, 8)}:`,
+          result.reason,
+        );
+      }
     }
+
+    this.setStatus(hasFailures ? "error" : "idle");
   }
 
   /**
@@ -496,7 +626,13 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     // Check if peer is known
     const peer = this.peers.get(nodeId);
     if (!peer) {
-      // Unknown peer - emit pairing request instead of rejecting
+      // Unknown peer - check rate limits before accepting pairing request
+      if (!this.checkPairingRateLimit(nodeId)) {
+        this.logger.warn("Pairing request rate limited:", nodeId);
+        await connection.close();
+        return;
+      }
+
       this.logger.info("Pairing request from unknown peer:", nodeId);
 
       const request: PairingRequest = {
@@ -504,8 +640,20 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
         timestamp: Date.now(),
       };
 
-      // Store the connection so we can accept/deny later
-      this.pendingPairingRequests.set(nodeId, { request, connection });
+      // Clean up pending request if connection disconnects before user responds
+      const unsubscribeStateChange = connection.onStateChange((state) => {
+        if (state === "disconnected" || state === "error") {
+          const pending = this.pendingPairingRequests.get(nodeId);
+          if (pending && pending.connection === connection) {
+            this.logger.debug("Pairing request connection lost:", nodeId);
+            pending.unsubscribeStateChange(); // Clean up the listener
+            this.pendingPairingRequests.delete(nodeId);
+          }
+        }
+      });
+
+      // Store the connection and unsubscribe so we can accept/deny later
+      this.pendingPairingRequests.set(nodeId, { request, connection, unsubscribeStateChange });
 
       // Emit event for UI to show the request
       this.emit("peer:pairing-request", request);
@@ -528,6 +676,73 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   // ===========================================================================
   // Private: Sync Sessions
   // ===========================================================================
+
+  /**
+   * Attach common event handlers to a sync session.
+   * @param session - The sync session to attach handlers to
+   * @param peer - The peer info for this session
+   * @param isInitiator - Whether we initiated this connection (affects reconnect handling)
+   */
+  private attachSessionHandlers(
+    session: SyncSession,
+    peer: PeerInfo,
+    isInitiator: boolean,
+  ): void {
+    session.on("state:change", (state) => {
+      this.logger.debug(`Sync session ${peer.nodeId} state:`, state);
+      if (state === "live") {
+        this.updatePeerState(peer.nodeId, "synced");
+      } else if (state === "error") {
+        this.updatePeerState(peer.nodeId, "error");
+        this.handleSyncError(peer.nodeId);
+      } else if (state === "closed") {
+        this.updatePeerState(peer.nodeId, "offline");
+        this.handleSyncError(peer.nodeId, true); // Reconnect on clean disconnect
+      }
+    });
+
+    session.on("sync:complete", () => {
+      peer.lastSynced = Date.now();
+      this.savePeers().catch((err) =>
+        this.logger.error("Failed to save peers:", err),
+      );
+      this.emit("peer:synced", peer.nodeId);
+      // Reset reconnect counter on successful sync (only for initiator to avoid double-reset)
+      if (isInitiator) {
+        this.reconnectAttempts.delete(peer.nodeId);
+      }
+    });
+
+    // Store peer's ticket when received (for bidirectional reconnection)
+    session.on("ticket:received", (ticket) => {
+      this.logger.debug(`Received ticket from peer ${peer.nodeId.slice(0, 8)}`);
+      peer.ticket = ticket;
+      this.savePeers().catch((err) =>
+        this.logger.error("Failed to save peer ticket:", err),
+      );
+    });
+
+    // Store peer's info when received (for display)
+    session.on("peer:info", ({ hostname, nickname }) => {
+      this.logger.debug(`Received info from peer ${peer.nodeId.slice(0, 8)}: ${hostname}${nickname ? ` (${nickname})` : ""}`);
+      peer.hostname = hostname;
+      peer.nickname = nickname;
+      this.savePeers().catch((err) =>
+        this.logger.error("Failed to save peer info:", err),
+      );
+    });
+
+    // Handle peer removing us
+    session.on("peer:removed", () => {
+      this.removePeerLocally(peer.nodeId).catch((err) =>
+        this.logger.error("Failed to remove peer locally:", err),
+      );
+    });
+
+    session.on("error", (error) => {
+      this.emit("peer:error", { nodeId: peer.nodeId, error });
+    });
+  }
 
   private async startSyncSession(
     connection: PeerConnection,
@@ -560,57 +775,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     );
 
     // Set up event handlers
-    session.on("state:change", (state) => {
-      this.logger.debug(`Sync session ${peer.nodeId} state:`, state);
-      if (state === "live") {
-        this.updatePeerState(peer.nodeId, "synced");
-      } else if (state === "error") {
-        this.updatePeerState(peer.nodeId, "error");
-        this.handleSyncError(peer.nodeId);
-      } else if (state === "closed") {
-        this.updatePeerState(peer.nodeId, "offline");
-        this.handleSyncError(peer.nodeId, true); // Reconnect on clean disconnect
-      }
-    });
-
-    session.on("sync:complete", () => {
-      peer.lastSynced = Date.now();
-      this.savePeers().catch((err) =>
-        this.logger.error("Failed to save peers:", err),
-      );
-      this.emit("peer:synced", peer.nodeId);
-      this.reconnectAttempts.set(peer.nodeId, 0);
-    });
-
-    // Store peer's ticket when received (for bidirectional reconnection)
-    session.on("ticket:received", (ticket) => {
-      this.logger.debug(`Received ticket from peer ${peer.nodeId.slice(0, 8)}`);
-      peer.ticket = ticket;
-      this.savePeers().catch((err) =>
-        this.logger.error("Failed to save peer ticket:", err),
-      );
-    });
-
-    // Store peer's info when received (for display)
-    session.on("peer:info", ({ hostname, nickname }) => {
-      this.logger.debug(`Received info from peer ${peer.nodeId.slice(0, 8)}: ${hostname}${nickname ? ` (${nickname})` : ""}`);
-      peer.hostname = hostname;
-      peer.nickname = nickname;
-      this.savePeers().catch((err) =>
-        this.logger.error("Failed to save peer info:", err),
-      );
-    });
-
-    // Handle peer removing us
-    session.on("peer:removed", () => {
-      this.removePeerLocally(peer.nodeId).catch((err) =>
-        this.logger.error("Failed to remove peer locally:", err),
-      );
-    });
-
-    session.on("error", (error) => {
-      this.emit("peer:error", { nodeId: peer.nodeId, error });
-    });
+    this.attachSessionHandlers(session, peer, true);
 
     this.sessions.set(peer.nodeId, session);
     this.updatePeerState(peer.nodeId, "syncing");
@@ -639,6 +804,39 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     // Generate our ticket for bidirectional reconnection
     const ourTicket = await this.transport.generateTicket();
 
+    // Create vault adoption confirmation callback with timeout to prevent indefinite hanging
+    const VAULT_ADOPTION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+    const onVaultAdoptionNeeded = async (peerVaultId: string, ourVaultId: string): Promise<boolean> => {
+      return new Promise((resolve) => {
+        let resolved = false;
+        const respond = (accept: boolean) => {
+          if (!resolved) {
+            resolved = true;
+            resolve(accept);
+          }
+        };
+
+        // Timeout after 5 minutes - reject adoption if no response
+        const timeout = setTimeout(() => {
+          if (!resolved) {
+            resolved = true;
+            this.logger.warn("Vault adoption request timed out, rejecting");
+            resolve(false);
+          }
+        }, VAULT_ADOPTION_TIMEOUT_MS);
+
+        this.emit("vault:adoption-request", {
+          nodeId: peer.nodeId,
+          peerVaultId,
+          ourVaultId,
+          respond: (accept: boolean) => {
+            clearTimeout(timeout);
+            respond(accept);
+          },
+        });
+      });
+    };
+
     // Create new session with blob store for binary sync
     const session = new SyncSession(
       peer.nodeId,
@@ -647,6 +845,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       {
         peerIsReadOnly: syncPolicy.readOnly,
         allowVaultAdoption: isFirstSync,
+        onVaultAdoptionNeeded: isFirstSync ? onVaultAdoptionNeeded : undefined,
         ourTicket,
         ourHostname: this.config.hostname,
         ourNickname: this.config.nickname,
@@ -654,56 +853,8 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       this.blobStore,
     );
 
-    // Set up event handlers (same as above)
-    session.on("state:change", (state) => {
-      if (state === "live") {
-        this.updatePeerState(peer.nodeId, "synced");
-      } else if (state === "error") {
-        this.updatePeerState(peer.nodeId, "error");
-        this.handleSyncError(peer.nodeId);
-      } else if (state === "closed") {
-        this.updatePeerState(peer.nodeId, "offline");
-        this.handleSyncError(peer.nodeId, true); // Reconnect on clean disconnect
-      }
-    });
-
-    session.on("sync:complete", () => {
-      peer.lastSynced = Date.now();
-      this.savePeers().catch((err) =>
-        this.logger.error("Failed to save peers:", err),
-      );
-      this.emit("peer:synced", peer.nodeId);
-    });
-
-    // Store peer's ticket when received (for bidirectional reconnection)
-    session.on("ticket:received", (ticket) => {
-      this.logger.debug(`Received ticket from peer ${peer.nodeId.slice(0, 8)}`);
-      peer.ticket = ticket;
-      this.savePeers().catch((err) =>
-        this.logger.error("Failed to save peer ticket:", err),
-      );
-    });
-
-    // Store peer's info when received (for display)
-    session.on("peer:info", ({ hostname, nickname }) => {
-      this.logger.debug(`Received info from peer ${peer.nodeId.slice(0, 8)}: ${hostname}${nickname ? ` (${nickname})` : ""}`);
-      peer.hostname = hostname;
-      peer.nickname = nickname;
-      this.savePeers().catch((err) =>
-        this.logger.error("Failed to save peer info:", err),
-      );
-    });
-
-    // Handle peer removing us
-    session.on("peer:removed", () => {
-      this.removePeerLocally(peer.nodeId).catch((err) =>
-        this.logger.error("Failed to remove peer locally:", err),
-      );
-    });
-
-    session.on("error", (error) => {
-      this.emit("peer:error", { nodeId: peer.nodeId, error });
-    });
+    // Set up event handlers
+    this.attachSessionHandlers(session, peer, false);
 
     this.sessions.set(peer.nodeId, session);
     this.updatePeerState(peer.nodeId, "syncing");
@@ -716,14 +867,17 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   private handleSyncError(nodeId: string, isCleanDisconnect = false): void {
     if (!this.config.autoReconnect) return;
 
+    const now = Date.now();
+    const existing = this.reconnectAttempts.get(nodeId);
+
     // Only increment counter for errors, not clean disconnects
     // This prevents sleep/wake cycles from exhausting retry limit
     const attempts = isCleanDisconnect
-      ? (this.reconnectAttempts.get(nodeId) ?? 0)
-      : (this.reconnectAttempts.get(nodeId) ?? 0) + 1;
+      ? (existing?.count ?? 0)
+      : (existing?.count ?? 0) + 1;
 
     if (!isCleanDisconnect) {
-      this.reconnectAttempts.set(nodeId, attempts);
+      this.reconnectAttempts.set(nodeId, { count: attempts, lastAttempt: now });
     }
 
     if (attempts > this.config.maxReconnectAttempts) {
@@ -740,11 +894,20 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       `Reconnecting to ${nodeId} in ${delay}ms${isCleanDisconnect ? ' (clean disconnect)' : ` (attempt ${attempts})`}`,
     );
 
-    setTimeout(() => {
+    // Cancel any existing reconnect timer for this peer
+    const existingTimer = this.reconnectTimers.get(nodeId);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+    }
+
+    // Track the timer so it can be cancelled on shutdown
+    const timer = setTimeout(() => {
+      this.reconnectTimers.delete(nodeId);
       this.syncPeer(nodeId).catch((err) => {
         this.logger.error("Reconnect failed:", err);
       });
     }, delay);
+    this.reconnectTimers.set(nodeId, timer);
   }
 
   // ===========================================================================
@@ -771,7 +934,8 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
 
   private startAutoSync(): void {
     // Sync after a short delay on startup to allow incoming connections to arrive first
-    setTimeout(() => {
+    this.initialSyncTimeout = setTimeout(() => {
+      this.initialSyncTimeout = null; // Clear reference after firing
       this.syncAll().catch((err) => {
         this.logger.error("Initial auto sync failed:", err);
       });
@@ -782,14 +946,159 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       this.syncAll().catch((err) => {
         this.logger.error("Auto sync failed:", err);
       });
+      // Periodically clean up stale entries to prevent memory leaks
+      this.cleanupStaleEntries();
     }, this.config.autoSyncInterval);
   }
 
+  /**
+   * Clean up stale entries in tracking maps to prevent memory leaks.
+   * Removes entries that haven't been updated in over 1 hour.
+   */
+  private cleanupStaleEntries(): void {
+    const now = Date.now();
+    const STALE_THRESHOLD_MS = 60 * 60 * 1000; // 1 hour
+
+    // Clean up stale reconnect attempts
+    for (const [nodeId, entry] of this.reconnectAttempts) {
+      if (now - entry.lastAttempt > STALE_THRESHOLD_MS) {
+        this.reconnectAttempts.delete(nodeId);
+        this.logger.debug(`Cleaned up stale reconnect entry for ${nodeId}`);
+      }
+    }
+
+    // Clean up stale pairing request history
+    for (const [nodeId, timestamps] of this.pairingRequestHistory) {
+      const recentTimestamps = timestamps.filter(
+        (t) => now - t < PAIRING_RATE_LIMIT.windowMs,
+      );
+      if (recentTimestamps.length === 0) {
+        this.pairingRequestHistory.delete(nodeId);
+      } else if (recentTimestamps.length !== timestamps.length) {
+        this.pairingRequestHistory.set(nodeId, recentTimestamps);
+      }
+    }
+
+    // Clean up stale denial history (keep for backoff period, then remove)
+    for (const [nodeId, entry] of this.pairingDenialHistory) {
+      const backoffMs = Math.min(
+        PAIRING_RATE_LIMIT.denialBackoffBase * Math.pow(2, entry.count - 1),
+        PAIRING_RATE_LIMIT.denialBackoffMax,
+      );
+      if (now - entry.lastDenied > backoffMs + STALE_THRESHOLD_MS) {
+        this.pairingDenialHistory.delete(nodeId);
+        this.logger.debug(`Cleaned up stale denial entry for ${nodeId}`);
+      }
+    }
+  }
+
   private stopAutoSync(): void {
+    if (this.initialSyncTimeout) {
+      clearTimeout(this.initialSyncTimeout);
+      this.initialSyncTimeout = null;
+    }
     if (this.autoSyncTimer) {
       clearInterval(this.autoSyncTimer);
       this.autoSyncTimer = null;
     }
+  }
+
+  // ===========================================================================
+  // Private: Rate Limiting
+  // ===========================================================================
+
+  /**
+   * Check if a pairing request from this peer is allowed.
+   * Returns true if allowed, false if rate limited.
+   */
+  private checkPairingRateLimit(nodeId: string): boolean {
+    const now = Date.now();
+    const windowStart = now - PAIRING_RATE_LIMIT.windowMs;
+
+    // Check total pending requests limit
+    if (this.pendingPairingRequests.size >= PAIRING_RATE_LIMIT.maxPendingRequests) {
+      this.logger.debug("Too many pending pairing requests");
+      return false;
+    }
+
+    // Check exponential backoff from previous denials
+    const denial = this.pairingDenialHistory.get(nodeId);
+    if (denial) {
+      const backoffMs = Math.min(
+        PAIRING_RATE_LIMIT.denialBackoffBase * Math.pow(2, denial.count - 1),
+        PAIRING_RATE_LIMIT.denialBackoffMax,
+      );
+      const backoffEnds = denial.lastDenied + backoffMs;
+
+      if (now < backoffEnds) {
+        const remainingSec = Math.ceil((backoffEnds - now) / 1000);
+        this.logger.debug(
+          `Peer ${nodeId.slice(0, 8)} in denial backoff for ${remainingSec}s more`,
+        );
+        return false;
+      }
+    }
+
+    // Check per-peer rate limit
+    let history = this.pairingRequestHistory.get(nodeId) ?? [];
+
+    // Remove old entries outside the time window
+    history = history.filter((ts) => ts > windowStart);
+
+    if (history.length >= PAIRING_RATE_LIMIT.maxRequestsPerPeer) {
+      this.logger.debug(`Peer ${nodeId.slice(0, 8)} exceeded pairing request limit`);
+      return false;
+    }
+
+    // Enforce max unique peers limit before adding new entry
+    if (
+      !this.pairingRequestHistory.has(nodeId) &&
+      this.pairingRequestHistory.size >= PAIRING_RATE_LIMIT.maxTrackedPeers
+    ) {
+      // Remove oldest entry (first in Map iteration order)
+      const oldestKey = this.pairingRequestHistory.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.pairingRequestHistory.delete(oldestKey);
+        this.logger.debug(`Pruned oldest pairing history for ${oldestKey.slice(0, 8)}`);
+      }
+    }
+
+    // Same limit for denial history
+    if (
+      !this.pairingDenialHistory.has(nodeId) &&
+      this.pairingDenialHistory.size >= PAIRING_RATE_LIMIT.maxTrackedPeers
+    ) {
+      const oldestKey = this.pairingDenialHistory.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.pairingDenialHistory.delete(oldestKey);
+        this.logger.debug(`Pruned oldest denial history for ${oldestKey.slice(0, 8)}`);
+      }
+    }
+
+    // Record this request
+    history.push(now);
+    this.pairingRequestHistory.set(nodeId, history);
+
+    return true;
+  }
+
+  /**
+   * Record a pairing denial for exponential backoff.
+   */
+  private recordPairingDenial(nodeId: string): void {
+    const existing = this.pairingDenialHistory.get(nodeId);
+    this.pairingDenialHistory.set(nodeId, {
+      count: (existing?.count ?? 0) + 1,
+      lastDenied: Date.now(),
+    });
+  }
+
+  /**
+   * Clear rate limit history for a peer (e.g., after accepting).
+   */
+  private clearPairingRateLimit(nodeId: string): void {
+    this.pairingRequestHistory.delete(nodeId);
+    this.pairingDenialHistory.delete(nodeId);
   }
 
   // ===========================================================================

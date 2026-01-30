@@ -71,11 +71,34 @@ export function validateFolderPath(path: string): { valid: boolean; value: strin
   }
 
   // Normalize path separators
-  const normalized = sanitized.replace(/\\/g, "/");
+  let normalized = sanitized.replace(/\\/g, "/");
+
+  // Remove leading/trailing slashes for consistency
+  normalized = normalized.replace(/^\/+|\/+$/g, "");
 
   // Check for path traversal attempts
   if (normalized.includes("..")) {
     return { valid: false, value: normalized, error: "Path traversal not allowed" };
+  }
+
+  // Check for relative path indicators
+  if (normalized.startsWith("./") || normalized === ".") {
+    return { valid: false, value: normalized, error: "Relative paths not allowed" };
+  }
+
+  // Check for self-references in path (e.g., /foo/./bar)
+  if (normalized.includes("/./") || normalized.endsWith("/.")) {
+    return { valid: false, value: normalized, error: "Path contains invalid self-reference" };
+  }
+
+  // Check for double slashes (could indicate path manipulation)
+  if (normalized.includes("//")) {
+    return { valid: false, value: normalized, error: "Path contains invalid double slashes" };
+  }
+
+  // Check for null bytes (can bypass checks in some systems)
+  if (normalized.includes("\0")) {
+    return { valid: false, value: normalized, error: "Path contains invalid characters" };
   }
 
   return { valid: true, value: normalized };
@@ -122,4 +145,91 @@ export function validateTicket(ticket: string): { valid: boolean; value: string;
   }
 
   return { valid: true, value: trimmed };
+}
+
+/**
+ * Check if a path matches or is inside an excluded folder.
+ * Used for selective sync exclusion logic.
+ *
+ * @param path - The path to check
+ * @param excludedFolder - The excluded folder path
+ * @returns true if the path should be excluded
+ */
+export function isPathExcluded(path: string, excludedFolder: string): boolean {
+  return path === excludedFolder || path.startsWith(excludedFolder + "/");
+}
+
+/**
+ * Check if a path matches any of the excluded folders.
+ *
+ * @param path - The path to check
+ * @param excludedFolders - Array of excluded folder paths
+ * @returns true if the path should be excluded
+ */
+export function isPathInExcludedFolders(path: string, excludedFolders: string[]): boolean {
+  for (const excluded of excludedFolders) {
+    if (isPathExcluded(path, excluded)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Map of technical error patterns to user-friendly messages.
+ */
+const ERROR_MESSAGES: Record<string, string> = {
+  "network error": "Network connection failed. Check your internet connection.",
+  "connection refused": "Could not connect to peer. They may be offline.",
+  "timeout": "Connection timed out. The peer may be unreachable.",
+  "ENOTFOUND": "Could not find the server. Check your network connection.",
+  "ECONNREFUSED": "Connection refused. The peer may be offline.",
+  "ETIMEDOUT": "Connection timed out. Try again later.",
+  "certificate": "Security certificate error. Check your network settings.",
+  "rate limit": "Too many requests. Please wait a moment and try again.",
+  "invalid ticket": "Invalid pairing code. Please check and try again.",
+  "already paired": "This device is already paired.",
+  "not found": "The requested item could not be found.",
+  "permission denied": "Permission denied. Check your access rights.",
+  "disk full": "Storage is full. Free up some space and try again.",
+  "file too large": "File is too large to sync.",
+};
+
+/**
+ * Format an error for user-friendly display.
+ * Converts technical error messages to plain language.
+ *
+ * @param error - The error to format (can be Error, string, or unknown)
+ * @returns A user-friendly error message
+ */
+export function formatUserError(error: unknown): string {
+  // Extract the error message
+  let message: string;
+  if (error instanceof Error) {
+    message = error.message;
+  } else if (typeof error === "string") {
+    message = error;
+  } else {
+    message = "An unexpected error occurred";
+  }
+
+  // Check for known error patterns
+  const lowerMessage = message.toLowerCase();
+  for (const [pattern, friendlyMsg] of Object.entries(ERROR_MESSAGES)) {
+    if (lowerMessage.includes(pattern.toLowerCase())) {
+      return friendlyMsg;
+    }
+  }
+
+  // If the message is very long (like a stack trace), truncate it
+  if (message.length > 100) {
+    // Try to extract just the first meaningful line
+    const firstLine = message.split("\n")[0].trim();
+    if (firstLine.length > 100) {
+      return "An error occurred. Check the console for details.";
+    }
+    return firstLine;
+  }
+
+  return message;
 }

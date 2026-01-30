@@ -6,24 +6,88 @@
 
 import type { Plugin } from "obsidian";
 import type { StorageAdapter } from "../types";
+import { createLogger, type Logger } from "../utils/logger";
 
 const STORAGE_PREFIX = "peervault-storage/";
+
+/** Maximum number of items to keep in cache */
+const MAX_CACHE_ITEMS = 500;
+
+/** Maximum total cache size in bytes (50 MB) */
+const MAX_CACHE_BYTES = 50 * 1024 * 1024;
 
 /**
  * Storage adapter using Obsidian's plugin data directory.
  */
 export class ObsidianStorageAdapter implements StorageAdapter {
   private cache = new Map<string, Uint8Array>();
+  private cacheBytes = 0;
+  private logger: Logger;
 
-  constructor(private plugin: Plugin) {}
+  constructor(private plugin: Plugin, logger?: Logger) {
+    this.logger = logger ?? createLogger("Storage");
+  }
+
+  /**
+   * Evict oldest cache entries to stay within limits.
+   */
+  private evictIfNeeded(): void {
+    // Evict by item count
+    while (this.cache.size > MAX_CACHE_ITEMS) {
+      const oldestKey = this.cache.keys().next().value;
+      if (oldestKey !== undefined) {
+        const oldValue = this.cache.get(oldestKey);
+        if (oldValue) this.cacheBytes -= oldValue.length;
+        this.cache.delete(oldestKey);
+      } else {
+        break;
+      }
+    }
+
+    // Evict by total size
+    while (this.cacheBytes > MAX_CACHE_BYTES && this.cache.size > 0) {
+      const oldestKey = this.cache.keys().next().value;
+      if (oldestKey !== undefined) {
+        const oldValue = this.cache.get(oldestKey);
+        if (oldValue) this.cacheBytes -= oldValue.length;
+        this.cache.delete(oldestKey);
+      } else {
+        break;
+      }
+    }
+  }
+
+  /**
+   * Add item to cache with LRU tracking.
+   */
+  private cacheSet(key: string, data: Uint8Array): void {
+    // Remove old entry if exists (to update LRU order)
+    const existing = this.cache.get(key);
+    if (existing) {
+      this.cacheBytes -= existing.length;
+      this.cache.delete(key);
+    }
+
+    // Add new entry
+    this.cache.set(key, data);
+    this.cacheBytes += data.length;
+
+    // Evict if needed
+    this.evictIfNeeded();
+  }
 
   /**
    * Read raw bytes from storage.
    */
   async read(key: string): Promise<Uint8Array | null> {
-    // Check cache first
+    // Check cache first (and refresh LRU order)
     const cached = this.cache.get(key);
-    if (cached) return cached;
+    if (cached) {
+      // Refresh LRU order by re-inserting
+      this.cache.delete(key);
+      this.cache.set(key, cached);
+      return cached;
+    }
 
     try {
       const path = this.getStoragePath(key);
@@ -32,11 +96,11 @@ export class ObsidianStorageAdapter implements StorageAdapter {
       if (await adapter.exists(path)) {
         const data = await adapter.readBinary(path);
         const bytes = new Uint8Array(data);
-        this.cache.set(key, bytes);
+        this.cacheSet(key, bytes);
         return bytes;
       }
     } catch (error) {
-      console.error(`Failed to read storage key "${key}":`, error);
+      this.logger.error(`Failed to read storage key "${key}":`, error);
     }
 
     return null;
@@ -57,9 +121,9 @@ export class ObsidianStorageAdapter implements StorageAdapter {
       }
 
       await adapter.writeBinary(path, data.buffer as ArrayBuffer);
-      this.cache.set(key, data);
+      this.cacheSet(key, data);
     } catch (error) {
-      console.error(`Failed to write storage key "${key}":`, error);
+      this.logger.error(`Failed to write storage key "${key}":`, error);
       throw error;
     }
   }
@@ -75,9 +139,13 @@ export class ObsidianStorageAdapter implements StorageAdapter {
       if (await adapter.exists(path)) {
         await adapter.remove(path);
       }
+      const cached = this.cache.get(key);
+      if (cached) {
+        this.cacheBytes -= cached.length;
+      }
       this.cache.delete(key);
     } catch (error) {
-      console.error(`Failed to delete storage key "${key}":`, error);
+      this.logger.error(`Failed to delete storage key "${key}":`, error);
       throw error;
     }
   }
@@ -105,7 +173,7 @@ export class ObsidianStorageAdapter implements StorageAdapter {
 
       return keys;
     } catch (error) {
-      console.error("Failed to list storage keys:", error);
+      this.logger.error("Failed to list storage keys:", error);
       return [];
     }
   }
@@ -129,6 +197,7 @@ export class ObsidianStorageAdapter implements StorageAdapter {
    */
   clearCache(): void {
     this.cache.clear();
+    this.cacheBytes = 0;
   }
 
   /**

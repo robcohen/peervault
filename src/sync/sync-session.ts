@@ -38,6 +38,22 @@ import {
 } from "./messages";
 import { EventEmitter } from "../utils/events";
 
+/** Maximum length for peer hostname/nickname to prevent abuse */
+const MAX_PEER_NAME_LENGTH = 64;
+
+/**
+ * Sanitize peer-provided string to prevent excessively long values.
+ * Truncates and removes control characters.
+ */
+function sanitizePeerString(value: string | undefined, maxLength: number = MAX_PEER_NAME_LENGTH): string | undefined {
+  if (!value) return undefined;
+  // Remove control characters and trim
+  const cleaned = value.replace(/[\x00-\x1f\x7f]/g, "").trim();
+  if (cleaned.length === 0) return undefined;
+  // Truncate if too long
+  return cleaned.length > maxLength ? cleaned.slice(0, maxLength) + "…" : cleaned;
+}
+
 /** Sync session configuration */
 export interface SyncSessionConfig {
   /** Ping interval in ms */
@@ -45,6 +61,9 @@ export interface SyncSessionConfig {
 
   /** Ping timeout in ms */
   pingTimeout?: number;
+
+  /** Receive timeout in ms (max time to wait for a message from peer) */
+  receiveTimeout?: number;
 
   /** Max retry attempts for sync */
   maxRetries?: number;
@@ -54,6 +73,14 @@ export interface SyncSessionConfig {
 
   /** If true, adopt peer's vault ID on first sync instead of rejecting on mismatch */
   allowVaultAdoption?: boolean;
+
+  /**
+   * Callback to confirm vault adoption before proceeding.
+   * Called when vault IDs mismatch and allowVaultAdoption is true.
+   * Return true to adopt peer's vault ID, false to abort sync.
+   * If not provided and allowVaultAdoption is true, auto-adopts without confirmation.
+   */
+  onVaultAdoptionNeeded?: (peerVaultId: string, ourVaultId: string) => Promise<boolean>;
 
   /** Our connection ticket to send to peer */
   ourTicket: string;
@@ -71,6 +98,7 @@ const DEFAULT_CONFIG: Omit<Required<SyncSessionConfig>, "ourTicket" | "ourHostna
 } = {
   pingInterval: 15000, // Reduced from 30000 for faster stale detection
   pingTimeout: 10000,
+  receiveTimeout: 30000, // 30 seconds default receive timeout
   maxRetries: 3,
   peerIsReadOnly: false,
   allowVaultAdoption: false,
@@ -106,6 +134,9 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
   private pendingUpdates: Uint8Array[] = [];
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly BATCH_DELAY_MS = 15;
+  private readonly MAX_PENDING_UPDATES = 100;
+  private readonly MAX_PENDING_BYTES = 1024 * 1024; // 1MB
+  private pendingBytes = 0;
 
   constructor(
     private peerId: string,
@@ -134,6 +165,9 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
    * Start sync with the given stream.
    */
   async startSync(stream: SyncStream): Promise<void> {
+    if (!stream) {
+      throw SyncErrors.protocolError("Stream is required to start sync");
+    }
     if (this.state !== "idle" && this.state !== "error") {
       throw SyncErrors.protocolError(`Cannot start sync in state: ${this.state}`);
     }
@@ -164,7 +198,10 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       this.setState("live");
       this.startPingTimer();
       this.subscribeToLocalUpdates();
-      this.startLiveLoop();
+      this.startLiveLoop().catch((err) => {
+        this.logger.error("Live loop error:", err);
+        this.emit("error", err as Error);
+      });
 
       this.emit("sync:complete", undefined);
     } catch (error) {
@@ -199,17 +236,34 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       // Emit peer's ticket (for bidirectional reconnection)
       this.emit("ticket:received", peerVersionInfo.ticket);
 
-      // Emit peer's info (for display)
+      // Emit peer's info (for display) - sanitize to prevent abuse
       this.emit("peer:info", {
-        hostname: peerVersionInfo.hostname,
-        nickname: peerVersionInfo.nickname,
+        hostname: sanitizePeerString(peerVersionInfo.hostname),
+        nickname: sanitizePeerString(peerVersionInfo.nickname),
       });
 
       // Validate vault ID
       let ourVaultId = this.documentManager.getVaultId();
       if (peerVersionInfo.vaultId !== ourVaultId) {
         if (this.config.allowVaultAdoption) {
-          // First sync with this peer - adopt their vault ID
+          // Check for user confirmation if callback provided
+          if (this.config.onVaultAdoptionNeeded) {
+            this.logger.info(
+              `Vault ID mismatch - requesting user confirmation to adopt: ${peerVersionInfo.vaultId}`,
+            );
+            const confirmed = await this.config.onVaultAdoptionNeeded(
+              peerVersionInfo.vaultId,
+              ourVaultId,
+            );
+            if (!confirmed) {
+              this.logger.info("User denied vault adoption, aborting sync");
+              await this.sendMessage(
+                createErrorMessage(SyncErrorCode.VAULT_MISMATCH, "Vault adoption denied by user"),
+              );
+              throw SyncErrors.vaultMismatch(ourVaultId, peerVersionInfo.vaultId);
+            }
+          }
+          // User confirmed (or no callback) - adopt their vault ID
           this.logger.info(
             `Adopting peer's vault ID: ${peerVersionInfo.vaultId} (was: ${ourVaultId})`,
           );
@@ -252,7 +306,10 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       this.setState("live");
       this.startPingTimer();
       this.subscribeToLocalUpdates();
-      this.startLiveLoop();
+      this.startLiveLoop().catch((err) => {
+        this.logger.error("Live loop error:", err);
+        this.emit("error", err as Error);
+      });
 
       this.emit("sync:complete", undefined);
     } catch (error) {
@@ -274,6 +331,20 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
 
     // Add to pending batch
     this.pendingUpdates.push(updates);
+    this.pendingBytes += updates.length;
+
+    // Flush immediately if limits exceeded
+    if (
+      this.pendingUpdates.length >= this.MAX_PENDING_UPDATES ||
+      this.pendingBytes >= this.MAX_PENDING_BYTES
+    ) {
+      if (this.flushTimer) {
+        clearTimeout(this.flushTimer);
+        this.flushTimer = null;
+      }
+      await this.flushUpdates();
+      return;
+    }
 
     // Schedule flush if not already scheduled
     if (!this.flushTimer) {
@@ -298,6 +369,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     // Combine all pending updates into one
     const combined = this.concatenateUpdates(this.pendingUpdates);
     this.pendingUpdates = [];
+    this.pendingBytes = 0;
 
     try {
       await this.sendMessage(createUpdatesMessage(combined, 0));
@@ -361,6 +433,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       }
     }
     this.pendingUpdates = [];
+    this.pendingBytes = 0;
 
     if (this.stream) {
       try {
@@ -390,6 +463,18 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
   // Private: Version Exchange
   // ===========================================================================
 
+  /**
+   * Exchange version vectors with peer (initiator role).
+   *
+   * Protocol flow:
+   * 1. Send our VERSION_INFO (vault ID, version vector, ticket, identity)
+   * 2. Receive peer's VERSION_INFO
+   * 3. Validate vault IDs match
+   * 4. Emit peer's ticket and identity info for connection management
+   *
+   * @throws SyncErrors.vaultMismatch if vault IDs don't match
+   * @throws SyncErrors.protocolError if unexpected message received
+   */
   private async exchangeVersions(): Promise<void> {
     const vaultId = this.documentManager.getVaultId();
     const versionBytes = this.documentManager.getVersionBytes();
@@ -425,10 +510,10 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     // Emit peer's ticket (for bidirectional reconnection)
     this.emit("ticket:received", peerVersionInfo.ticket);
 
-    // Emit peer's info (for display)
+    // Emit peer's info (for display) - sanitize to prevent abuse
     this.emit("peer:info", {
-      hostname: peerVersionInfo.hostname,
-      nickname: peerVersionInfo.nickname,
+      hostname: sanitizePeerString(peerVersionInfo.hostname),
+      nickname: sanitizePeerString(peerVersionInfo.nickname),
     });
 
     this.logger.debug("Version exchange complete");
@@ -438,47 +523,23 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
   // Private: Update Sync (Initiator)
   // ===========================================================================
 
+  /**
+   * Sync document updates with peer (initiator role).
+   *
+   * Protocol flow:
+   * 1. Export our CRDT updates (changes since initial state)
+   * 2. Send UPDATES message with our changes
+   * 3. Receive peer's UPDATES message
+   * 4. Import peer's changes (unless peer is read-only)
+   *
+   * Uses Loro CRDT's automatic conflict resolution - concurrent edits
+   * are merged deterministically without data loss.
+   */
   private async syncUpdates(): Promise<void> {
-    // Get our current version
-    const ourVersion = this.documentManager.getVersion();
-
-    // Export updates we have
-    const ourUpdates = this.documentManager.exportUpdates();
-
-    // Send our updates
-    if (ourUpdates.length > 0) {
-      await this.sendMessage(createUpdatesMessage(ourUpdates, 0));
-    }
-
-    // Wait for peer's updates
-    const peerMessage = await this.receiveMessage();
-
-    if (peerMessage.type === SyncMessageType.UPDATES) {
-      const updatesMsg = peerMessage as UpdatesMessage;
-      if (updatesMsg.updates.length > 0) {
-        if (this.config.peerIsReadOnly) {
-          this.logger.debug("Skipping updates from read-only peer");
-        } else {
-          this.documentManager.importUpdates(updatesMsg.updates);
-          this.logger.debug("Imported updates from peer");
-        }
-      }
-    } else if (peerMessage.type === SyncMessageType.ERROR) {
-      throw SyncErrors.protocolError(
-        `Peer error: ${(peerMessage as { message: string }).message}`,
-      );
-    }
-
-    // Send sync complete
-    const finalVersion = this.documentManager.getVersionBytes();
-    await this.sendMessage(createSyncCompleteMessage(finalVersion));
-
-    // Wait for peer's sync complete
-    const completeMsg = await this.receiveMessage();
-    if (completeMsg.type !== SyncMessageType.SYNC_COMPLETE) {
-      this.logger.warn("Expected SYNC_COMPLETE, got:", completeMsg.type);
-    }
-
+    // Initiator: send first, then receive
+    await this.sendOurUpdates();
+    await this.receiveAndImportUpdates();
+    await this.exchangeSyncComplete(true);
     this.logger.debug("Sync complete");
   }
 
@@ -487,9 +548,32 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
   // ===========================================================================
 
   private async syncUpdatesAsReceiver(
-    peerVersionBytes: Uint8Array,
+    _peerVersionBytes: Uint8Array,
   ): Promise<void> {
-    // Wait for peer's updates first
+    // Receiver: receive first, then send
+    await this.receiveAndImportUpdates();
+    await this.sendOurUpdates();
+    await this.exchangeSyncComplete(false);
+    this.logger.debug("Sync complete (receiver)");
+  }
+
+  // ===========================================================================
+  // Private: Update Sync Helpers
+  // ===========================================================================
+
+  /**
+   * Send our document updates to the peer.
+   */
+  private async sendOurUpdates(): Promise<void> {
+    const ourUpdates = this.documentManager.exportUpdates();
+    await this.sendMessage(createUpdatesMessage(ourUpdates, 0));
+  }
+
+  /**
+   * Receive and import updates from the peer.
+   * Handles the UPDATES message type and respects read-only peer settings.
+   */
+  private async receiveAndImportUpdates(): Promise<void> {
     const peerMessage = await this.receiveMessage();
 
     if (peerMessage.type === SyncMessageType.UPDATES) {
@@ -507,27 +591,28 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
         `Peer error: ${(peerMessage as { message: string }).message}`,
       );
     }
+  }
 
-    // Send our updates
-    const ourUpdates = this.documentManager.exportUpdates();
-    if (ourUpdates.length > 0) {
-      await this.sendMessage(createUpdatesMessage(ourUpdates, 0));
-    } else {
-      // Send empty updates
-      await this.sendMessage(createUpdatesMessage(new Uint8Array(0), 0));
-    }
-
-    // Wait for sync complete
-    const completeMsg = await this.receiveMessage();
-    if (completeMsg.type !== SyncMessageType.SYNC_COMPLETE) {
-      this.logger.warn("Expected SYNC_COMPLETE, got:", completeMsg.type);
-    }
-
-    // Send our sync complete
+  /**
+   * Exchange SYNC_COMPLETE messages to finalize the sync.
+   * @param sendFirst - If true, send our complete message first; otherwise receive first.
+   */
+  private async exchangeSyncComplete(sendFirst: boolean): Promise<void> {
     const finalVersion = this.documentManager.getVersionBytes();
-    await this.sendMessage(createSyncCompleteMessage(finalVersion));
 
-    this.logger.debug("Sync complete (receiver)");
+    if (sendFirst) {
+      await this.sendMessage(createSyncCompleteMessage(finalVersion));
+      const completeMsg = await this.receiveMessage();
+      if (completeMsg.type !== SyncMessageType.SYNC_COMPLETE) {
+        this.logger.warn("Expected SYNC_COMPLETE, got:", completeMsg.type);
+      }
+    } else {
+      const completeMsg = await this.receiveMessage();
+      if (completeMsg.type !== SyncMessageType.SYNC_COMPLETE) {
+        this.logger.warn("Expected SYNC_COMPLETE, got:", completeMsg.type);
+      }
+      await this.sendMessage(createSyncCompleteMessage(finalVersion));
+    }
   }
 
   // ===========================================================================
@@ -739,9 +824,19 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
   // ===========================================================================
 
   private async startLiveLoop(): Promise<void> {
+    // Exponential backoff for transient errors
+    const MAX_RETRIES = 5;
+    const BASE_DELAY_MS = 500;
+    const MAX_DELAY_MS = 30000;
+    let consecutiveErrors = 0;
+
     while (this.state === "live" && this.stream && !this.aborted) {
       try {
-        const message = await this.receiveMessage();
+        // Use infinite timeout for live loop - ping/pong handles liveness
+        const message = await this.receiveMessage(Infinity);
+
+        // Reset error count on successful message
+        consecutiveErrors = 0;
 
         switch (message.type) {
           case SyncMessageType.UPDATES: {
@@ -787,11 +882,31 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
             this.logger.warn("Unexpected message in live mode:", message.type);
         }
       } catch (error) {
-        if (!this.aborted) {
-          this.logger.error("Live loop error:", error);
-          this.setState("error");
-          this.emit("error", error as Error);
+        if (this.aborted) {
+          return;
         }
+
+        consecutiveErrors++;
+        const isTransient = this.isTransientError(error);
+
+        if (isTransient && consecutiveErrors <= MAX_RETRIES) {
+          // Exponential backoff with jitter for transient errors
+          const delay = Math.min(
+            BASE_DELAY_MS * Math.pow(2, consecutiveErrors - 1) + Math.random() * 100,
+            MAX_DELAY_MS,
+          );
+          this.logger.warn(
+            `Live loop transient error (attempt ${consecutiveErrors}/${MAX_RETRIES}), retrying in ${delay.toFixed(0)}ms:`,
+            error,
+          );
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          continue; // Retry the loop
+        }
+
+        // Non-transient error or max retries exceeded
+        this.logger.error("Live loop error (non-recoverable):", error);
+        this.setState("error");
+        this.emit("error", error as Error);
         return;
       }
     }
@@ -859,12 +974,88 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     await this.stream.send(bytes);
   }
 
-  private async receiveMessage(): Promise<AnySyncMessage> {
+  /**
+   * Receive a message from the peer with timeout.
+   *
+   * @param timeoutMs - Optional timeout override. Uses config.receiveTimeout by default.
+   *                    Pass 0 or Infinity to disable timeout (for live sync loop).
+   * @throws TransportErrors.streamClosed if stream is closed
+   * @throws SyncErrors.timeout if receive times out
+   */
+  private async receiveMessage(timeoutMs?: number): Promise<AnySyncMessage> {
     if (!this.stream) {
       throw TransportErrors.streamClosed("sync-session");
     }
 
-    const bytes = await this.stream.receive();
-    return deserializeMessage(bytes);
+    const timeout = timeoutMs ?? this.config.receiveTimeout;
+
+    // No timeout (e.g., during live loop where we wait indefinitely)
+    if (timeout <= 0 || timeout === Infinity) {
+      const bytes = await this.stream.receive();
+      return deserializeMessage(bytes);
+    }
+
+    // Race between receive and timeout with guaranteed cleanup
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let timedOut = false;
+
+    try {
+      const receivePromise = this.stream.receive();
+
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          reject(SyncErrors.timeout(`Receive timeout after ${timeout}ms`));
+        }, timeout);
+      });
+
+      const bytes = await Promise.race([receivePromise, timeoutPromise]);
+      return deserializeMessage(bytes);
+    } finally {
+      // Always clean up timer, regardless of success or failure
+      if (timer !== null) {
+        clearTimeout(timer);
+      }
+    }
+  }
+
+  /**
+   * Determine if an error is transient and should be retried.
+   * Transient errors include timeouts and network issues.
+   * Non-transient errors include protocol errors and peer removal.
+   */
+  private isTransientError(error: unknown): boolean {
+    if (!(error instanceof Error)) {
+      return false;
+    }
+
+    const message = error.message.toLowerCase();
+
+    // Transient: timeout, network, connection issues
+    if (
+      message.includes("timeout") ||
+      message.includes("network") ||
+      message.includes("connection") ||
+      message.includes("econnreset") ||
+      message.includes("econnrefused") ||
+      message.includes("epipe") ||
+      message.includes("temporarily")
+    ) {
+      return true;
+    }
+
+    // Non-transient: protocol errors, vault mismatch, explicit errors
+    if (
+      message.includes("protocol") ||
+      message.includes("mismatch") ||
+      message.includes("invalid") ||
+      message.includes("denied") ||
+      message.includes("removed")
+    ) {
+      return false;
+    }
+
+    // Default: assume transient for unknown errors
+    return true;
   }
 }

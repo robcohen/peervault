@@ -6,6 +6,7 @@
 
 import { App, Modal, Notice, Setting, TFolder } from "obsidian";
 import type PeerVaultPlugin from "../main";
+import { isPathInExcludedFolders } from "../utils/validation";
 
 /** Sync mode for a folder */
 export type FolderSyncMode = "include" | "exclude" | "inherit";
@@ -319,12 +320,7 @@ export class SelectiveSyncModal extends Modal {
   }
 
   private isPathExcluded(path: string): boolean {
-    for (const excluded of this.excludedFolders) {
-      if (path === excluded || path.startsWith(excluded + "/")) {
-        return true;
-      }
-    }
-    return false;
+    return isPathInExcludedFolders(path, [...this.excludedFolders]);
   }
 
   private async save(): Promise<void> {

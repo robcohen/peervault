@@ -121,6 +121,8 @@ export class IrohTransport implements Transport {
   private ready = false;
   private config: TransportConfig;
   private acceptLoopRunning = false;
+  private acceptLoopCrashCount = 0;
+  private static readonly MAX_ACCEPT_LOOP_CRASHES = 5;
 
   constructor(config: TransportConfig) {
     this.config = config;
@@ -213,8 +215,12 @@ export class IrohTransport implements Transport {
     return connection;
   }
 
-  onIncomingConnection(callback: (conn: PeerConnection) => void): void {
+  onIncomingConnection(callback: (conn: PeerConnection) => void): () => void {
     this.incomingCallbacks.push(callback);
+    return () => {
+      const idx = this.incomingCallbacks.indexOf(callback);
+      if (idx >= 0) this.incomingCallbacks.splice(idx, 1);
+    };
   }
 
   private startAcceptLoop(): void {
@@ -222,6 +228,11 @@ export class IrohTransport implements Transport {
     this.acceptLoopRunning = true;
 
     const acceptLoop = async () => {
+      // Exponential backoff for errors
+      const BASE_DELAY_MS = 500;
+      const MAX_DELAY_MS = 30000;
+      let consecutiveErrors = 0;
+
       while (this.ready && this.endpoint) {
         try {
           this.config.logger.debug("Waiting for incoming connection...");
@@ -235,6 +246,9 @@ export class IrohTransport implements Transport {
             }
             break;
           }
+
+          // Reset error counter on successful accept
+          consecutiveErrors = 0;
 
           const peerId = wasmConn.remoteNodeId();
 
@@ -261,18 +275,43 @@ export class IrohTransport implements Transport {
           }
         } catch (err) {
           if (this.ready) {
-            this.config.logger.error("Error accepting connection:", err);
-            // Small delay before retrying
-            await new Promise((resolve) => setTimeout(resolve, 1000));
+            consecutiveErrors++;
+            // Exponential backoff with jitter
+            const delay = Math.min(
+              BASE_DELAY_MS * Math.pow(2, consecutiveErrors - 1) + Math.random() * 100,
+              MAX_DELAY_MS,
+            );
+            this.config.logger.error(
+              `Error accepting connection (attempt ${consecutiveErrors}), retrying in ${delay.toFixed(0)}ms:`,
+              err,
+            );
+            await new Promise((resolve) => setTimeout(resolve, delay));
           }
         }
       }
     };
 
-    // Run accept loop in background
+    // Run accept loop in background with auto-recovery
     acceptLoop().catch((err) => {
       this.config.logger.error("Accept loop crashed:", err);
       this.acceptLoopRunning = false;
+      this.acceptLoopCrashCount++;
+
+      // Auto-restart the loop if the transport is still ready and under crash limit
+      if (this.ready && this.endpoint) {
+        if (this.acceptLoopCrashCount >= IrohTransport.MAX_ACCEPT_LOOP_CRASHES) {
+          this.config.logger.error(
+            `Accept loop crashed ${this.acceptLoopCrashCount} times, giving up. ` +
+            "Restart the plugin to retry."
+          );
+          return;
+        }
+        const delay = Math.min(1000 * Math.pow(2, this.acceptLoopCrashCount - 1), 30000);
+        this.config.logger.info(
+          `Restarting accept loop after crash (attempt ${this.acceptLoopCrashCount}/${IrohTransport.MAX_ACCEPT_LOOP_CRASHES}) in ${delay}ms...`
+        );
+        setTimeout(() => this.startAcceptLoop(), delay);
+      }
     });
   }
 
@@ -287,12 +326,16 @@ export class IrohTransport implements Transport {
 
   async shutdown(): Promise<void> {
     this.ready = false;
+    this.acceptLoopRunning = false;
 
     // Close all connections
     for (const conn of this.connections.values()) {
       await conn.close();
     }
     this.connections.clear();
+
+    // Clear incoming connection callbacks to prevent leaks on reinitialization
+    this.incomingCallbacks = [];
 
     // Close the endpoint
     if (this.endpoint) {
@@ -320,10 +363,18 @@ class IrohPeerConnection implements PeerConnection {
   private streams = new Map<string, IrohSyncStream>();
   private pendingStreams: IrohSyncStream[] = [];
   private stateCallbacks: Array<(state: ConnectionState) => void> = [];
+  /** Pending acceptStream() handlers paired with their reject functions to avoid index mismatch */
+  private pendingAccepts: Array<{
+    resolve: (stream: SyncStream) => void;
+    reject: (error: Error) => void;
+  }> = [];
+  /** Stream callbacks for onStream() - these are persistent, not one-time */
   private streamCallbacks: Array<(stream: SyncStream) => void> = [];
   private streamCounter = 0;
   private logger: TransportConfig["logger"];
   private acceptStreamLoopRunning = false;
+  private streamLoopCrashCount = 0;
+  private static readonly MAX_STREAM_LOOP_CRASHES = 5;
 
   constructor(
     wasmConn: WasmConnection,
@@ -351,7 +402,14 @@ class IrohPeerConnection implements PeerConnection {
 
           this.logger.debug("Accepted incoming stream:", streamId);
 
-          // Add to pending or notify callbacks
+          // Priority 1: Resolve any pending acceptStream() promise
+          if (this.pendingAccepts.length > 0) {
+            const pending = this.pendingAccepts.shift()!;
+            pending.resolve(stream);
+            continue;
+          }
+
+          // Priority 2: Notify onStream() callbacks (persistent listeners)
           if (this.streamCallbacks.length > 0) {
             for (const callback of this.streamCallbacks) {
               try {
@@ -361,6 +419,7 @@ class IrohPeerConnection implements PeerConnection {
               }
             }
           } else {
+            // Priority 3: Queue for later acceptStream() call
             this.pendingStreams.push(stream);
           }
         } catch (err) {
@@ -377,6 +436,23 @@ class IrohPeerConnection implements PeerConnection {
     loop().catch((err) => {
       this.logger.error("Stream accept loop crashed:", err);
       this.acceptStreamLoopRunning = false;
+      this.streamLoopCrashCount++;
+
+      // Auto-restart the loop if still connected and under crash limit
+      if (this.state === "connected") {
+        if (this.streamLoopCrashCount >= IrohPeerConnection.MAX_STREAM_LOOP_CRASHES) {
+          this.logger.error(
+            `Stream accept loop crashed ${this.streamLoopCrashCount} times, disconnecting.`
+          );
+          this.handleDisconnect();
+          return;
+        }
+        const delay = Math.min(500 * Math.pow(2, this.streamLoopCrashCount - 1), 15000);
+        this.logger.info(
+          `Restarting stream accept loop after crash (attempt ${this.streamLoopCrashCount}/${IrohPeerConnection.MAX_STREAM_LOOP_CRASHES}) in ${delay}ms...`
+        );
+        setTimeout(() => this.startStreamAcceptLoop(), delay);
+      }
     });
   }
 
@@ -384,6 +460,19 @@ class IrohPeerConnection implements PeerConnection {
     if (this.state === "disconnected") return;
 
     this.state = "disconnected";
+
+    // Reject all pending acceptStream() promises
+    const pendingAccepts = this.pendingAccepts;
+    this.pendingAccepts = [];
+    const disconnectError = TransportErrors.connectionFailed(this.peerId, "Connection lost");
+    for (const pending of pendingAccepts) {
+      try {
+        pending.reject(disconnectError);
+      } catch (err) {
+        this.logger.debug("Error rejecting pending accept on disconnect:", err);
+      }
+    }
+
     for (const callback of this.stateCallbacks) {
       try {
         callback("disconnected");
@@ -414,20 +503,15 @@ class IrohPeerConnection implements PeerConnection {
       return this.pendingStreams.shift()!;
     }
 
-    // Wait for incoming stream
+    // Wait for incoming stream - using paired resolve/reject to avoid index mismatch
     return new Promise((resolve, reject) => {
       if (this.state !== "connected") {
         reject(TransportErrors.connectionFailed(this.peerId, "Connection not active"));
         return;
       }
 
-      const handler = (stream: SyncStream) => {
-        resolve(stream);
-        // Remove this one-time handler
-        const idx = this.streamCallbacks.indexOf(handler);
-        if (idx >= 0) this.streamCallbacks.splice(idx, 1);
-      };
-      this.streamCallbacks.push(handler);
+      // Add paired resolve/reject - the accept loop will call resolve when a stream arrives
+      this.pendingAccepts.push({ resolve, reject });
     });
   }
 
@@ -436,17 +520,38 @@ class IrohPeerConnection implements PeerConnection {
 
     this.state = "disconnected";
 
-    // Close all streams
+    // Close all active streams
     for (const stream of this.streams.values()) {
       await stream.close();
     }
     this.streams.clear();
 
+    // Close all pending streams that were never claimed
+    for (const stream of this.pendingStreams) {
+      await stream.close();
+    }
+    this.pendingStreams = [];
+
+    // Reject all pending acceptStream() promises
+    const pendingAccepts = this.pendingAccepts;
+    this.pendingAccepts = [];
+    const closeError = TransportErrors.connectionFailed(this.peerId, "Connection closed");
+    for (const pending of pendingAccepts) {
+      try {
+        pending.reject(closeError);
+      } catch (err) {
+        this.logger.debug("Error rejecting pending accept:", err);
+      }
+    }
+
+    // Clear persistent stream callbacks
+    this.streamCallbacks = [];
+
     // Close the WASM connection
     await this.wasmConn.close();
     this.wasmConn.free();
 
-    // Notify state change
+    // Notify state change (then clear callbacks)
     for (const callback of this.stateCallbacks) {
       try {
         callback("disconnected");
@@ -454,6 +559,7 @@ class IrohPeerConnection implements PeerConnection {
         this.logger.error("Error in state change callback:", err);
       }
     }
+    this.stateCallbacks = [];
   }
 
   isConnected(): boolean {
@@ -469,12 +575,20 @@ class IrohPeerConnection implements PeerConnection {
     }
   }
 
-  onStateChange(callback: (state: ConnectionState) => void): void {
+  onStateChange(callback: (state: ConnectionState) => void): () => void {
     this.stateCallbacks.push(callback);
+    return () => {
+      const idx = this.stateCallbacks.indexOf(callback);
+      if (idx >= 0) this.stateCallbacks.splice(idx, 1);
+    };
   }
 
-  onStream(callback: (stream: SyncStream) => void): void {
+  onStream(callback: (stream: SyncStream) => void): () => void {
     this.streamCallbacks.push(callback);
+    return () => {
+      const idx = this.streamCallbacks.indexOf(callback);
+      if (idx >= 0) this.streamCallbacks.splice(idx, 1);
+    };
   }
 }
 

@@ -28,6 +28,12 @@ export interface ConflictInfo {
 /** Concurrent edit window in ms (edits within this window are considered concurrent) */
 const CONCURRENT_WINDOW_MS = 60000; // 1 minute
 
+/** Maximum number of files to track edits for */
+const MAX_TRACKED_FILES = 1000;
+
+/** Maximum number of conflicts to store */
+const MAX_CONFLICTS = 500;
+
 /**
  * Tracks file edit history to detect concurrent edits.
  */
@@ -66,12 +72,69 @@ export class ConflictTracker {
     const recentOnly = edits.filter((e) => e.timestamp > cutoff);
     this.recentEdits.set(path, recentOnly);
 
+    // Enforce size limit on recentEdits map - remove oldest entries
+    if (this.recentEdits.size > MAX_TRACKED_FILES) {
+      this.pruneOldestEdits();
+    }
+
     // Check for concurrent edits
     this.detectConflict(path, recentOnly);
   }
 
   /**
+   * Remove oldest entries from recentEdits to stay under the size limit.
+   */
+  private pruneOldestEdits(): void {
+    // Find entries with oldest timestamps and remove them
+    const entries = Array.from(this.recentEdits.entries())
+      .map(([path, edits]) => ({
+        path,
+        latestTimestamp: Math.max(...edits.map((e) => e.timestamp), 0),
+      }))
+      .sort((a, b) => a.latestTimestamp - b.latestTimestamp);
+
+    // Remove oldest 10% to avoid frequent pruning
+    const toRemove = Math.ceil(entries.length * 0.1);
+    for (let i = 0; i < toRemove && i < entries.length; i++) {
+      this.recentEdits.delete(entries[i].path);
+    }
+  }
+
+  /**
+   * Remove old conflicts to stay under the size limit.
+   * Prioritizes removing resolved conflicts first, then oldest unresolved.
+   */
+  private pruneOldConflicts(): void {
+    const entries = Array.from(this.conflicts.entries())
+      .map(([path, conflict]) => ({ path, conflict }))
+      // Sort: resolved first, then by timestamp (oldest first)
+      .sort((a, b) => {
+        if (a.conflict.resolved !== b.conflict.resolved) {
+          return a.conflict.resolved ? -1 : 1; // Resolved first
+        }
+        return a.conflict.timestamp - b.conflict.timestamp; // Oldest first
+      });
+
+    // Remove oldest 10% to avoid frequent pruning
+    const toRemove = Math.ceil(entries.length * 0.1);
+    for (let i = 0; i < toRemove && i < entries.length; i++) {
+      this.conflicts.delete(entries[i].path);
+    }
+  }
+
+  /**
    * Detect if there are concurrent edits from different peers.
+   *
+   * A conflict is detected when 2+ different peers have edited the same file
+   * within the CONCURRENT_WINDOW_MS time window (default: 1 minute).
+   *
+   * Note: This doesn't mean data was lost - Loro CRDT automatically merges
+   * concurrent edits. This tracking is purely to alert users that multiple
+   * people edited the same file around the same time so they can review
+   * the merged result.
+   *
+   * @param path - File path being checked
+   * @param edits - Recent edits for this file
    */
   private detectConflict(
     path: string,
@@ -114,6 +177,11 @@ export class ConflictTracker {
 
       this.conflicts.set(path, conflict);
       this.logger.info("Concurrent edit detected:", path, "peers:", peerNames);
+
+      // Enforce size limit on conflicts map - remove oldest resolved conflicts first
+      if (this.conflicts.size > MAX_CONFLICTS) {
+        this.pruneOldConflicts();
+      }
 
       // Notify listeners
       for (const callback of this.conflictCallbacks) {
@@ -183,6 +251,24 @@ export class ConflictTracker {
    */
   getConflictCount(): number {
     return this.getConflicts().length;
+  }
+
+  /**
+   * Clear all conflict callbacks.
+   * Call this when cleaning up to prevent memory leaks.
+   */
+  clearCallbacks(): void {
+    this.conflictCallbacks = [];
+  }
+
+  /**
+   * Reset the tracker, clearing all state.
+   * Call this when reinitializing.
+   */
+  reset(): void {
+    this.recentEdits.clear();
+    this.conflicts.clear();
+    this.conflictCallbacks = [];
   }
 }
 

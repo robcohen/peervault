@@ -180,17 +180,24 @@ export class MigrationRunner {
 
   /**
    * Get the currently stored schema version.
+   * @throws Error if storage read fails (not for missing key)
    */
   private async getStoredVersion(): Promise<number> {
-    try {
-      const data = await this.storage.read(SCHEMA_VERSION_KEY);
-      if (!data) return 0; // Fresh install
+    const data = await this.storage.read(SCHEMA_VERSION_KEY);
+    if (!data) return 0; // Fresh install - key doesn't exist
 
+    try {
       const json = new TextDecoder().decode(data);
       const stored: StoredSchemaVersion = JSON.parse(json);
+      if (typeof stored.version !== "number" || stored.version < 0) {
+        this.logger.warn("Invalid schema version stored, treating as fresh install");
+        return 0;
+      }
       return stored.version;
-    } catch {
-      return 0; // Assume fresh install on error
+    } catch (parseError) {
+      // JSON parse error - data is corrupted
+      this.logger.error("Failed to parse schema version, treating as fresh install:", parseError);
+      return 0;
     }
   }
 

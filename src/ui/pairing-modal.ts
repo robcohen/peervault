@@ -14,6 +14,7 @@ import {
   scanQRFromImage,
   scanQRFromClipboard,
 } from "./utils/qr-utils";
+import { formatUserError } from "../utils/validation";
 
 export type PairingTab = "show" | "scan" | "manual";
 
@@ -242,8 +243,7 @@ export class PairingModal extends Modal {
       }
     } catch (error) {
       this.plugin.logger.error("Failed to process QR image:", error);
-      const errorMsg = error instanceof Error ? error.message : "Unknown error";
-      new Notice(`Failed to process image: ${errorMsg}`);
+      new Notice(`Failed to process image: ${formatUserError(error)}`);
     }
   }
 
@@ -326,8 +326,7 @@ export class PairingModal extends Modal {
       this.close();
     } catch (error) {
       this.plugin.logger.error("Failed to connect to peer:", error);
-      const errorMsg = error instanceof Error ? error.message : "Unknown error";
-      new Notice(`Connection failed: ${errorMsg}`);
+      new Notice(`Connection failed: ${formatUserError(error)}`);
     }
   }
 }

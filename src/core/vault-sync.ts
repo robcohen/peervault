@@ -11,6 +11,7 @@ import type { DocumentManager, FileChangeEvent } from "./document-manager";
 import type { BlobStore } from "./blob-store";
 import { isBinaryFile } from "./blob-store";
 import type { Logger } from "../utils/logger";
+import { isPathInExcludedFolders } from "../utils/validation";
 
 /** Configuration for vault sync */
 export interface VaultSyncConfig {
@@ -248,42 +249,50 @@ export class VaultSync {
       const docPaths = this.documentManager.listAllPaths();
       this.logger.info(`Document has ${docPaths.length} files`);
 
-      // Sort paths to ensure parents are created before children
-      const sortedPaths = [...docPaths].sort((a, b) => {
-        const aDepth = a.split("/").length;
-        const bDepth = b.split("/").length;
-        return aDepth - bDepth;
-      });
+      // Group paths by depth to ensure parents are created before children
+      // Files at the same depth can be processed in parallel
+      const pathsByDepth = new Map<number, string[]>();
+      for (const path of docPaths) {
+        if (!this.shouldSync(path)) continue;
 
-      for (const path of sortedPaths) {
-        if (!this.shouldSync(path)) {
-          continue;
-        }
+        const content = this.documentManager.getContent(path);
+        if (!content || content.type === "folder") continue;
 
-        try {
-          const content = this.documentManager.getContent(path);
-          if (!content) {
-            continue;
+        const depth = path.split("/").length;
+        const group = pathsByDepth.get(depth) ?? [];
+        group.push(path);
+        pathsByDepth.set(depth, group);
+      }
+
+      // Process each depth level in order, with parallel processing within each level
+      const CONCURRENCY = 5; // Max concurrent file operations
+      const depths = Array.from(pathsByDepth.keys()).sort((a, b) => a - b);
+
+      for (const depth of depths) {
+        const paths = pathsByDepth.get(depth) ?? [];
+
+        // Process in batches of CONCURRENCY
+        for (let i = 0; i < paths.length; i += CONCURRENCY) {
+          const batch = paths.slice(i, i + CONCURRENCY);
+          const results = await Promise.allSettled(
+            batch.map(async (path) => {
+              const existingFile = this.app.vault.getAbstractFileByPath(path);
+              const isNew = !existingFile;
+              await this.writeFileToVault(path);
+              return isNew ? "created" : "updated";
+            }),
+          );
+
+          // Tally results
+          for (const result of results) {
+            if (result.status === "fulfilled") {
+              if (result.value === "created") stats.created++;
+              else stats.updated++;
+            } else {
+              this.logger.error("Failed to sync file from document:", result.reason);
+              stats.failed++;
+            }
           }
-
-          // Skip folders - they're created automatically when writing files
-          if (content.type === "folder") {
-            continue;
-          }
-
-          const existingFile = this.app.vault.getAbstractFileByPath(path);
-          const isNew = !existingFile;
-
-          await this.writeFileToVault(path);
-
-          if (isNew) {
-            stats.created++;
-          } else {
-            stats.updated++;
-          }
-        } catch (error) {
-          this.logger.error("Failed to sync file from document:", path, error);
-          stats.failed++;
         }
       }
 
@@ -320,6 +329,16 @@ export class VaultSync {
 
   /**
    * Handle a remote file change from the document.
+   *
+   * Applies changes from peer's CRDT updates to the local vault filesystem.
+   * Respects peer group exclusion policies - files in excluded folders
+   * won't be written to vault even if they exist in the document.
+   *
+   * Special rename handling:
+   * - Both paths excluded: skip entirely
+   * - Old excluded, new included: treat as create (file appears)
+   * - Old included, new excluded: treat as delete (file disappears)
+   * - Neither excluded: normal rename operation
    */
   private async handleRemoteChange(event: FileChangeEvent): Promise<void> {
     // Check if path is excluded by peer group policies
@@ -337,11 +356,17 @@ export class VaultSync {
       switch (event.type) {
         case "create":
         case "modify":
-          await this.writeFileToVault(event.path);
+          await this.retryVaultOperation(
+            () => this.writeFileToVault(event.path),
+            `Write file ${event.path}`,
+          );
           break;
 
         case "delete":
-          await this.deleteFileFromVault(event.path);
+          await this.retryVaultOperation(
+            () => this.deleteFileFromVault(event.path),
+            `Delete file ${event.path}`,
+          );
           break;
 
         case "rename":
@@ -355,19 +380,29 @@ export class VaultSync {
               return;
             } else if (oldExcluded && !newExcluded) {
               // Moving from excluded to included - treat as create
-              await this.writeFileToVault(event.path);
+              await this.retryVaultOperation(
+                () => this.writeFileToVault(event.path),
+                `Write file ${event.path}`,
+              );
             } else if (!oldExcluded && newExcluded) {
               // Moving from included to excluded - treat as delete
-              await this.deleteFileFromVault(event.oldPath);
+              await this.retryVaultOperation(
+                () => this.deleteFileFromVault(event.oldPath!),
+                `Delete file ${event.oldPath}`,
+              );
             } else {
               // Neither excluded - normal rename
-              await this.renameFileInVault(event.oldPath, event.path);
+              await this.retryVaultOperation(
+                () => this.renameFileInVault(event.oldPath!, event.path),
+                `Rename ${event.oldPath} to ${event.path}`,
+              );
             }
           }
           break;
       }
     } catch (error) {
-      this.logger.error("Failed to apply remote change:", event, error);
+      // This should only happen if retryVaultOperation itself throws unexpectedly
+      this.logger.error("Unexpected error applying remote change:", event, error);
     } finally {
       this.isProcessingRemote = false;
     }
@@ -377,12 +412,7 @@ export class VaultSync {
    * Check if a path is excluded by peer group policies.
    */
   private isExcludedByPeers(path: string): boolean {
-    for (const excluded of this.peerExcludedFolders) {
-      if (path.startsWith(excluded + "/") || path === excluded) {
-        return true;
-      }
-    }
-    return false;
+    return isPathInExcludedFolders(path, [...this.peerExcludedFolders]);
   }
 
   /**
@@ -421,9 +451,8 @@ export class VaultSync {
       const blobData = await this.blobStore.get(content.blobHash);
       if (!blobData) {
         this.logger.warn(
-          "Blob not found for remote file:",
-          path,
-          content.blobHash,
+          `Blob not found for remote file "${path}" (hash: ${content.blobHash.slice(0, 16)}...). ` +
+          "File will be skipped. Try re-syncing with the peer that has this file.",
         );
         return;
       }
@@ -497,12 +526,7 @@ export class VaultSync {
    * Check if a path should be synced.
    */
   private shouldSync(path: string): boolean {
-    for (const excluded of this.config.excludedFolders) {
-      if (path.startsWith(excluded + "/") || path === excluded) {
-        return false;
-      }
-    }
-    return true;
+    return !isPathInExcludedFolders(path, this.config.excludedFolders);
   }
 
   /**
@@ -538,14 +562,65 @@ export class VaultSync {
     return [...this.peerExcludedFolders];
   }
 
+  /** Maximum number of pending changes to prevent memory leaks */
+  private static readonly MAX_PENDING_CHANGES = 1000;
+
+  /** Max retries for vault write operations */
+  private static readonly MAX_WRITE_RETRIES = 3;
+
+  /**
+   * Retry a vault operation with exponential backoff.
+   * @param operation - The async operation to retry
+   * @param operationName - Name for logging
+   * @returns true if operation succeeded, false if all retries failed
+   */
+  private async retryVaultOperation(
+    operation: () => Promise<void>,
+    operationName: string,
+  ): Promise<boolean> {
+    const baseDelayMs = 200;
+
+    for (let attempt = 1; attempt <= VaultSync.MAX_WRITE_RETRIES; attempt++) {
+      try {
+        await operation();
+        return true;
+      } catch (error) {
+        if (attempt === VaultSync.MAX_WRITE_RETRIES) {
+          this.logger.error(
+            `${operationName} failed after ${attempt} attempts:`,
+            error,
+          );
+          return false;
+        }
+
+        const delay = baseDelayMs * Math.pow(2, attempt - 1);
+        this.logger.warn(
+          `${operationName} failed (attempt ${attempt}/${VaultSync.MAX_WRITE_RETRIES}), retrying in ${delay}ms:`,
+          error,
+        );
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+    return false;
+  }
+
   /**
    * Debounce a file change operation.
    */
   private debounceChange(path: string, fn: () => Promise<void>): void {
-    // Cancel existing timeout
+    // Cancel existing timeout for this path (updates to same path always allowed)
     const existing = this.pendingChanges.get(path);
     if (existing) {
       clearTimeout(existing);
+    }
+
+    // Enforce limit - drop new paths when at capacity (but allow updates to existing paths)
+    if (this.pendingChanges.size >= VaultSync.MAX_PENDING_CHANGES && !existing) {
+      this.logger.warn(
+        `Pending changes limit reached (${VaultSync.MAX_PENDING_CHANGES}), ` +
+        `dropping change for "${path}"`,
+      );
+      return; // Actually drop the change
     }
 
     // Set new timeout

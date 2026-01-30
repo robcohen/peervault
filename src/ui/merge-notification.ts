@@ -8,6 +8,7 @@
 
 import { App, Modal, Notice } from "obsidian";
 import { STATUS_ICONS } from "./status-icons";
+import { UI_LIMITS } from "../types";
 
 /** Information about a merge event */
 export interface MergeInfo {
@@ -148,8 +149,7 @@ export class MergeDetailModal extends Modal {
       contentEl.createEl("h3", { text: "Changed Files" });
       const fileList = contentEl.createEl("ul", { cls: "merge-file-list" });
 
-      // Show up to 20 files
-      const filesToShow = this.info.changedFiles.slice(0, 20);
+      const filesToShow = this.info.changedFiles.slice(0, UI_LIMITS.maxMergeFilesDisplay);
       for (const path of filesToShow) {
         const li = fileList.createEl("li");
         li.createEl("a", {

@@ -6,7 +6,7 @@ export type {
   PeerManagerEvents,
 } from "./types";
 
-export { PeerManager } from "./peer-manager";
+export { PeerManager, type VaultAdoptionRequest } from "./peer-manager";
 
 // Peer groups
 export {

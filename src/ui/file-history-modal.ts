@@ -8,6 +8,7 @@ import { App, Modal, Notice, Setting } from "obsidian";
 import type PeerVaultPlugin from "../main";
 import type { HistoricalVersion } from "../core/document-manager";
 import type { OpId } from "loro-crdt";
+import { UI_LIMITS } from "../types";
 
 /** A version entry for a file */
 export interface FileVersion {
@@ -35,6 +36,7 @@ export interface FileVersion {
 export class FileHistoryModal extends Modal {
   private filePath: string;
   private versions: FileVersion[] = [];
+  private datalistEl: HTMLDataListElement | null = null;
 
   constructor(
     app: App,
@@ -80,6 +82,11 @@ export class FileHistoryModal extends Modal {
   }
 
   override onClose(): void {
+    // Clean up datalist to avoid DOM pollution
+    if (this.datalistEl) {
+      this.datalistEl.remove();
+      this.datalistEl = null;
+    }
     this.contentEl.empty();
   }
 
@@ -102,16 +109,20 @@ export class FileHistoryModal extends Modal {
         text.inputEl.style.width = "300px";
 
         // Autocomplete with vault files
-        const datalist = document.createElement("datalist");
-        datalist.id = "peervault-file-list";
+        // Remove old datalist if it exists
+        if (this.datalistEl) {
+          this.datalistEl.remove();
+        }
+        this.datalistEl = document.createElement("datalist");
+        this.datalistEl.id = "peervault-file-list";
         const files = this.app.vault.getMarkdownFiles();
-        for (const file of files.slice(0, 100)) {
+        for (const file of files.slice(0, UI_LIMITS.maxFileHistoryFiles)) {
           const option = document.createElement("option");
           option.value = file.path;
-          datalist.appendChild(option);
+          this.datalistEl.appendChild(option);
         }
         text.inputEl.setAttribute("list", "peervault-file-list");
-        text.inputEl.parentElement?.appendChild(datalist);
+        text.inputEl.parentElement?.appendChild(this.datalistEl);
       })
       .addButton((btn) =>
         btn.setButtonText("Load").onClick(async () => {
