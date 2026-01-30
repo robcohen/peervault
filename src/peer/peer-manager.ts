@@ -631,6 +631,8 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       } catch (error) {
         this.logger.error("Failed to connect to peer:", nodeId, error);
         this.updatePeerState(nodeId, "error");
+        // Schedule retry for connection failures (peer may be temporarily unavailable)
+        this.handleSyncError(nodeId);
         throw error;
       }
     }

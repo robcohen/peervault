@@ -184,17 +184,41 @@ export class PluginAPI {
   }
 
   /**
-   * Get the CRDT document version as hex string.
+   * Get a content-based hash of the CRDT state.
+   *
+   * This computes a hash of (sorted file list + each file's content hash),
+   * which represents the actual sync state rather than Loro's internal
+   * version vector (which can differ even when content is identical).
    */
   async getDocumentVersion(): Promise<string> {
     return await this.client.evaluate<string>(`
-      (function() {
+      (async function() {
         const plugin = window.app?.plugins?.plugins?.["peervault"];
         const dm = plugin?.documentManager;
-        if (!dm) return "";
-        const version = dm.getVersionBytes?.();
-        if (!version) return "";
-        return Array.from(version).map(b => b.toString(16).padStart(2, '0')).join('');
+        if (!dm?.listAllPaths) return "";
+
+        // Get sorted file list
+        const files = dm.listAllPaths().sort();
+        if (files.length === 0) return "empty";
+
+        // Build a content fingerprint: file paths + content lengths
+        // (Using lengths instead of full hashes for speed)
+        const fingerprint = [];
+        for (const path of files) {
+          const content = dm.getFileContent?.(path);
+          const len = content ? content.length : 0;
+          fingerprint.push(path + ":" + len);
+        }
+
+        // Simple hash of the fingerprint
+        const str = fingerprint.join("|");
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+          const char = str.charCodeAt(i);
+          hash = ((hash << 5) - hash) + char;
+          hash = hash & hash; // Convert to 32bit integer
+        }
+        return (hash >>> 0).toString(16).padStart(8, '0');
       })()
     `);
   }

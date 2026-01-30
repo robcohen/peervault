@@ -359,8 +359,8 @@ export async function waitForVersionConvergence(
 
   throw new Error(
     `Versions did not converge after ${timeoutMs}ms. ` +
-      `${waiter1.vaultName}: ${finalV1.slice(0, 16)}..., ` +
-      `${waiter2.vaultName}: ${finalV2.slice(0, 16)}...`
+      `${waiter1.vaultName}: ${finalV1}, ` +
+      `${waiter2.vaultName}: ${finalV2}`
   );
 }
 

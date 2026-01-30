@@ -56,8 +56,9 @@ export default [
       ]);
       console.log("  Reloaded both plugins");
 
-      // Wait for reconnection
-      await new Promise((r) => setTimeout(r, 10000));
+      // Wait for reconnection - needs longer due to exponential backoff
+      // Both sides will fail initial connect (other not ready), then retry
+      await new Promise((r) => setTimeout(r, 20000));
 
       // Verify both enabled
       await assertPluginEnabled(ctx.test.plugin);

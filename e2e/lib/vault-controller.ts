@@ -33,8 +33,14 @@ export class VaultController {
 
   /**
    * Create a new file in the vault.
+   *
+   * @param overwrite - If true, overwrites existing file. If false (default), throws if file exists.
    */
-  async createFile(path: string, content: string | Uint8Array): Promise<void> {
+  async createFile(
+    path: string,
+    content: string | Uint8Array,
+    overwrite = false
+  ): Promise<void> {
     const contentStr =
       content instanceof Uint8Array
         ? Buffer.from(content).toString("base64")
@@ -47,6 +53,7 @@ export class VaultController {
         const path = ${JSON.stringify(path)};
         const content = ${JSON.stringify(contentStr)};
         const isBinary = ${isBinary};
+        const overwrite = ${overwrite};
 
         // Ensure parent folders exist
         const parts = path.split('/');
@@ -56,6 +63,16 @@ export class VaultController {
           if (!folder) {
             await vault.createFolder(folderPath);
           }
+        }
+
+        // Check if file exists
+        const existing = vault.getAbstractFileByPath(path);
+        if (existing) {
+          if (!overwrite) {
+            throw new Error('File already exists.');
+          }
+          // Delete existing to replace
+          await vault.delete(existing);
         }
 
         // Create the file

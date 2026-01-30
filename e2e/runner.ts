@@ -36,6 +36,7 @@ type TestFn = (ctx: TestContext) => Promise<void>;
 interface TestDef {
   name: string;
   fn: TestFn;
+  skip?: boolean;
 }
 
 /** Test file module */
@@ -142,6 +143,19 @@ async function runSuite(
         const tests = module.default || module.tests || [];
 
         for (const test of tests) {
+          if (test.skip) {
+            // Report skipped test
+            reporter.addTest({
+              name: test.name,
+              suite: suiteName,
+              passed: true, // Skipped tests count as passed
+              skipped: true,
+              duration: 0,
+            });
+            console.log(`⊘ ${test.name} (skipped)`);
+            continue;
+          }
+
           const result = await runTest(test.name, suiteName, () =>
             test.fn(ctx)
           );

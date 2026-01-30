@@ -105,15 +105,18 @@ export async function loadAllFixtureSets(): Promise<FixtureSet[]> {
 
 /**
  * Load fixtures into a vault.
+ *
+ * @param overwrite - If true, overwrites existing files. Defaults to true.
  */
 export async function loadFixturesIntoVault(
   vault: VaultController,
-  fixtureSet: FixtureSet
+  fixtureSet: FixtureSet,
+  overwrite = true
 ): Promise<number> {
   let loaded = 0;
 
   for (const file of fixtureSet.files) {
-    await vault.createFile(file.path, file.content);
+    await vault.createFile(file.path, file.content, overwrite);
     loaded++;
   }
 
@@ -276,13 +279,16 @@ export function createStandardTestSet(): FixtureFile[] {
 
 /**
  * Load fixtures inline (without filesystem).
+ *
+ * @param overwrite - If true, overwrites existing files. Defaults to true.
  */
 export async function loadInlineFixtures(
   vault: VaultController,
-  fixtures: FixtureFile[]
+  fixtures: FixtureFile[],
+  overwrite = true
 ): Promise<number> {
   for (const fixture of fixtures) {
-    await vault.createFile(fixture.path, fixture.content);
+    await vault.createFile(fixture.path, fixture.content, overwrite);
   }
   return fixtures.length;
 }

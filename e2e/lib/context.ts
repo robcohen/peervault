@@ -73,6 +73,7 @@ export interface TestResult {
   name: string;
   suite: string;
   passed: boolean;
+  skipped?: boolean;
   error?: Error;
   duration: number;
 }
