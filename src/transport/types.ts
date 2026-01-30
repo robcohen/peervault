@@ -122,6 +122,12 @@ export interface PeerConnection {
    * Returns undefined if not available.
    */
   getRttMs(): number | undefined;
+
+  /**
+   * Get the number of pending (queued) streams waiting to be accepted.
+   * Use this to check if there are streams to process before calling acceptStream().
+   */
+  getPendingStreamCount(): number;
 }
 
 /**

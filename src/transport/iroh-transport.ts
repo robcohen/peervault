@@ -575,6 +575,10 @@ class IrohPeerConnection implements PeerConnection {
     }
   }
 
+  getPendingStreamCount(): number {
+    return this.pendingStreams.length;
+  }
+
   onStateChange(callback: (state: ConnectionState) => void): () => void {
     this.stateCallbacks.push(callback);
     return () => {

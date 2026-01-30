@@ -58,6 +58,7 @@ See `docs/wasm-build.md` for detailed documentation.
 - `src/crypto/` - Encryption services
 - `src/utils/` - Logger, events
 - `peervault-iroh/` - Rust/WASM crate for Iroh networking
+- `e2e/` - End-to-end testing framework (CDP-based)
 
 ### Sync Protocol
 1. Initiator opens a QUIC stream and sends `VERSION_INFO`
@@ -131,6 +132,26 @@ asyncio.run(tail())
 
 ### In-App Log Export
 Settings > PeerVault > Advanced > "Copy Logs" - copies last 200 log entries to clipboard.
+
+## E2E Testing
+
+The `e2e/` directory contains a comprehensive testing framework that runs against real Obsidian instances via CDP.
+
+```sh
+# Start Obsidian with CDP enabled
+obsidian --remote-debugging-port=9222
+
+# Open TEST and TEST2 vaults, then run:
+bun run test:e2e              # Run all tests
+bun run test:e2e --suite=02-sync-basic  # Run specific suite
+bun run test:e2e --discover   # List available vaults
+```
+
+See `e2e/README.md` for full documentation including:
+- Test suite descriptions
+- Writing new tests
+- Available assertions and utilities
+- Troubleshooting guide
 
 ## Known Issues & Gotchas
 

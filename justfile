@@ -166,9 +166,179 @@ docs:
     @echo "Spec files:"
     @ls -la spec/*.md
 
-# Run Playwright tests
+# ============================================================================
+# E2E Testing Commands
+# ============================================================================
+
+# Run E2E tests
 e2e:
     bun run test:e2e
+
+# Run E2E tests with verbose output
+e2e-verbose:
+    bun run test:e2e --verbose
+
+# Discover available vaults (no tests)
+e2e-discover:
+    bun run test:e2e --discover
+
+# ============================================================================
+# Local Relay Server (for E2E testing)
+# ============================================================================
+
+# Directory for relay data
+relay_dir := ".relay"
+relay_log := ".relay/relay.log"
+relay_pid := ".relay/relay.pid"
+
+# Install iroh-relay if not present
+relay-install:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v iroh-relay &> /dev/null; then
+        echo "iroh-relay already installed"
+        iroh-relay --version
+    elif [ -f ".cargo/bin/iroh-relay" ]; then
+        echo "iroh-relay found in .cargo/bin"
+    else
+        echo "Installing iroh-relay..."
+        cargo install iroh-relay --features="server" --root .
+        echo "Installed to .cargo/bin/iroh-relay"
+    fi
+
+# Start local relay server (background, with logging)
+relay-start: relay-install
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p {{relay_dir}}
+
+    # Check if already running
+    if [ -f "{{relay_pid}}" ]; then
+        PID=$(cat "{{relay_pid}}")
+        if kill -0 "$PID" 2>/dev/null; then
+            echo "Relay already running (PID $PID)"
+            echo "Logs: {{relay_log}}"
+            exit 0
+        fi
+        rm "{{relay_pid}}"
+    fi
+
+    # Find the binary
+    RELAY_BIN=""
+    if command -v iroh-relay &> /dev/null; then
+        RELAY_BIN="iroh-relay"
+    elif [ -f ".cargo/bin/iroh-relay" ]; then
+        RELAY_BIN=".cargo/bin/iroh-relay"
+    else
+        echo "Error: iroh-relay not found. Run 'just relay-install' first."
+        exit 1
+    fi
+
+    echo "Starting local relay server..."
+    # Set RUST_LOG for detailed logging
+    RUST_LOG=info,iroh_relay=debug,iroh=debug \
+        "$RELAY_BIN" --dev > "{{relay_log}}" 2>&1 &
+    PID=$!
+    echo "$PID" > "{{relay_pid}}"
+
+    # Wait for startup
+    sleep 2
+    if kill -0 "$PID" 2>/dev/null; then
+        echo "Relay started on http://localhost:3340 (PID $PID)"
+        echo "Logs: {{relay_log}}"
+        echo ""
+        echo "Configure vaults to use: http://localhost:3340"
+    else
+        echo "Error: Relay failed to start. Check {{relay_log}}"
+        cat "{{relay_log}}"
+        exit 1
+    fi
+
+# Stop local relay server
+relay-stop:
+    #!/usr/bin/env bash
+    if [ -f "{{relay_pid}}" ]; then
+        PID=$(cat "{{relay_pid}}")
+        if kill -0 "$PID" 2>/dev/null; then
+            echo "Stopping relay (PID $PID)..."
+            kill "$PID"
+            rm "{{relay_pid}}"
+            echo "Relay stopped"
+        else
+            echo "Relay not running (stale PID file)"
+            rm "{{relay_pid}}"
+        fi
+    else
+        # Try to find and kill by process name
+        PIDS=$(pgrep -f "iroh-relay" || true)
+        if [ -n "$PIDS" ]; then
+            echo "Killing iroh-relay processes: $PIDS"
+            pkill -f "iroh-relay" || true
+        else
+            echo "No relay running"
+        fi
+    fi
+
+# Show relay status
+relay-status:
+    #!/usr/bin/env bash
+    if [ -f "{{relay_pid}}" ]; then
+        PID=$(cat "{{relay_pid}}")
+        if kill -0 "$PID" 2>/dev/null; then
+            echo "Relay running (PID $PID)"
+            echo "URL: http://localhost:3340"
+            echo ""
+            # Show recent logs
+            if [ -f "{{relay_log}}" ]; then
+                echo "Recent logs:"
+                tail -10 "{{relay_log}}"
+            fi
+        else
+            echo "Relay not running (stale PID file)"
+        fi
+    else
+        PIDS=$(pgrep -f "iroh-relay" || true)
+        if [ -n "$PIDS" ]; then
+            echo "Relay running (PIDs: $PIDS) - not managed by just"
+        else
+            echo "Relay not running"
+        fi
+    fi
+
+# Tail relay logs (follow mode)
+relay-logs:
+    #!/usr/bin/env bash
+    if [ -f "{{relay_log}}" ]; then
+        tail -f "{{relay_log}}"
+    else
+        echo "No relay log found. Start relay with 'just relay-start'"
+    fi
+
+# Show full relay logs
+relay-logs-full:
+    #!/usr/bin/env bash
+    if [ -f "{{relay_log}}" ]; then
+        cat "{{relay_log}}"
+    else
+        echo "No relay log found"
+    fi
+
+# Clean relay data and logs
+relay-clean: relay-stop
+    rm -rf {{relay_dir}}
+    echo "Relay data cleaned"
+
+# Run E2E tests with local relay
+e2e-local: relay-start
+    #!/usr/bin/env bash
+    echo "Running E2E tests with local relay..."
+    echo "Note: Configure both test vaults to use http://localhost:3340"
+    echo ""
+    bun run test:e2e
+
+# ============================================================================
+# Project Stats
+# ============================================================================
 
 # Show project stats
 stats:

@@ -10,6 +10,7 @@
     "dev": "bun run esbuild.config.mjs --watch",
     "check": "tsc --noEmit",
     "test": "bun test",
+    "test:e2e": "bun run e2e/runner.ts",
     "lint": "eslint src/",
     "format": "prettier --write src/",
     "package": "bun run build && cd dist && tar -czvf ../peervault-release.tar.gz main.js manifest.json styles.css peervault_iroh.js peervault_iroh_bg.wasm"

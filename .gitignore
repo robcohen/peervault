@@ -68,3 +68,6 @@ playwright/.cache/
 # Temp files
 .direnv/
 peervault-*.tar.gz
+
+# Local relay server
+.relay/

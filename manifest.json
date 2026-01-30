@@ -1,7 +1,7 @@
 {
   "id": "peervault",
   "name": "PeerVault",
-  "version": "0.2.49",
+  "version": "0.2.50",
   "minAppVersion": "1.4.0",
   "description": "P2P sync for Obsidian using Loro CRDT and Iroh transport - no servers required",
   "author": "PeerVault Contributors",
