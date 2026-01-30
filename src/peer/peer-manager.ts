@@ -67,6 +67,7 @@ interface PeerManagerEvents extends Record<string, unknown> {
   "peer:pairing-denied": string;
   "vault:adoption-request": VaultAdoptionRequest;
   "status:change": "idle" | "syncing" | "offline" | "error";
+  "blob:received": string; // blob hash - used to retry binary file writes
 }
 
 /**
@@ -574,12 +575,13 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     let hasFailures = false;
     for (let i = 0; i < results.length; i++) {
       const result = results[i];
-      if (result.status === "rejected") {
+      const syncTask = syncTasks[i];
+      if (result && result.status === "rejected" && syncTask) {
         hasFailures = true;
-        const nodeId = syncTasks[i].nodeId;
+        const nodeId = syncTask.nodeId;
         this.logger.debug(
           `Sync failed for peer ${nodeId.slice(0, 8)}:`,
-          result.reason,
+          (result as PromiseRejectedResult).reason,
         );
       }
     }
@@ -794,6 +796,11 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
 
     session.on("error", (error) => {
       this.emit("peer:error", { nodeId: peer.nodeId, error });
+    });
+
+    // Handle blob received - emit event so VaultSync can retry binary file writes
+    session.on("blob:received", (hash) => {
+      this.emit("blob:received", hash);
     });
   }
 

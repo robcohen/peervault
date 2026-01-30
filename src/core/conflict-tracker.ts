@@ -96,7 +96,8 @@ export class ConflictTracker {
     // Remove oldest 10% to avoid frequent pruning
     const toRemove = Math.ceil(entries.length * 0.1);
     for (let i = 0; i < toRemove && i < entries.length; i++) {
-      this.recentEdits.delete(entries[i].path);
+      const entry = entries[i];
+      if (entry) this.recentEdits.delete(entry.path);
     }
   }
 
@@ -118,7 +119,8 @@ export class ConflictTracker {
     // Remove oldest 10% to avoid frequent pruning
     const toRemove = Math.ceil(entries.length * 0.1);
     for (let i = 0; i < toRemove && i < entries.length; i++) {
-      this.conflicts.delete(entries[i].path);
+      const entry = entries[i];
+      if (entry) this.conflicts.delete(entry.path);
     }
   }
 

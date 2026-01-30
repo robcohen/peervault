@@ -281,6 +281,20 @@ export default class PeerVaultPlugin extends Plugin {
       }),
     );
 
+    // Handle blob received - retry syncing binary files that were missing blobs
+    this.peerManagerUnsubscribes.push(
+      this.peerManager.on("blob:received", async (hash) => {
+        this.logger.debug("Blob received:", hash.slice(0, 16) + "...");
+        // Trigger a sync from document to retry writing binary files
+        // that were previously skipped due to missing blobs
+        try {
+          await this.vaultSync.syncFromDocument();
+        } catch (err) {
+          this.logger.error("Failed to sync after blob received:", err);
+        }
+      }),
+    );
+
     // Handle vault adoption requests - show confirmation before adopting peer's vault ID
     this.peerManagerUnsubscribes.push(
       this.peerManager.on("vault:adoption-request", async ({ nodeId, peerVaultId, ourVaultId, respond }) => {

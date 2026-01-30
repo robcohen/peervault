@@ -224,7 +224,7 @@ export function formatUserError(error: unknown): string {
   // If the message is very long (like a stack trace), truncate it
   if (message.length > 100) {
     // Try to extract just the first meaningful line
-    const firstLine = message.split("\n")[0].trim();
+    const firstLine = (message.split("\n")[0] ?? "").trim();
     if (firstLine.length > 100) {
       return "An error occurred. Check the console for details.";
     }

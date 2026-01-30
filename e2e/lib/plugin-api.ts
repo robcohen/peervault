@@ -238,6 +238,53 @@ export class PluginAPI {
   }
 
   /**
+   * Get blob store diagnostic info.
+   */
+  async getBlobStoreInfo(): Promise<{
+    blobCount: number;
+    referencedHashes: string[];
+    missingHashes: string[];
+  }> {
+    return await this.client.evaluate<{
+      blobCount: number;
+      referencedHashes: string[];
+      missingHashes: string[];
+    }>(`
+      (async function() {
+        const plugin = window.app?.plugins?.plugins?.["peervault"];
+        const blobStore = plugin?.blobStore;
+        const dm = plugin?.documentManager;
+
+        if (!blobStore || !dm) {
+          return { blobCount: -1, referencedHashes: [], missingHashes: [] };
+        }
+
+        const blobs = blobStore.list ? await blobStore.list() : [];
+        const referencedHashes = dm.getAllBlobHashes ? dm.getAllBlobHashes() : [];
+        const missingHashes = blobStore.getMissing ? await blobStore.getMissing(referencedHashes) : [];
+
+        return {
+          blobCount: blobs.length,
+          referencedHashes,
+          missingHashes,
+        };
+      })()
+    `);
+  }
+
+  /**
+   * Get blob:received event count (debug).
+   */
+  async getBlobReceivedCount(): Promise<number> {
+    return await this.client.evaluate<number>(`
+      (function() {
+        const plugin = window.app?.plugins?.plugins?.["peervault"];
+        return plugin?.getBlobReceivedCount?.() ?? -1;
+      })()
+    `);
+  }
+
+  /**
    * Get the vault ID.
    */
   async getVaultId(): Promise<string> {

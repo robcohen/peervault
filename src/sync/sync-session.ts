@@ -92,7 +92,7 @@ export interface SyncSessionConfig {
   ourNickname?: string;
 }
 
-const DEFAULT_CONFIG: Omit<Required<SyncSessionConfig>, "ourTicket" | "ourHostname" | "ourNickname"> & {
+const DEFAULT_CONFIG: Omit<Required<SyncSessionConfig>, "ourTicket" | "ourHostname" | "ourNickname" | "onVaultAdoptionNeeded"> & {
   peerIsReadOnly: boolean;
   allowVaultAdoption: boolean;
 } = {
@@ -111,6 +111,7 @@ interface SyncSessionEvents extends Record<string, unknown> {
   "ticket:received": string;
   "peer:info": { hostname: string; nickname?: string };
   "peer:removed": string | undefined; // reason
+  "blob:received": string; // blob hash
   error: Error;
 }
 
@@ -122,10 +123,11 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
   private stream: SyncStream | null = null;
   private pingSeq = 0;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
-  private config: Omit<Required<SyncSessionConfig>, "ourTicket" | "ourHostname" | "ourNickname"> & {
+  private config: Omit<Required<SyncSessionConfig>, "ourTicket" | "ourHostname" | "ourNickname" | "onVaultAdoptionNeeded"> & {
     ourTicket: string;
     ourHostname: string;
     ourNickname?: string;
+    onVaultAdoptionNeeded?: (peerVaultId: string, ourVaultId: string) => Promise<boolean>;
   };
   private aborted = false;
   private unsubscribeLocalUpdates: (() => void) | null = null;
@@ -238,8 +240,8 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
 
       // Emit peer's info (for display) - sanitize to prevent abuse
       this.emit("peer:info", {
-        hostname: sanitizePeerString(peerVersionInfo.hostname),
-        nickname: sanitizePeerString(peerVersionInfo.nickname),
+        hostname: sanitizePeerString(peerVersionInfo.hostname ?? "") ?? "",
+        nickname: sanitizePeerString(peerVersionInfo.nickname ?? ""),
       });
 
       // Validate vault ID
@@ -500,8 +502,8 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
 
     // Emit peer's info (for display) - sanitize to prevent abuse
     this.emit("peer:info", {
-      hostname: sanitizePeerString(peerVersionInfo.hostname),
-      nickname: sanitizePeerString(peerVersionInfo.nickname),
+      hostname: sanitizePeerString(peerVersionInfo.hostname ?? "") ?? "",
+      nickname: sanitizePeerString(peerVersionInfo.nickname ?? ""),
     });
 
     this.logger.debug("Version exchange complete");
@@ -807,6 +809,27 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     }
   }
 
+  /**
+   * Check for missing blobs after receiving a live update and request them.
+   * This handles the case where a binary file is created/modified during live sync.
+   */
+  private async requestMissingBlobsLive(): Promise<void> {
+    if (!this.blobStore) return;
+
+    // Get all blob hashes referenced in the document
+    const referencedHashes = this.documentManager.getAllBlobHashes();
+    if (referencedHashes.length === 0) return;
+
+    // Find which ones we're missing
+    const missingHashes = await this.blobStore.getMissing(referencedHashes);
+    if (missingHashes.length === 0) return;
+
+    this.logger.debug("Requesting missing blobs in live mode:", missingHashes.length);
+
+    // Request the missing blobs
+    await this.sendMessage(createBlobRequestMessage(missingHashes));
+  }
+
   // ===========================================================================
   // Private: Live Sync
   // ===========================================================================
@@ -835,7 +858,29 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
               } else {
                 this.documentManager.importUpdates(updatesMsg.updates);
                 this.logger.debug("Imported live update from peer");
+                // Check for missing blobs and request them
+                await this.requestMissingBlobsLive();
               }
+            }
+            break;
+          }
+
+          case SyncMessageType.BLOB_REQUEST: {
+            // Peer is requesting blobs - send them
+            const requestMsg = message as BlobRequestMessage;
+            this.logger.debug("Peer requesting blobs in live mode:", requestMsg.hashes.length);
+            await this.sendBlobsParallel(requestMsg.hashes);
+            break;
+          }
+
+          case SyncMessageType.BLOB_DATA: {
+            // Peer is sending blob data - store it
+            const blobMsg = message as BlobDataMessage;
+            if (this.blobStore) {
+              await this.blobStore.add(blobMsg.data, blobMsg.mimeType);
+              this.logger.debug("Received blob in live mode:", blobMsg.hash.slice(0, 16));
+              // Emit event so VaultSync can retry writing the file
+              this.emit("blob:received", blobMsg.hash);
             }
             break;
           }
