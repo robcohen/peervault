@@ -357,7 +357,9 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
   }
 
   /**
-   * Flush all pending updates as a single combined message.
+   * Flush all pending updates.
+   * Each Loro update is sent as a separate message because Loro updates
+   * are self-contained binary blobs that cannot be concatenated.
    */
   private async flushUpdates(): Promise<void> {
     this.flushTimer = null;
@@ -366,33 +368,19 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       return;
     }
 
-    // Combine all pending updates into one
-    const combined = this.concatenateUpdates(this.pendingUpdates);
+    // Send each update separately - Loro updates cannot be concatenated
+    // as they have internal checksums and headers
+    const updates = this.pendingUpdates;
     this.pendingUpdates = [];
     this.pendingBytes = 0;
 
     try {
-      await this.sendMessage(createUpdatesMessage(combined, 0));
+      for (const update of updates) {
+        await this.sendMessage(createUpdatesMessage(update, 0));
+      }
     } catch (error) {
       this.logger.error("Failed to send batched update:", error);
     }
-  }
-
-  /**
-   * Concatenate multiple Uint8Array updates into one.
-   */
-  private concatenateUpdates(arrays: Uint8Array[]): Uint8Array {
-    if (arrays.length === 0) return new Uint8Array(0);
-    if (arrays.length === 1) return arrays[0]!;
-
-    const totalLength = arrays.reduce((sum, arr) => sum + arr.length, 0);
-    const result = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const arr of arrays) {
-      result.set(arr, offset);
-      offset += arr.length;
-    }
-    return result;
   }
 
   /**
@@ -904,7 +892,12 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
         }
 
         // Non-transient error or max retries exceeded
-        this.logger.error("Live loop error (non-recoverable):", error);
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        const errorStack = error instanceof Error ? error.stack : undefined;
+        this.logger.error(
+          `Live loop error (non-recoverable, transient=${isTransient}, attempts=${consecutiveErrors}): ${errorMessage}`,
+          errorStack ? `\nStack: ${errorStack}` : "",
+        );
         this.setState("error");
         this.emit("error", error as Error);
         return;

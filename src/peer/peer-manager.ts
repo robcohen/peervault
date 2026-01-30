@@ -5,7 +5,7 @@
  * the transport layer and document manager.
  */
 
-import type { Transport, PeerConnection } from "../transport";
+import type { Transport, PeerConnection, SyncStream } from "../transport";
 import type { DocumentManager } from "../core/document-manager";
 import type { BlobStore } from "../core/blob-store";
 import type { Logger } from "../utils/logger";
@@ -404,11 +404,27 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     await this.savePeers();
     this.emit("peer:connected", peer);
 
+    // Register persistent stream listener for this connection.
+    // This allows the peer to initiate new sync sessions at any time.
+    const unsubscribeStream = connection.onStream((stream) => {
+      this.handleIncomingStream(stream, connection, peer).catch((err) => {
+        this.logger.error("Error handling incoming stream:", err);
+      });
+    });
+
+    // Clean up listener when connection closes
+    connection.onStateChange((state) => {
+      if (state === "disconnected" || state === "error") {
+        unsubscribeStream();
+      }
+    });
+
     // Continue with the existing connection - the initiator already opened
     // a stream and is waiting for us to accept it and respond.
     // We become the acceptor in this sync session.
+    // Process any pending streams (the initiator's stream is likely already queued)
     try {
-      await this.handleIncomingSyncSession(connection, peer);
+      await this.processPendingStreams(connection, peer);
     } catch (error) {
       this.logger.error("Failed to start sync after accepting pairing:", error);
       this.updatePeerState(nodeId, "error");
@@ -542,7 +558,9 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
 
     const syncTasks: Array<{ nodeId: string; promise: Promise<void> }> = [];
     for (const peer of this.peers.values()) {
-      if (peer.state === "synced" || peer.state === "offline") {
+      // Sync peers in synced, offline, or error state
+      // Error peers need reconnection attempts too
+      if (peer.state === "synced" || peer.state === "offline" || peer.state === "error") {
         syncTasks.push({
           nodeId: peer.nodeId,
           promise: this.syncPeer(peer.nodeId),
@@ -580,9 +598,26 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
 
     // Check for existing session
     const existingSession = this.sessions.get(nodeId);
-    if (existingSession?.getState() === "live") {
-      // Already synced and in live mode
-      return;
+    if (existingSession) {
+      const state = existingSession.getState();
+      if (state === "live") {
+        // Already synced and in live mode
+        return;
+      }
+      // Session exists but not in live state - it may be stale/stuck.
+      // Close it with timeout to prevent blocking.
+      this.logger.debug(`Closing stale session for peer ${nodeId.slice(0, 8)} (state: ${state})`);
+      try {
+        await Promise.race([
+          existingSession.close(),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("Session close timeout")), 5000)
+          ),
+        ]);
+      } catch (err) {
+        this.logger.warn(`Failed to close stale session for ${nodeId.slice(0, 8)}:`, err);
+      }
+      this.sessions.delete(nodeId);
     }
 
     // First, try to use an existing connection
@@ -669,8 +704,24 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
 
     peer.lastSeen = Date.now();
 
-    // Handle incoming sync
-    await this.handleIncomingSyncSession(connection, peer);
+    // Register persistent stream listener for this connection.
+    // This allows the peer to initiate new sync sessions at any time.
+    const unsubscribe = connection.onStream((stream) => {
+      this.handleIncomingStream(stream, connection, peer).catch((err) => {
+        this.logger.error("Error handling incoming stream:", err);
+      });
+    });
+
+    // Clean up listener when connection closes
+    connection.onStateChange((state) => {
+      if (state === "disconnected" || state === "error") {
+        unsubscribe();
+      }
+    });
+
+    // Also process any streams that arrived before we registered the listener
+    // (they're queued in pendingStreams)
+    this.processPendingStreams(connection, peer);
   }
 
   // ===========================================================================
@@ -748,10 +799,20 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     connection: PeerConnection,
     peer: PeerInfo,
   ): Promise<void> {
-    // Close existing session if any
+    // Close existing session if any (with timeout to prevent blocking)
     const existingSession = this.sessions.get(peer.nodeId);
     if (existingSession) {
-      await existingSession.close();
+      try {
+        await Promise.race([
+          existingSession.close(),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("Session close timeout")), 5000)
+          ),
+        ]);
+      } catch (err) {
+        this.logger.warn(`Failed to close existing session for ${peer.nodeId.slice(0, 8)}:`, err);
+      }
+      this.sessions.delete(peer.nodeId);
     }
 
     // Get effective sync policy for this peer
@@ -789,10 +850,20 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     connection: PeerConnection,
     peer: PeerInfo,
   ): Promise<void> {
-    // Close existing session if any
+    // Close existing session if any (with timeout to prevent blocking)
     const existingSession = this.sessions.get(peer.nodeId);
     if (existingSession) {
-      await existingSession.close();
+      try {
+        await Promise.race([
+          existingSession.close(),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("Session close timeout")), 5000)
+          ),
+        ]);
+      } catch (err) {
+        this.logger.warn(`Failed to close existing session for ${peer.nodeId.slice(0, 8)}:`, err);
+      }
+      this.sessions.delete(peer.nodeId);
     }
 
     // Get effective sync policy for this peer
@@ -862,6 +933,129 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     // Accept stream and handle incoming sync
     const stream = await connection.acceptStream();
     await session.handleIncomingSync(stream);
+  }
+
+  /**
+   * Handle an incoming stream as a sync request.
+   * This is called by the onStream callback for each new stream.
+   */
+  private async handleIncomingStream(
+    stream: SyncStream,
+    connection: PeerConnection,
+    peer: PeerInfo,
+  ): Promise<void> {
+    this.logger.debug(`Handling incoming stream from ${peer.nodeId.slice(0, 8)}`);
+
+    // Close existing session if any (with timeout to prevent blocking)
+    const existingSession = this.sessions.get(peer.nodeId);
+    if (existingSession) {
+      const state = existingSession.getState();
+      // Don't interrupt a live session for a new stream - the peer should use the existing one
+      if (state === "live") {
+        this.logger.debug("Already in live session, ignoring new stream");
+        return;
+      }
+      // Close non-live sessions (error, syncing, etc.) to accept reconnection
+      this.logger.debug(`Closing existing session (state: ${state}) to accept incoming stream`);
+      try {
+        await Promise.race([
+          existingSession.close(),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("Session close timeout")), 5000)
+          ),
+        ]);
+      } catch (err) {
+        this.logger.warn(`Failed to close existing session for ${peer.nodeId.slice(0, 8)}:`, err);
+      }
+      this.sessions.delete(peer.nodeId);
+    }
+
+    // Get effective sync policy for this peer
+    const syncPolicy = this.groupManager.getEffectiveSyncPolicy(peer.nodeId);
+
+    // Allow vault adoption on first sync (peer has never synced before)
+    const isFirstSync = peer.lastSynced === undefined;
+
+    // Generate our ticket for bidirectional reconnection
+    const ourTicket = await this.transport.generateTicket();
+
+    // Create vault adoption confirmation callback
+    const VAULT_ADOPTION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+    const onVaultAdoptionNeeded = async (peerVaultId: string, ourVaultId: string): Promise<boolean> => {
+      return new Promise((resolve) => {
+        let resolved = false;
+        const respond = (accept: boolean) => {
+          if (!resolved) {
+            resolved = true;
+            resolve(accept);
+          }
+        };
+
+        const timeout = setTimeout(() => {
+          if (!resolved) {
+            resolved = true;
+            this.logger.warn("Vault adoption request timed out, rejecting");
+            resolve(false);
+          }
+        }, VAULT_ADOPTION_TIMEOUT_MS);
+
+        this.emit("vault:adoption-request", {
+          nodeId: peer.nodeId,
+          peerVaultId,
+          ourVaultId,
+          respond: (accept: boolean) => {
+            clearTimeout(timeout);
+            respond(accept);
+          },
+        });
+      });
+    };
+
+    // Create new session
+    const session = new SyncSession(
+      peer.nodeId,
+      this.documentManager,
+      this.logger,
+      {
+        peerIsReadOnly: syncPolicy.readOnly,
+        allowVaultAdoption: isFirstSync,
+        onVaultAdoptionNeeded: isFirstSync ? onVaultAdoptionNeeded : undefined,
+        ourTicket,
+        ourHostname: this.config.hostname,
+        ourNickname: this.config.nickname,
+      },
+      this.blobStore,
+    );
+
+    // Set up event handlers
+    this.attachSessionHandlers(session, peer, false);
+
+    this.sessions.set(peer.nodeId, session);
+    this.updatePeerState(peer.nodeId, "syncing");
+
+    // Handle the incoming sync with the provided stream
+    await session.handleIncomingSync(stream);
+  }
+
+  /**
+   * Process any pending streams that arrived before the listener was registered.
+   * Uses getPendingStreamCount() to avoid blocking on acceptStream() when empty.
+   */
+  private async processPendingStreams(
+    connection: PeerConnection,
+    peer: PeerInfo,
+  ): Promise<void> {
+    // Process all pending streams without blocking
+    // We check the count first to avoid adding orphaned pendingAccepts entries
+    while (connection.getPendingStreamCount() > 0) {
+      try {
+        const stream = await connection.acceptStream();
+        await this.handleIncomingStream(stream, connection, peer);
+      } catch (err) {
+        this.logger.warn("Error processing pending stream:", err);
+        break;
+      }
+    }
   }
 
   private handleSyncError(nodeId: string, isCleanDisconnect = false): void {
