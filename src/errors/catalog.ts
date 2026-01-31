@@ -190,6 +190,26 @@ export const SyncErrors = {
       true,
       { details },
     ),
+
+  sessionRecoveryFailed: (sessionId: string, reason: string) =>
+    new PeerVaultError(
+      `Failed to recover sync session: ${reason}`,
+      "SYNC_SESSION_RECOVERY_FAILED",
+      ErrorCategory.SYNC,
+      ErrorSeverity.ERROR,
+      true,
+      { sessionId, reason },
+    ),
+
+  blobSyncFailed: (hash: string, reason: string) =>
+    new PeerVaultError(
+      `Failed to sync blob ${hash.slice(0, 8)}...: ${reason}`,
+      "SYNC_BLOB_FAILED",
+      ErrorCategory.SYNC,
+      ErrorSeverity.WARNING,
+      true,
+      { hash, reason },
+    ),
 };
 
 /**
@@ -204,6 +224,26 @@ export const TransportErrors = {
       ErrorSeverity.CRITICAL,
       false,
       { details },
+    ),
+
+  wasmMemoryExhausted: () =>
+    new PeerVaultError(
+      "WASM memory exhausted. Restart Obsidian to free memory.",
+      "TRANSPORT_WASM_OOM",
+      ErrorCategory.TRANSPORT,
+      ErrorSeverity.CRITICAL,
+      false,
+      { recoveryAction: "restart_obsidian" },
+    ),
+
+  reconnectFailed: (peerId: string, attempts: number) =>
+    new PeerVaultError(
+      `Failed to reconnect to peer after ${attempts} attempts`,
+      "TRANSPORT_RECONNECT_FAILED",
+      ErrorCategory.TRANSPORT,
+      ErrorSeverity.ERROR,
+      true,
+      { peerId, attempts },
     ),
 
   notInitialized: () =>
@@ -323,6 +363,70 @@ export const ConfigErrors = {
       ErrorSeverity.CRITICAL,
       false,
       { fromVersion, toVersion, reason },
+    ),
+};
+
+/**
+ * WebRTC-related errors.
+ */
+export const WebRTCErrors = {
+  notAvailable: () =>
+    new PeerVaultError(
+      "WebRTC is not available in this environment",
+      "WEBRTC_NOT_AVAILABLE",
+      ErrorCategory.TRANSPORT,
+      ErrorSeverity.WARNING,
+      false,
+    ),
+
+  upgradeRejected: (peerId: string, reason: string) =>
+    new PeerVaultError(
+      `WebRTC upgrade rejected by ${peerId}: ${reason}`,
+      "WEBRTC_UPGRADE_REJECTED",
+      ErrorCategory.TRANSPORT,
+      ErrorSeverity.INFO,
+      true,
+      { peerId, reason },
+    ),
+
+  upgradeTimeout: (peerId: string) =>
+    new PeerVaultError(
+      `WebRTC upgrade timed out for peer ${peerId}`,
+      "WEBRTC_UPGRADE_TIMEOUT",
+      ErrorCategory.TRANSPORT,
+      ErrorSeverity.WARNING,
+      true,
+      { peerId },
+    ),
+
+  signalingFailed: (peerId: string, details: string) =>
+    new PeerVaultError(
+      `WebRTC signaling failed for ${peerId}: ${details}`,
+      "WEBRTC_SIGNALING_FAILED",
+      ErrorCategory.TRANSPORT,
+      ErrorSeverity.WARNING,
+      true,
+      { peerId, details },
+    ),
+
+  connectionFailed: (peerId: string, details: string) =>
+    new PeerVaultError(
+      `WebRTC connection failed for ${peerId}: ${details}`,
+      "WEBRTC_CONN_FAILED",
+      ErrorCategory.TRANSPORT,
+      ErrorSeverity.WARNING,
+      true,
+      { peerId, details },
+    ),
+
+  dataChannelError: (channelLabel: string, error: string) =>
+    new PeerVaultError(
+      `DataChannel error on ${channelLabel}: ${error}`,
+      "WEBRTC_DATACHANNEL_ERROR",
+      ErrorCategory.TRANSPORT,
+      ErrorSeverity.WARNING,
+      true,
+      { channelLabel, error },
     ),
 };
 

@@ -11,3 +11,10 @@ export type {
 
 export { PEERVAULT_ALPN } from "./types";
 export { IrohTransport, initIrohWasm, isIrohWasmReady } from "./iroh-transport";
+
+// Hybrid transport (Iroh + WebRTC)
+export { HybridTransport, HybridConnection } from "./hybrid-transport";
+export type { HybridTransportConfig } from "./hybrid-transport";
+
+// WebRTC module
+export * from "./webrtc";

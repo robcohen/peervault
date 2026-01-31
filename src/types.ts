@@ -222,7 +222,7 @@ export type SyncStatus = "idle" | "syncing" | "offline" | "error";
 // ============================================================================
 
 /** Transport type for P2P connections */
-export type TransportType = "iroh";
+export type TransportType = "iroh" | "hybrid";
 
 /**
  * Plugin settings stored in Obsidian.
@@ -254,6 +254,12 @@ export interface PeerVaultSettings {
   gcRequirePeerConsensus: boolean;
   /** User-defined nickname for this device (optional) */
   deviceNickname?: string;
+  /** Enable WebRTC upgrade for direct LAN connections (default: true) */
+  enableWebRTC: boolean;
+  /** Auto-upgrade to WebRTC when available (default: true) */
+  autoWebRTCUpgrade: boolean;
+  /** Timeout for WebRTC upgrade in milliseconds (default: 10000) */
+  webrtcUpgradeTimeout: number;
 }
 
 export const DEFAULT_SETTINGS: PeerVaultSettings = {
@@ -264,11 +270,14 @@ export const DEFAULT_SETTINGS: PeerVaultSettings = {
   showStatusBar: true,
   debugMode: false,
   relayServers: [],
-  transportType: "iroh",
+  transportType: "hybrid", // Use hybrid transport (Iroh + WebRTC)
   gcEnabled: true,
   gcMaxDocSizeMB: 50,
   gcMinHistoryDays: 30,
   gcRequirePeerConsensus: true,
+  enableWebRTC: true,
+  autoWebRTCUpgrade: true,
+  webrtcUpgradeTimeout: 10000, // 10 seconds
 };
 
 // ============================================================================

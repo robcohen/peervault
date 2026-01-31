@@ -27,7 +27,9 @@ pub fn init() {
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
                 .without_time()
-                .with_writer(MakeConsoleWriter::default().map_trace_level_to(tracing::Level::DEBUG))
+                .with_writer(
+                    MakeConsoleWriter::default().map_trace_level_to(tracing::Level::DEBUG),
+                ),
         )
         .init();
 }
@@ -55,9 +57,9 @@ impl WasmEndpoint {
         let secret_key = match key_bytes {
             Some(bytes) => {
                 let vec: Vec<u8> = bytes.to_vec();
-                let arr: [u8; 32] = vec.try_into().map_err(|_| {
-                    JsValue::from_str("Invalid key: expected 32 bytes")
-                })?;
+                let arr: [u8; 32] = vec
+                    .try_into()
+                    .map_err(|_| JsValue::from_str("Invalid key: expected 32 bytes"))?;
                 SecretKey::from_bytes(&arr)
             }
             None => SecretKey::generate(&mut rand::rng()),
@@ -73,9 +75,9 @@ impl WasmEndpoint {
                         .as_string()
                         .ok_or_else(|| JsValue::from_str("Relay URL must be a string"))?;
 
-                    let url: RelayUrl = url_str
-                        .parse()
-                        .map_err(|e| JsValue::from_str(&format!("Invalid relay URL '{}': {}", url_str, e)))?;
+                    let url: RelayUrl = url_str.parse().map_err(|e| {
+                        JsValue::from_str(&format!("Invalid relay URL '{}': {}", url_str, e))
+                    })?;
 
                     relay_url_list.push(url);
                 }
@@ -136,7 +138,8 @@ impl WasmEndpoint {
 
         let remote_endpoint_id = endpoint_addr.id.to_string();
 
-        let connection = self.endpoint
+        let connection = self
+            .endpoint
             .connect(endpoint_addr, PEERVAULT_ALPN)
             .await
             .map_err(|e| JsValue::from_str(&format!("Connection failed: {}", e)))?;
@@ -151,7 +154,8 @@ impl WasmEndpoint {
     /// This blocks until a connection is received.
     #[wasm_bindgen(js_name = acceptConnection)]
     pub async fn accept_connection(&self) -> Result<WasmConnection, JsValue> {
-        let incoming = self.endpoint
+        let incoming = self
+            .endpoint
             .accept()
             .await
             .ok_or_else(|| JsValue::from_str("Endpoint closed"))?;

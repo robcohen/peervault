@@ -34,6 +34,7 @@ import {
 import { formatUserError } from "./utils/validation";
 import {
   IrohTransport,
+  HybridTransport,
   initIrohWasm,
   type Transport,
   type TransportStorage,
@@ -150,12 +151,39 @@ export default class PeerVaultPlugin extends Plugin {
     };
 
     // Initialize Iroh WASM module (bundled inline)
-    this.logger.info("Initializing Iroh transport...");
     await initIrohWasm();
-    this.transport = new IrohTransport(transportConfig);
-    this.logger.info("Iroh transport initialized successfully");
 
-    await this.transport.initialize();
+    // Create transport based on settings
+    if (this.settings.transportType === "hybrid") {
+      this.logger.info("Initializing Hybrid transport (Iroh + WebRTC)...");
+      this.transport = new HybridTransport({
+        ...transportConfig,
+        enableWebRTC: this.settings.enableWebRTC,
+        autoUpgradeToWebRTC: this.settings.autoWebRTCUpgrade,
+        webrtcUpgradeTimeout: this.settings.webrtcUpgradeTimeout,
+      });
+    } else {
+      this.logger.info("Initializing Iroh transport...");
+      this.transport = new IrohTransport(transportConfig);
+    }
+    this.logger.info("Transport initialized successfully");
+
+    try {
+      await this.transport.initialize();
+    } catch (err) {
+      // Check for WASM memory errors and show user-friendly message
+      const errStr = String(err);
+      if (errStr.includes("Out of memory") || errStr.includes("memory")) {
+        new Notice(
+          "PeerVault: Cannot start - WASM memory exhausted. " +
+          "This can happen after reloading plugins multiple times. " +
+          "Please restart Obsidian to free memory.",
+          15000
+        );
+        this.logger.error("WASM memory exhausted - restart Obsidian to free memory:", err);
+      }
+      throw err;
+    }
 
     // Initialize peer manager with blob store for binary sync
     // Get hostname - uses os.hostname() on desktop, platform/model detection on mobile

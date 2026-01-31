@@ -121,9 +121,45 @@ export function renderAdvancedSection(
         }),
     );
 
+  // WebRTC direct connection setting
+  new Setting(container)
+    .setName("WebRTC direct connections")
+    .setDesc(
+      "Enable WebRTC for direct peer-to-peer connections on the same network. " +
+      "Reduces latency from ~100ms to <10ms when both devices are on the same LAN."
+    )
+    .addToggle((toggle) =>
+      toggle
+        .setValue(plugin.settings.enableWebRTC)
+        .onChange(async (value) => {
+          plugin.settings.enableWebRTC = value;
+          await plugin.saveSettings();
+          new Notice("Restart plugin to apply WebRTC setting");
+        }),
+    );
+
   // Connection stats
   renderConnectionStats(container, plugin);
 }
+
+/**
+ * Format bytes into human-readable string (KB, MB, GB)
+ */
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+/** Quality indicator icons */
+const QUALITY_ICONS: Record<string, string> = {
+  excellent: "🟢",
+  good: "🟢",
+  fair: "🟡",
+  poor: "🔴",
+  disconnected: "⚫",
+};
 
 function renderConnectionStats(
   container: HTMLElement,
@@ -139,14 +175,33 @@ function renderConnectionStats(
     return;
   }
 
-  // Get RTT for each connected peer
+  // Get RTT, bandwidth, and health for each connected peer
   for (const peer of connectedPeers) {
     const rtt = plugin.peerManager?.getPeerRtt(peer.nodeId);
     const rttText = rtt !== undefined ? `${Math.round(rtt)}ms` : "measuring...";
     const displayName = peer.hostname || peer.nickname || peer.nodeId.substring(0, 8);
+    const health = peer.health;
+
+    // Build description with latency, health, and bandwidth stats
+    let desc = `Latency: ${rttText}`;
+
+    // Add health info if available
+    if (health) {
+      const qualityIcon = QUALITY_ICONS[health.quality] || "";
+      desc = `${qualityIcon} ${health.quality} • Latency: ${rttText}`;
+      if (health.jitterMs > 0) {
+        desc += ` • Jitter: ${Math.round(health.jitterMs)}ms`;
+      }
+    }
+
+    if (peer.bandwidth) {
+      const sent = formatBytes(peer.bandwidth.bytesSent);
+      const received = formatBytes(peer.bandwidth.bytesReceived);
+      desc += ` • Sent: ${sent} • Received: ${received}`;
+    }
 
     new Setting(container)
-      .setName(`Latency: ${displayName}`)
-      .setDesc(`Round-trip time: ${rttText}`);
+      .setName(displayName)
+      .setDesc(desc);
   }
 }

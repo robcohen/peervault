@@ -16,4 +16,5 @@ export {
   PeerErrors,
   ConfigErrors,
   PlatformErrors,
+  WebRTCErrors,
 } from "./catalog";
