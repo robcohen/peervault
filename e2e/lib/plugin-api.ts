@@ -426,6 +426,43 @@ export class PluginAPI {
   }
 
   /**
+   * Get connection info for a peer, including WebRTC status.
+   */
+  async getConnectionInfo(peerId: string): Promise<{
+    connected: boolean;
+    transportType: "iroh" | "hybrid";
+    webrtcActive: boolean;
+    webrtcDirect: boolean;
+    rttMs?: number;
+  } | null> {
+    return await this.client.evaluate<{
+      connected: boolean;
+      transportType: "iroh" | "hybrid";
+      webrtcActive: boolean;
+      webrtcDirect: boolean;
+      rttMs?: number;
+    } | null>(`
+      (function() {
+        const plugin = window.app?.plugins?.plugins?.["peervault"];
+        if (!plugin?.getConnectionInfo) return null;
+        return plugin.getConnectionInfo(${JSON.stringify(peerId)});
+      })()
+    `);
+  }
+
+  /**
+   * Check if WebRTC is available in this environment.
+   */
+  async isWebRTCAvailable(): Promise<boolean> {
+    return await this.client.evaluate<boolean>(`
+      (function() {
+        const plugin = window.app?.plugins?.plugins?.["peervault"];
+        return plugin?.isWebRTCAvailable?.() ?? false;
+      })()
+    `);
+  }
+
+  /**
    * Clear all peers and reset sync state.
    */
   async clearAllPeers(): Promise<void> {

@@ -702,4 +702,44 @@ Only accept if you trust this peer and want to sync with them.`,
     const excludedFolders = this.peerManager.getConnectedPeersExcludedFolders();
     this.vaultSync.updatePeerExcludedFolders(excludedFolders);
   }
+
+  /**
+   * Get connection info for a peer, including WebRTC status.
+   * Used by E2E tests to verify transport upgrades.
+   */
+  getConnectionInfo(peerId: string): {
+    connected: boolean;
+    transportType: "iroh" | "hybrid";
+    webrtcActive: boolean;
+    webrtcDirect: boolean;
+    rttMs?: number;
+  } | null {
+    if (!this.transport) return null;
+
+    const conn = this.transport.getConnection(peerId);
+    if (!conn) return null;
+
+    // Check if this is a HybridConnection with WebRTC info
+    const hybridConn = conn as {
+      isWebRTCActive?: () => boolean;
+      isDirectConnection?: () => boolean;
+    };
+
+    const isHybrid = typeof hybridConn.isWebRTCActive === "function";
+
+    return {
+      connected: conn.isConnected(),
+      transportType: isHybrid ? "hybrid" : "iroh",
+      webrtcActive: isHybrid ? hybridConn.isWebRTCActive!() : false,
+      webrtcDirect: isHybrid ? hybridConn.isDirectConnection!() : false,
+      rttMs: conn.getRttMs(),
+    };
+  }
+
+  /**
+   * Check if WebRTC is available in this environment.
+   */
+  isWebRTCAvailable(): boolean {
+    return typeof RTCPeerConnection !== "undefined";
+  }
 }
