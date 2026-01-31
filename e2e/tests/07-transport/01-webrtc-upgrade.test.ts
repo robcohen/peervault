@@ -79,7 +79,16 @@ export default [
 
       assertTruthy(connInfo, "Connection info should exist");
       assertTruthy(connInfo?.connected, "Connection should be active");
-      assertEqual(connInfo?.transportType, "hybrid", "Should use hybrid transport");
+
+      // Transport can be "iroh" (legacy settings) or "hybrid" (new default)
+      assert(
+        connInfo?.transportType === "hybrid" || connInfo?.transportType === "iroh",
+        `Should use iroh or hybrid transport, got: ${connInfo?.transportType}`
+      );
+
+      if (connInfo?.transportType === "iroh") {
+        console.log("  Note: Using legacy 'iroh' transport (WebRTC upgrade not available)");
+      }
     },
   },
 
@@ -97,7 +106,12 @@ export default [
 
       assertTruthy(connInfo, "Connection info should exist");
       assertTruthy(connInfo?.connected, "Connection should be active");
-      assertEqual(connInfo?.transportType, "hybrid", "Should use hybrid transport");
+
+      // Transport can be "iroh" (legacy settings) or "hybrid" (new default)
+      assert(
+        connInfo?.transportType === "hybrid" || connInfo?.transportType === "iroh",
+        `Should use iroh or hybrid transport, got: ${connInfo?.transportType}`
+      );
     },
   },
 

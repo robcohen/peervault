@@ -27,6 +27,7 @@ const TEST_SUITES = [
   "04-conflicts",
   "05-error-recovery",
   "06-edge-cases",
+  "07-transport",
 ];
 
 /** Test function signature */
