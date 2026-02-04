@@ -37,7 +37,7 @@ import {
 import { isWebRTCAvailable } from "./webrtc";
 
 /** Delay before attempting WebRTC upgrade (ms) - longer to avoid sync interference */
-const UPGRADE_DELAY_MS = 60000;  // Increased to 60s to allow sync to complete first
+const UPGRADE_DELAY_MS = 5000;  // 5s delay to allow initial sync handshake first
 
 /** Time to wait for first message when detecting stream type (ms) */
 const STREAM_DETECT_TIMEOUT_MS = 2000;
@@ -357,10 +357,19 @@ export class HybridConnection implements PeerConnection {
   }
 
   /**
-   * Handle incoming stream - just forward to callbacks.
+   * Handle incoming stream - detect type when WebRTC upgrade is expected.
    */
   private handleIncomingStream(stream: SyncStream): void {
-    this.forwardStreamToCallbacks(stream);
+    // Only detect stream type if we're expecting a WebRTC upgrade
+    // (after the upgrade timer has fired and WebRTC isn't already connected)
+    if (this.upgradeScheduled && !this.webrtcConn) {
+      this.detectAndHandleStream(stream).catch((err) => {
+        this.logger.error(`[Hybrid ${this.peerId}] Stream handling error:`, err);
+      });
+    } else {
+      // Normal case: forward directly to callbacks
+      this.forwardStreamToCallbacks(stream);
+    }
   }
 
   /**
