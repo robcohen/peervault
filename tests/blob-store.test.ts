@@ -191,6 +191,46 @@ describe('BlobStore', () => {
       expect(hash1).toBe(hash2);
     });
   });
+
+  describe('Integrity Verification', () => {
+    it('should verify and add blob with correct hash', async () => {
+      const content = new TextEncoder().encode('Verify me');
+      const expectedHash = await blobStore.computeHash(content);
+
+      const result = await blobStore.verifyAndAdd(content, expectedHash, 'text/plain');
+
+      expect(result).toBe(true);
+      expect(await blobStore.has(expectedHash)).toBe(true);
+    });
+
+    it('should reject blob with incorrect hash', async () => {
+      const content = new TextEncoder().encode('Corrupted data');
+      const wrongHash = 'a'.repeat(64); // Wrong hash
+
+      const result = await blobStore.verifyAndAdd(content, wrongHash, 'text/plain');
+
+      expect(result).toBe(false);
+      expect(await blobStore.has(wrongHash)).toBe(false);
+    });
+
+    it('should compute hash correctly', async () => {
+      const content = new TextEncoder().encode('Hash me');
+
+      const hash = await blobStore.computeHash(content);
+
+      expect(hash).toBeDefined();
+      expect(hash.length).toBe(64); // SHA-256 = 64 hex chars
+    });
+
+    it('should compute same hash as add method', async () => {
+      const content = new TextEncoder().encode('Same hash');
+
+      const computedHash = await blobStore.computeHash(content);
+      const addedHash = await blobStore.add(content, 'text/plain');
+
+      expect(computedHash).toBe(addedHash);
+    });
+  });
 });
 
 describe('Binary File Detection', () => {

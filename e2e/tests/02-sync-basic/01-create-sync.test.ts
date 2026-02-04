@@ -14,20 +14,39 @@ import {
 
 export default [
   {
+    name: "Ensure active sync sessions before testing",
+    async fn(ctx: TestContext) {
+      // Ensure both vaults have active sync sessions
+      // This handles the case where sessions errored out between test suites
+      const test1Active = await ctx.test.plugin.ensureActiveSessions();
+      const test2Active = await ctx.test2.plugin.ensureActiveSessions();
+
+      assert(
+        test1Active,
+        "TEST should have an active sync session after force sync"
+      );
+      assert(
+        test2Active,
+        "TEST2 should have an active sync session after force sync"
+      );
+
+      console.log("  Active sync sessions confirmed on both vaults");
+    },
+  },
+
+  {
     name: "Create file in TEST syncs to TEST2",
+    parallel: true, // Independent file
     async fn(ctx: TestContext) {
       const path = "sync-test-1.md";
       const content = "# Sync Test 1\n\nCreated in TEST, should sync to TEST2.";
 
-      // Create file in TEST
       await ctx.test.vault.createFile(path, content);
       console.log(`  Created ${path} in TEST`);
 
-      // Wait for sync
-      await ctx.test2.sync.waitForFile(path, { timeoutMs: 30000 });
+      await ctx.test2.sync.waitForFile(path);
       console.log("  File appeared in TEST2");
 
-      // Verify content
       await assertFileContent(ctx.test2.vault, path, content);
       console.log("  Content matches");
     },
@@ -35,19 +54,17 @@ export default [
 
   {
     name: "Create file in TEST2 syncs to TEST",
+    parallel: true, // Independent file
     async fn(ctx: TestContext) {
       const path = "sync-test-2.md";
       const content = "# Sync Test 2\n\nCreated in TEST2, should sync to TEST.";
 
-      // Create file in TEST2
       await ctx.test2.vault.createFile(path, content);
       console.log(`  Created ${path} in TEST2`);
 
-      // Wait for sync
-      await ctx.test.sync.waitForFile(path, { timeoutMs: 30000 });
+      await ctx.test.sync.waitForFile(path);
       console.log("  File appeared in TEST");
 
-      // Verify content
       await assertFileContent(ctx.test.vault, path, content);
       console.log("  Content matches");
     },
@@ -55,6 +72,7 @@ export default [
 
   {
     name: "Multiple files created quickly sync correctly",
+    parallel: true, // Independent files
     async fn(ctx: TestContext) {
       const files = [
         { path: "batch/file-1.md", content: "Batch file 1" },
@@ -62,19 +80,16 @@ export default [
         { path: "batch/file-3.md", content: "Batch file 3" },
       ];
 
-      // Create all files in TEST
       for (const file of files) {
         await ctx.test.vault.createFile(file.path, file.content);
       }
       console.log(`  Created ${files.length} files in TEST`);
 
-      // Wait for all files to appear in TEST2
       for (const file of files) {
-        await ctx.test2.sync.waitForFile(file.path, { timeoutMs: 30000 });
+        await ctx.test2.sync.waitForFile(file.path);
       }
       console.log("  All files appeared in TEST2");
 
-      // Verify contents
       for (const file of files) {
         await assertFileContent(ctx.test2.vault, file.path, file.content);
       }
@@ -84,6 +99,7 @@ export default [
 
   {
     name: "File with frontmatter syncs correctly",
+    parallel: true, // Independent file
     async fn(ctx: TestContext) {
       const path = "frontmatter-test.md";
       const content = `---
@@ -98,13 +114,8 @@ date: 2024-01-15
 
 This file has YAML frontmatter.`;
 
-      // Create in TEST
       await ctx.test.vault.createFile(path, content);
-
-      // Wait for sync
-      await ctx.test2.sync.waitForFile(path, { timeoutMs: 30000 });
-
-      // Verify content
+      await ctx.test2.sync.waitForFile(path);
       await assertFileContent(ctx.test2.vault, path, content);
       console.log("  Frontmatter preserved correctly");
     },
@@ -112,6 +123,7 @@ This file has YAML frontmatter.`;
 
   {
     name: "File with internal links syncs correctly",
+    parallel: true, // Independent file
     async fn(ctx: TestContext) {
       const path = "links-test.md";
       const content = `# Links Test
@@ -122,13 +134,8 @@ Also [[batch/file-1|with alias]].
 
 And an embed: ![[sync-test-1]]`;
 
-      // Create in TEST2
       await ctx.test2.vault.createFile(path, content);
-
-      // Wait for sync
-      await ctx.test.sync.waitForFile(path, { timeoutMs: 30000 });
-
-      // Verify content
+      await ctx.test.sync.waitForFile(path);
       await assertFileContent(ctx.test.vault, path, content);
       console.log("  Internal links preserved correctly");
     },
@@ -154,8 +161,7 @@ And an embed: ![[sync-test-1]]`;
   {
     name: "CRDT versions converge",
     async fn(ctx: TestContext) {
-      // Wait for version convergence
-      await ctx.waitForConvergence(30000);
+      await ctx.waitForConvergence();
       console.log("  CRDT versions have converged");
     },
   },

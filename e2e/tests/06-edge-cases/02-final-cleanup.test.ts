@@ -15,7 +15,7 @@ export default [
   {
     name: "Final CRDT convergence check",
     async fn(ctx: TestContext) {
-      await ctx.waitForConvergence(60000);
+      await ctx.waitForConvergence();
 
       const [v1, v2] = await Promise.all([
         ctx.test.sync.getVersion(),
@@ -85,7 +85,7 @@ export default [
     name: "Clean up TEST vault",
     async fn(ctx: TestContext) {
       const result = await ctx.test.state.resetVaultFiles();
-      console.log(`  Deleted ${result.deletedCount} files from TEST`);
+      console.log(`  Deleted ${result.deleted} files from TEST`);
     },
   },
 
@@ -93,8 +93,8 @@ export default [
     name: "Wait for cleanup to sync",
     async fn(ctx: TestContext) {
       // Wait for deletions to sync
-      await new Promise((r) => setTimeout(r, 10000));
-      await ctx.waitForConvergence(60000);
+      await new Promise((r) => setTimeout(r, 5000));
+      await ctx.waitForConvergence();
     },
   },
 
@@ -102,7 +102,7 @@ export default [
     name: "Clean up TEST2 vault",
     async fn(ctx: TestContext) {
       const result = await ctx.test2.state.resetVaultFiles();
-      console.log(`  Deleted ${result.deletedCount} files from TEST2`);
+      console.log(`  Deleted ${result.deleted} files from TEST2`);
     },
   },
 

@@ -304,21 +304,41 @@ export class VaultController {
           }
         }
 
-        // Also delete empty folders
-        const folders = vault.getAllLoadedFiles()
-          .filter(f => f.children !== undefined) // Is a folder
-          .filter(f => !f.path.startsWith('.obsidian'))
-          .filter(f => f.path !== '/') // Not root
-          .sort((a, b) => b.path.length - a.path.length); // Delete deepest first
+        // Also delete empty folders using adapter for reliable deletion
+        // Use recursive approach: list all folders, sort deepest first, delete empty ones
+        const adapter = vault.adapter;
 
-        for (const folder of folders) {
+        async function deleteEmptyFolders(path) {
+          if (path.startsWith('.obsidian')) return;
+
           try {
-            if (folder.children?.length === 0) {
-              await vault.delete(folder);
+            const listing = await adapter.list(path);
+
+            // Recursively process subfolders first
+            for (const subfolder of listing.folders) {
+              await deleteEmptyFolders(subfolder);
+            }
+
+            // Re-check if folder is now empty
+            const updated = await adapter.list(path);
+            if (updated.files.length === 0 && updated.folders.length === 0 && path !== '') {
+              await adapter.rmdir(path, false);
             }
           } catch (e) {
-            // Ignore errors for non-empty folders - this is expected
+            // Folder may not exist or already deleted
           }
+        }
+
+        // Start from root
+        try {
+          const root = await adapter.list('');
+          for (const folder of root.folders) {
+            if (!folder.startsWith('.obsidian')) {
+              await deleteEmptyFolders(folder);
+            }
+          }
+        } catch (e) {
+          console.warn('Error cleaning up folders:', e);
         }
 
         return { deleted, failed, failedPaths };

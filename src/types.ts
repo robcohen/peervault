@@ -224,6 +224,9 @@ export type SyncStatus = "idle" | "syncing" | "offline" | "error";
 /** Transport type for P2P connections */
 export type TransportType = "iroh" | "hybrid";
 
+/** Protocol trace level for debugging */
+export type ProtocolTraceLevel = "minimal" | "standard" | "verbose";
+
 /**
  * Plugin settings stored in Obsidian.
  */
@@ -260,6 +263,10 @@ export interface PeerVaultSettings {
   autoWebRTCUpgrade: boolean;
   /** Timeout for WebRTC upgrade in milliseconds (default: 10000) */
   webrtcUpgradeTimeout: number;
+  /** Enable protocol tracing for debugging (default: false) */
+  enableProtocolTracing: boolean;
+  /** Protocol trace level (default: "standard") */
+  protocolTraceLevel: ProtocolTraceLevel;
 }
 
 export const DEFAULT_SETTINGS: PeerVaultSettings = {
@@ -278,6 +285,8 @@ export const DEFAULT_SETTINGS: PeerVaultSettings = {
   enableWebRTC: true,
   autoWebRTCUpgrade: true,
   webrtcUpgradeTimeout: 10000, // 10 seconds
+  enableProtocolTracing: false,
+  protocolTraceLevel: "standard",
 };
 
 // ============================================================================

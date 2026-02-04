@@ -21,7 +21,7 @@ export default [
 
       // Perform reset
       const result = await ctx.test.state.resetAll();
-      console.log(`  Deleted ${result.deletedCount} files from TEST`);
+      console.log(`  Deleted ${result.deleted} files from TEST`);
 
       // Verify clean
       await ctx.test.state.waitForCleanState(5000);
@@ -37,7 +37,7 @@ export default [
 
       // Perform reset
       const result = await ctx.test2.state.resetAll();
-      console.log(`  Deleted ${result.deletedCount} files from TEST2`);
+      console.log(`  Deleted ${result.deleted} files from TEST2`);
 
       // Verify clean
       await ctx.test2.state.waitForCleanState(5000);
@@ -69,6 +69,55 @@ export default [
     name: "TEST2 has no peers",
     async fn(ctx: TestContext) {
       await assertNoPeers(ctx.test2.plugin);
+    },
+  },
+
+  {
+    name: "Enable WebRTC for testing",
+    async fn(ctx: TestContext) {
+      // Enable WebRTC for proper transport testing
+      await ctx.test.client.evaluate(`
+        (async function() {
+          const plugin = window.app?.plugins?.plugins?.["peervault"];
+          if (plugin?.settings) {
+            plugin.settings.enableWebRTC = true;
+            plugin.settings.autoWebRTCUpgrade = true;
+            await plugin.saveSettings?.();
+          }
+        })()
+      `);
+      await ctx.test2.client.evaluate(`
+        (async function() {
+          const plugin = window.app?.plugins?.plugins?.["peervault"];
+          if (plugin?.settings) {
+            plugin.settings.enableWebRTC = true;
+            plugin.settings.autoWebRTCUpgrade = true;
+            await plugin.saveSettings?.();
+          }
+        })()
+      `);
+      console.log("  WebRTC enabled on both vaults");
+    },
+  },
+
+  {
+    name: "Enable protocol tracing for debugging",
+    async fn(ctx: TestContext) {
+      // Enable protocol tracing on both vaults to debug sync issues
+      await ctx.test.plugin.enableProtocolTracing("verbose");
+      await ctx.test2.plugin.enableProtocolTracing("verbose");
+      console.log("  Protocol tracing enabled on both vaults");
+    },
+  },
+
+  {
+    name: "Configure local relay server",
+    async fn(ctx: TestContext) {
+      // Use local relay server for faster, more reliable tests
+      const localRelayUrl = "http://localhost:3340";
+      await ctx.test.plugin.setRelayServers([localRelayUrl]);
+      await ctx.test2.plugin.setRelayServers([localRelayUrl]);
+      console.log(`  Local relay configured: ${localRelayUrl}`);
     },
   },
 

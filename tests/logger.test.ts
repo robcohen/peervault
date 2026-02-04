@@ -9,6 +9,7 @@ import {
   Logger,
   createLogger,
   setGlobalDebugMode,
+  setMinLogLevel,
   getLogBuffer,
   getRecentLogs,
   clearLogBuffer,
@@ -29,6 +30,7 @@ describe("Logger", () => {
   beforeEach(() => {
     clearLogBuffer();
     setGlobalDebugMode(false);
+    setMinLogLevel("info"); // Reset to default
     consoleSpy = {
       debug: spyOn(console, "debug").mockImplementation(() => {}),
       info: spyOn(console, "info").mockImplementation(() => {}),
@@ -71,6 +73,7 @@ describe("Logger", () => {
 
     it("should log debug messages when debug mode is on", () => {
       setGlobalDebugMode(true);
+      setMinLogLevel("debug"); // Enable debug output
       const logger = createLogger("Test");
       logger.debug("debug message");
       expect(consoleSpy.debug).toHaveBeenCalledWith("[Test]", "debug message");
@@ -99,6 +102,7 @@ describe("Logger", () => {
 
     it("should route debug level correctly", () => {
       setGlobalDebugMode(true);
+      setMinLogLevel("debug"); // Enable debug output
       const logger = createLogger("Test");
       logger.log("debug", "debug message");
       expect(consoleSpy.debug).toHaveBeenCalled();
@@ -115,6 +119,7 @@ describe("Logger", () => {
 
     it("should inherit debug mode from parent", () => {
       setGlobalDebugMode(true);
+      setMinLogLevel("debug"); // Enable debug output
       const parent = createLogger("Parent");
       const child = parent.child("Child");
       child.debug("debug message");
@@ -324,6 +329,9 @@ describe("Logger", () => {
 
   describe("Logger Constructor", () => {
     it("should accept custom debug mode function", () => {
+      // Set min log level to debug so debug messages are output
+      setMinLogLevel("debug");
+
       let debugEnabled = false;
       const logger = new Logger("Custom", () => debugEnabled);
 
@@ -333,6 +341,9 @@ describe("Logger", () => {
       debugEnabled = true;
       logger.debug("message 2");
       expect(consoleSpy.debug).toHaveBeenCalled();
+
+      // Reset to default
+      setMinLogLevel("info");
     });
   });
 });

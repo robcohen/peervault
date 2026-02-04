@@ -37,6 +37,20 @@ export interface PluginSettings {
   showStatusBar: boolean;
   debugMode: boolean;
   deviceNickname?: string;
+  enableProtocolTracing?: boolean;
+  protocolTraceLevel?: "minimal" | "standard" | "verbose";
+}
+
+/** Protocol trace event (matches TraceEvent in protocol-tracer.ts) */
+export interface TraceEvent {
+  ts: number;
+  sid: string;
+  pid: string;
+  stm?: string;
+  cat: string;
+  evt: string;
+  data?: Record<string, unknown>;
+  dur?: number;
 }
 
 /**
@@ -163,6 +177,91 @@ export class PluginAPI {
   }
 
   /**
+   * Force sync with all peers by calling peerManager.syncAll().
+   * Closes ALL existing sessions and creates fresh ones.
+   */
+  async forceSync(): Promise<{ sessionCount: number; sessionStates: Array<{ peerId: string; state: string }> }> {
+    return await this.client.evaluate<{ sessionCount: number; sessionStates: Array<{ peerId: string; state: string }> }>(`
+      (async function() {
+        const plugin = window.app?.plugins?.plugins?.["peervault"];
+        const pm = plugin?.peerManager;
+        if (!pm?.syncAll) {
+          throw new Error("syncAll not available");
+        }
+
+        // Close ALL sessions quickly
+        if (pm.sessions) {
+          const closePromises = [];
+          for (const [nodeId, session] of pm.sessions) {
+            closePromises.push(
+              Promise.race([
+                session.close?.(),
+                new Promise(r => setTimeout(r, 500)) // 500ms timeout per session
+              ]).catch(() => {})
+            );
+          }
+          await Promise.all(closePromises);
+          pm.sessions.clear();
+        }
+
+        // Trigger sync with all peers - creates fresh sessions
+        await pm.syncAll();
+
+        // Return current session state immediately (don't wait)
+        const sessions = pm.sessions ? Array.from(pm.sessions.entries()) : [];
+        return {
+          sessionCount: sessions.length,
+          sessionStates: sessions.map(([id, s]) => ({
+            peerId: id.slice(0, 16),
+            state: s.getState?.() ?? s.state ?? "unknown",
+          })),
+        };
+      })()
+    `);
+  }
+
+  /**
+   * Ensure sync sessions are active, forcing sync if needed.
+   * Returns true if at least one session is in live state.
+   * Waits up to 15 seconds for sessions to reach live state.
+   */
+  async ensureActiveSessions(): Promise<boolean> {
+    // Check current session state
+    let sessions = await this.getActiveSessions();
+    let hasLive = sessions.some(s => s.state === "live");
+
+    if (hasLive) {
+      return true;
+    }
+
+    // Force sync to create new sessions
+    const result = await this.forceSync();
+
+    // Wait for sessions to reach "live" state (up to 15 seconds)
+    const maxAttempts = 30;
+    for (let i = 0; i < maxAttempts; i++) {
+      sessions = await this.getActiveSessions();
+      hasLive = sessions.some(s => s.state === "live");
+
+      if (hasLive) {
+        return true;
+      }
+
+      // Log progress every 5 attempts
+      if (i > 0 && i % 5 === 0) {
+        const states = sessions.map(s => `${s.peerId.slice(0, 8)}:${s.state}`).join(", ");
+        console.log(`[ensureActiveSessions] Attempt ${i}/${maxAttempts}, sessions: [${states}]`);
+      }
+
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    // Final check
+    sessions = await this.getActiveSessions();
+    return sessions.some(s => s.state === "live");
+  }
+
+  /**
    * Get plugin settings.
    */
   async getSettings(): Promise<PluginSettings> {
@@ -179,6 +278,21 @@ export class PluginAPI {
           debugMode: settings.debugMode ?? false,
           deviceNickname: settings.deviceNickname,
         };
+      })()
+    `);
+  }
+
+  /**
+   * Set relay servers for the transport.
+   */
+  async setRelayServers(relayUrls: string[]): Promise<void> {
+    await this.client.evaluate(`
+      (async function() {
+        const plugin = window.app?.plugins?.plugins?.["peervault"];
+        if (!plugin?.settings) return;
+
+        plugin.settings.relayServers = ${JSON.stringify(relayUrls)};
+        await plugin.saveSettings?.();
       })()
     `);
   }
@@ -314,38 +428,6 @@ export class PluginAPI {
     `);
   }
 
-  /**
-   * Force a sync with all peers.
-   * This clears any error sessions and creates new ones.
-   */
-  async forceSync(): Promise<void> {
-    await this.client.evaluate(`
-      (async function() {
-        const plugin = window.app?.plugins?.plugins?.["peervault"];
-        const pm = plugin?.peerManager;
-        if (!pm) throw new Error("PeerManager not available");
-
-        // Close any error sessions first
-        if (pm.sessions) {
-          for (const [nodeId, session] of pm.sessions) {
-            if (session.getState?.() === "error") {
-              try {
-                await session.close();
-              } catch (e) {
-                console.warn("Failed to close error session:", e);
-              }
-              pm.sessions.delete(nodeId);
-            }
-          }
-        }
-
-        // Trigger sync with all peers
-        if (pm.syncAll) {
-          await pm.syncAll();
-        }
-      })()
-    `);
-  }
 
   /**
    * Check if session with peer is healthy (in live state).
@@ -356,6 +438,40 @@ export class PluginAPI {
       (s) => s.peerId === peerId || s.peerId.startsWith(peerId.slice(0, 8))
     );
     return session?.state === "live";
+  }
+
+  /**
+   * Force close all sessions and trigger fresh reconnection.
+   * This is useful after pairing to reset any stuck sync state.
+   */
+  async forceReconnect(): Promise<void> {
+    await this.client.evaluate(`
+      (async function() {
+        const plugin = window.app?.plugins?.plugins?.["peervault"];
+        const pm = plugin?.peerManager;
+        if (!pm) return;
+
+        // Close all existing sessions
+        if (pm.sessions) {
+          for (const [id, session] of pm.sessions) {
+            try {
+              await session.close();
+            } catch (e) {
+              console.warn("[E2E] Failed to close session:", id, e);
+            }
+          }
+          pm.sessions.clear();
+        }
+
+        // Wait a moment for cleanup
+        await new Promise(r => setTimeout(r, 500));
+
+        // Trigger fresh sync with all peers
+        if (pm.syncAll) {
+          await pm.syncAll();
+        }
+      })()
+    `);
   }
 
   /**
@@ -463,6 +579,39 @@ export class PluginAPI {
   }
 
   /**
+   * Get active sync sessions.
+   */
+  async getActiveSessions(): Promise<Array<{
+    peerId: string;
+    state: string;
+    isInitiator: boolean;
+  }>> {
+    return await this.client.evaluate<Array<{
+      peerId: string;
+      state: string;
+      isInitiator: boolean;
+    }>>(`
+      (function() {
+        const plugin = window.app?.plugins?.plugins?.["peervault"];
+        const pm = plugin?.peerManager;
+        if (!pm?.sessions) return [];
+
+        const sessions = [];
+        for (const [peerId, session] of pm.sessions.entries()) {
+          // Use getState() method if available, fall back to .state property
+          const state = session.getState?.() ?? session.state ?? "unknown";
+          sessions.push({
+            peerId: peerId,
+            state: state,
+            isInitiator: session.isInitiator || false,
+          });
+        }
+        return sessions;
+      })()
+    `);
+  }
+
+  /**
    * Clear all peers and reset sync state.
    */
   async clearAllPeers(): Promise<void> {
@@ -482,6 +631,227 @@ export class PluginAPI {
           } catch (e) {
             console.warn("Failed to remove peer:", id, e);
           }
+        }
+      })()
+    `);
+  }
+
+  /**
+   * Enable auto-accept for vault adoption requests.
+   * This automatically clicks "Join Network" buttons when the modal appears.
+   * Uses MutationObserver + polling fallback to ensure modals are caught.
+   */
+  async enableAutoAcceptVaultAdoption(): Promise<void> {
+    await this.client.evaluate(`
+      (function() {
+        if (window.__peervaultAutoAcceptEnabled) {
+          console.log("[E2E] Auto-accept already enabled");
+          return;
+        }
+        window.__peervaultAutoAcceptEnabled = true;
+
+        // Function to check and dismiss any "Join Sync Network" modals
+        function checkAndDismissModals() {
+          const modals = document.querySelectorAll('.modal-container');
+          for (const modal of modals) {
+            const title = modal.querySelector('h2');
+            if (title && title.textContent?.includes('Join Sync Network')) {
+              console.log("[E2E] Found 'Join Sync Network' modal, auto-accepting...");
+              const confirmBtn = modal.querySelector('button.mod-cta');
+              if (confirmBtn) {
+                confirmBtn.click();
+                console.log("[E2E] Clicked 'Join Network' button");
+                return true;
+              }
+            }
+          }
+          return false;
+        }
+
+        // Check immediately for any existing modals
+        checkAndDismissModals();
+
+        // Watch for confirmation modals and auto-click "Join Network"
+        const observer = new MutationObserver((mutations) => {
+          for (const mutation of mutations) {
+            for (const node of mutation.addedNodes) {
+              if (node.nodeType !== 1) continue;
+              const el = node;
+
+              // Check if this is a PeerVault confirm modal
+              if (el.classList?.contains("modal-container")) {
+                const title = el.querySelector("h2");
+                if (title && title.textContent?.includes("Join Sync Network")) {
+                  console.log("[E2E] Detected 'Join Sync Network' modal, auto-accepting...");
+
+                  // Find and click the confirm button (mod-cta class)
+                  const confirmBtn = el.querySelector("button.mod-cta");
+                  if (confirmBtn) {
+                    setTimeout(() => {
+                      confirmBtn.click();
+                      console.log("[E2E] Clicked 'Join Network' button");
+                    }, 100);
+                  }
+                }
+              }
+            }
+          }
+        });
+
+        observer.observe(document.body, { childList: true, subtree: true });
+
+        // Polling fallback - check every 500ms for modals that might have been missed
+        window.__peervaultModalPoller = setInterval(() => {
+          checkAndDismissModals();
+        }, 500);
+
+        console.log("[E2E] Vault adoption auto-accept enabled (MutationObserver + polling)");
+      })()
+    `);
+  }
+
+  /**
+   * Click any visible modal buttons (like "Join Network" confirmation).
+   * Returns true if a button was clicked.
+   */
+  async clickModalButton(buttonText: string): Promise<boolean> {
+    return await this.client.evaluate<boolean>(`
+      (function() {
+        // Find modal buttons with the specified text
+        const buttons = document.querySelectorAll(".modal-button, .mod-cta");
+        for (const btn of buttons) {
+          if (btn.textContent?.includes(${JSON.stringify(buttonText)})) {
+            btn.click();
+            console.log("[E2E] Clicked modal button:", ${JSON.stringify(buttonText)});
+            return true;
+          }
+        }
+        return false;
+      })()
+    `);
+  }
+
+  /**
+   * Dismiss any open modals by clicking their close button or pressing Escape.
+   */
+  async dismissModals(): Promise<void> {
+    await this.client.evaluate(`
+      (function() {
+        // Click close buttons
+        const closeButtons = document.querySelectorAll(".modal-close-button");
+        closeButtons.forEach(btn => btn.click());
+
+        // Also try pressing Escape
+        document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+      })()
+    `);
+  }
+
+  /**
+   * Enable protocol tracing for debugging.
+   * Returns { enabled: boolean, debug: string } with debug info about what happened.
+   */
+  async enableProtocolTracing(level: "minimal" | "standard" | "verbose" = "standard"): Promise<{ enabled: boolean; debug: string }> {
+    return await this.client.evaluate<{ enabled: boolean; debug: string }>(`
+      (async function() {
+        let debug = [];
+
+        // Try direct tracer access first
+        let tracer = window.__protocolTracer;
+        debug.push("tracer: " + (tracer ? "found" : "not found"));
+        debug.push("typeof: " + typeof tracer);
+
+        if (tracer) {
+          const keys = Object.keys(tracer).slice(0, 10);
+          debug.push("keys: " + keys.join(","));
+          debug.push("setEnabled type: " + typeof tracer.setEnabled);
+        }
+
+        if (tracer && typeof tracer.setEnabled === 'function') {
+          tracer.setEnabled(true);
+          tracer.setLevel(${JSON.stringify(level)});
+          const isEnabled = tracer.isEnabled?.();
+          debug.push("isEnabled after set: " + isEnabled);
+          return { enabled: true, debug: debug.join(" | ") };
+        } else {
+          // Update settings and reload plugin to apply
+          const plugin = window.app?.plugins?.plugins?.["peervault"];
+          debug.push("plugin: " + (plugin ? "found" : "not found"));
+          if (plugin?.settings) {
+            plugin.settings.enableProtocolTracing = true;
+            plugin.settings.protocolTraceLevel = ${JSON.stringify(level)};
+            await plugin.saveSettings?.();
+            debug.push("settings updated");
+            return { enabled: false, debug: debug.join(" | ") };
+          } else {
+            debug.push("no plugin settings");
+            return { enabled: false, debug: debug.join(" | ") };
+          }
+        }
+      })()
+    `);
+  }
+
+  /**
+   * Disable protocol tracing.
+   */
+  async disableProtocolTracing(): Promise<void> {
+    await this.client.evaluate(`
+      (function() {
+        const tracer = window.__protocolTracer;
+        if (tracer) {
+          tracer.setEnabled(false);
+          console.log("[E2E] Protocol tracing disabled");
+        }
+      })()
+    `);
+  }
+
+  /**
+   * Get protocol trace events.
+   */
+  async getProtocolTraces(count?: number): Promise<TraceEvent[]> {
+    return await this.client.evaluate<TraceEvent[]>(`
+      (function() {
+        const tracer = window.__protocolTracer;
+        if (!tracer) {
+          console.log("[E2E getProtocolTraces] tracer not found on window");
+          return [];
+        }
+        if (!tracer.getRecentEvents) {
+          console.log("[E2E getProtocolTraces] tracer.getRecentEvents not found");
+          return [];
+        }
+        const events = tracer.getRecentEvents(${count ?? 1000});
+        console.log("[E2E getProtocolTraces] got", events.length, "events");
+        return events;
+      })()
+    `);
+  }
+
+  /**
+   * Get protocol traces as NDJSON string.
+   */
+  async getProtocolTracesNdjson(count?: number): Promise<string> {
+    return await this.client.evaluate<string>(`
+      (function() {
+        const tracer = window.__protocolTracer;
+        if (!tracer) return "";
+        return tracer.exportAsNdjson(${count ?? undefined});
+      })()
+    `);
+  }
+
+  /**
+   * Clear protocol traces.
+   */
+  async clearProtocolTraces(): Promise<void> {
+    await this.client.evaluate(`
+      (function() {
+        const tracer = window.__protocolTracer;
+        if (tracer) {
+          tracer.clear();
+          console.log("[E2E] Protocol traces cleared");
         }
       })()
     `);

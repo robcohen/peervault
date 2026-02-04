@@ -31,6 +31,12 @@ export interface E2EConfig {
     defaultTimeout: number;
     /** Polling interval for sync status checks */
     pollInterval: number;
+    /** Minimum poll interval for exponential backoff */
+    minPollInterval: number;
+    /** Maximum poll interval for exponential backoff */
+    maxPollInterval: number;
+    /** Backoff multiplier */
+    backoffMultiplier: number;
   };
 
   /** Fixture settings */
@@ -67,8 +73,14 @@ export const config: E2EConfig = {
     },
   },
   sync: {
-    defaultTimeout: 30000,
-    pollInterval: 500,
+    defaultTimeout: 20000, // Increased for CRDT convergence reliability
+    pollInterval: 100,
+    /** Minimum poll interval for exponential backoff */
+    minPollInterval: 50,
+    /** Maximum poll interval for exponential backoff */
+    maxPollInterval: 500,
+    /** Backoff multiplier */
+    backoffMultiplier: 1.5,
   },
   fixtures: {
     path: "./e2e/fixtures",
@@ -78,6 +90,9 @@ export const config: E2EConfig = {
     collectConsoleLogs: true,
   },
 };
+
+/** Check if --slow flag is set */
+export const isSlowMode = process.argv.includes("--slow");
 
 /** Get config with environment variable overrides */
 export function getConfig(): E2EConfig {
@@ -94,6 +109,17 @@ export function getConfig(): E2EConfig {
   }
   if (process.env.TEST2_VAULT_PATH) {
     cfg.vaults.TEST2.path = process.env.TEST2_VAULT_PATH;
+  }
+
+  // Slow mode uses conservative timeouts for debugging
+  if (isSlowMode) {
+    cfg.sync = {
+      ...cfg.sync,
+      defaultTimeout: 30000,
+      pollInterval: 500,
+      minPollInterval: 200,
+      maxPollInterval: 1000,
+    };
   }
 
   return cfg;

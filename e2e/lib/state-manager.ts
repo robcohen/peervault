@@ -38,15 +38,31 @@ export class StateManager {
    * Clear all peers and pending pairing requests.
    */
   async resetPeers(): Promise<void> {
+    // First clear via the plugin API
     await this.plugin.clearAllPeers();
 
-    // Clear any pending pairing requests
+    // Then force-clear storage directly to handle race conditions
+    // (when both vaults are connected, clearing one sends PEER_REMOVED to the other)
     await this.client.evaluate(`
       (async function() {
         const plugin = window.app?.plugins?.plugins?.["peervault"];
         const pm = plugin?.peerManager;
-        if (pm?.pendingPairingRequests) {
+        if (!pm) return;
+
+        // Clear pending pairing requests
+        if (pm.pendingPairingRequests) {
           pm.pendingPairingRequests.clear();
+        }
+
+        // Force-clear the peers map and save to storage
+        pm.peers.clear();
+        pm.sessions.clear();
+        pm.reconnectAttempts.clear();
+
+        // Force save empty peers to storage
+        if (pm.storage) {
+          const data = new TextEncoder().encode(JSON.stringify([]));
+          await pm.storage.write("peervault-peers", data);
         }
       })()
     `);
@@ -54,17 +70,18 @@ export class StateManager {
 
   /**
    * Reset the CRDT document state.
-   * This clears all sync state and reinitializes.
+   * This clears the CRDT storage completely so a fresh doc is created on reload.
    */
   async resetCrdtState(): Promise<void> {
     await this.client.evaluate(`
       (async function() {
         const plugin = window.app?.plugins?.plugins?.["peervault"];
-        const dm = plugin?.documentManager;
-        if (!dm) return;
+        if (!plugin) return;
+
+        const dm = plugin.documentManager;
+        const pm = plugin.peerManager;
 
         // Close any active sessions first
-        const pm = plugin?.peerManager;
         if (pm?.sessions) {
           for (const [id, session] of pm.sessions) {
             try {
@@ -76,9 +93,40 @@ export class StateManager {
           pm.sessions.clear();
         }
 
-        // Reset the document - this reinitializes CRDT state
-        if (dm.reset) {
-          await dm.reset();
+        // Delete all CRDT-related storage using Obsidian's adapter
+        const adapter = window.app.vault.adapter;
+        const basePath = window.app.vault.configDir + "/plugins/peervault/peervault-storage";
+
+        try {
+          // Delete the entire storage directory
+          if (await adapter.exists(basePath)) {
+            const listing = await adapter.list(basePath);
+            // Delete all files in the directory
+            for (const file of listing.files) {
+              await adapter.remove(file);
+              console.log("[E2E] Deleted storage file:", file);
+            }
+            // Delete the directory itself
+            await adapter.rmdir(basePath, true);
+            console.log("[E2E] Deleted peervault-storage directory");
+          }
+        } catch (e) {
+          console.log("[E2E] Error deleting storage:", e);
+        }
+
+        // Also clear the blob store data directory
+        const blobPath = window.app.vault.configDir + "/plugins/peervault/blobs";
+        try {
+          if (await adapter.exists(blobPath)) {
+            const listing = await adapter.list(blobPath);
+            for (const file of listing.files) {
+              await adapter.remove(file);
+            }
+            await adapter.rmdir(blobPath, true);
+            console.log("[E2E] Deleted blobs directory");
+          }
+        } catch (e) {
+          console.log("[E2E] Error deleting blobs:", e);
         }
       })()
     `);

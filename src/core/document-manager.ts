@@ -25,6 +25,7 @@ import type {
 import type { Logger } from "../utils/logger";
 import { isBinaryFile } from "./blob-store";
 import { computeTextEdits } from "../utils/text-diff";
+import { protocolTracer } from "../utils/protocol-tracer";
 
 /**
  * Type for the loro-crdt module with optional WASM ready promise.
@@ -204,23 +205,55 @@ export class DocumentManager {
       this.nodeCache.set(nodeIdStr, node);
     }
 
-    // Then build path caches from roots (excludes deleted)
+    // Then build path caches from roots
+    // Note: tree.roots() may include deleted nodes, so we check isDeleted() in cacheNodePath
     const roots = this.tree.roots();
+    let deletedCount = 0;
+    let activeCount = 0;
     for (const root of roots) {
+      if (root.isDeleted()) {
+        deletedCount++;
+      } else {
+        activeCount++;
+      }
       this.cacheNodePath(root, "");
+    }
+
+    // Log if we found deleted roots (helps diagnose deletion issues)
+    if (deletedCount > 0) {
+      this.logger.debug(`rebuildPathCache: ${roots.length} roots (${activeCount} active, ${deletedCount} deleted)`);
     }
   }
 
   private cacheNodePath(node: LoroTreeNode, parentPath: string): void {
+    // Check Loro's native deletion status first
+    if (node.isDeleted()) return;
+
     const meta = node.data;
     const name = meta?.get("name") as string | undefined;
     if (!name) return;
 
+    // Also check legacy metadata flag for backwards compatibility
     const deleted = meta?.get("deleted") as boolean | undefined;
     if (deleted) return;
 
     const path = parentPath ? `${parentPath}/${name}` : name;
     const nodeId = this.getNodeId(node);
+    const mtime = (meta?.get("mtime") as number) || 0;
+
+    // Handle duplicate paths: keep the node with the most recent mtime
+    const existingNodeId = this.pathCache.get(path);
+    if (existingNodeId) {
+      const existingNode = this.getNodeById(existingNodeId);
+      const existingMtime = (existingNode?.data?.get("mtime") as number) || 0;
+      if (existingMtime >= mtime) {
+        // Existing node is newer or same age, skip this one
+        return;
+      }
+      // This node is newer, remove old mapping
+      this.nodePathCache.delete(existingNodeId);
+    }
+
     this.pathCache.set(path, nodeId);
     this.nodePathCache.set(nodeId, path);
 
@@ -461,21 +494,54 @@ export class DocumentManager {
    */
   async handleFileDelete(path: string): Promise<void> {
     const nodeId = this.pathCache.get(path);
-    if (!nodeId) return;
+    if (!nodeId) {
+      protocolTracer.trace("", "", "crdt", "handleFileDelete.nodeNotFound", { path });
+      return;
+    }
 
     const node = this.getNodeById(nodeId);
-    if (!node) return;
+    if (!node) {
+      protocolTracer.trace("", "", "crdt", "handleFileDelete.nodeNotFound", { path, nodeId });
+      return;
+    }
 
-    // Soft delete - set deleted flag
-    const meta = node.data;
-    meta.set("deleted", true);
-    meta.set("deletedAt", Date.now());
+    protocolTracer.trace("", "", "crdt", "handleFileDelete.deleting", { path, nodeId });
+
+    // Use Loro's native tree deletion - this properly marks the node as deleted
+    // and ensures it won't appear in tree.roots() or node.children()
+    try {
+      this.tree.delete(nodeId);
+      protocolTracer.trace("", "", "crdt", "handleFileDelete.treeDeleteOk", { path, nodeId });
+    } catch (err) {
+      // If tree.delete fails, fall back to soft delete via metadata
+      this.logger.warn("tree.delete() failed, using soft delete:", err);
+      protocolTracer.trace("", "", "crdt", "handleFileDelete.treeDeleteFailed", {
+        path,
+        nodeId,
+        error: String(err),
+      });
+      const meta = node.data;
+      meta.set("deleted", true);
+      meta.set("deletedAt", Date.now());
+    }
+
+    // Verify deletion worked
+    const nodeAfter = this.getNodeById(nodeId);
+    const isDeleted = nodeAfter?.isDeleted() ?? true;
+    protocolTracer.trace("", "", "crdt", "handleFileDelete.verified", {
+      path,
+      nodeId,
+      isDeleted,
+      nodeFound: !!nodeAfter,
+    });
 
     // Remove from cache
     this.pathCache.delete(path);
     this.nodePathCache.delete(nodeId);
 
     this.doc.commit();
+
+    protocolTracer.trace("", "", "crdt", "handleFileDelete.committed", { path, nodeId });
     this.logger.debug("Deleted file node:", path);
   }
 
@@ -864,12 +930,14 @@ export class DocumentManager {
     const nodeId = this.pathCache.get(path);
     if (!nodeId) {
       this.logger.warn("Cannot set content: file not found:", path);
+      protocolTracer.trace("", "", "crdt", "setTextContent.nodeNotFound", { path });
       return;
     }
 
     const node = this.getNodeById(nodeId);
     if (!node) {
       this.logger.warn("Cannot set content: node not found:", nodeId);
+      protocolTracer.trace("", "", "crdt", "setTextContent.nodeNotFound", { path, nodeId });
       return;
     }
 
@@ -877,6 +945,7 @@ export class DocumentManager {
 
     // Get or create LoroText container inside node.data
     let textContainer = nodeMeta.get("content") as LoroText | undefined;
+    const hadExistingContainer = textContainer instanceof LoroText;
     if (!textContainer || !(textContainer instanceof LoroText)) {
       // Create new LoroText container inside node metadata
       textContainer = nodeMeta.setContainer("content", new LoroText());
@@ -887,11 +956,27 @@ export class DocumentManager {
 
     // Fast path: no changes
     if (currentContent === content) {
+      protocolTracer.trace("", "", "crdt", "setTextContent.noChange", {
+        path,
+        contentLength: content.length,
+      });
       return;
     }
 
+    protocolTracer.trace("", "", "crdt", "setTextContent.computing", {
+      path,
+      currentLength: currentContent.length,
+      newLength: content.length,
+      hadExistingContainer,
+    });
+
     // Compute diff and apply minimal edits
     const edits = computeTextEdits(currentContent, content);
+
+    protocolTracer.trace("", "", "crdt", "setTextContent.editsComputed", {
+      path,
+      editCount: edits.length,
+    });
 
     // Apply edits in reverse order (from end to start) to preserve positions
     for (let i = edits.length - 1; i >= 0; i--) {
@@ -913,6 +998,13 @@ export class DocumentManager {
     nodeMeta.set("mtime", Date.now());
 
     this.doc.commit();
+
+    protocolTracer.trace("", "", "crdt", "setTextContent.committed", {
+      path,
+      editCount: edits.length,
+      newLength: content.length,
+    });
+
     this.logger.debug(
       "Set text content for:",
       path,

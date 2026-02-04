@@ -13,6 +13,7 @@ import type {
   ConnectionState,
 } from "./types";
 import { TransportErrors } from "../errors";
+import { protocolTracer } from "../utils/protocol-tracer";
 
 // Import the bundled Iroh WASM module (inlined by esbuild plugin)
 // @ts-ignore - This is resolved by esbuild to the transformed module
@@ -66,9 +67,50 @@ interface IrohWasmModule {
 }
 
 // Module-level state for the WASM module
-let wasmModule: IrohWasmModule | null = null;
-let wasmInitialized = false;
-let initPromise: Promise<void> | null = null;
+// Use a global registry for cleanup coordination across vault instances
+// This helps prevent WASM memory exhaustion when plugins reload rapidly
+interface PeerVaultWasmGlobal {
+  pendingCleanups: Set<Promise<void>>;
+  activeEndpoints: number;
+  // Cache the WASM module globally to prevent memory leaks on plugin reload
+  // Without this, each plugin reload creates a NEW WASM instance (memory leak)
+  wasmModule: IrohWasmModule | null;
+  wasmInitialized: boolean;
+  initPromise: Promise<void> | null;
+}
+
+declare global {
+  interface Window {
+    __peervaultWasm?: PeerVaultWasmGlobal;
+  }
+}
+
+function getGlobalState(): PeerVaultWasmGlobal {
+  if (typeof window !== "undefined") {
+    if (!window.__peervaultWasm) {
+      window.__peervaultWasm = {
+        pendingCleanups: new Set(),
+        activeEndpoints: 0,
+        wasmModule: null,
+        wasmInitialized: false,
+        initPromise: null,
+      };
+    }
+    return window.__peervaultWasm;
+  }
+  // Fallback for non-browser environments
+  return {
+    pendingCleanups: new Set(),
+    activeEndpoints: 0,
+    wasmModule: null,
+    wasmInitialized: false,
+    initPromise: null,
+  };
+}
+
+function getGlobalCleanups(): Set<Promise<void>> {
+  return getGlobalState().pendingCleanups;
+}
 
 /**
  * Initialize the Iroh WASM module.
@@ -81,11 +123,13 @@ export async function initIrohWasm(
   _jsUrl?: string,
   _wasmUrl?: string,
 ): Promise<void> {
-  // Prevent multiple initializations
-  if (wasmInitialized) return;
-  if (initPromise) return initPromise;
+  const globalState = getGlobalState();
 
-  initPromise = (async () => {
+  // Prevent multiple initializations - use GLOBAL state to survive plugin reloads
+  if (globalState.wasmInitialized) return;
+  if (globalState.initPromise) return globalState.initPromise;
+
+  globalState.initPromise = (async () => {
     try {
       // WASM is bundled inline - just initialize it
       const module = irohWasm as unknown as IrohWasmModule;
@@ -93,22 +137,33 @@ export async function initIrohWasm(
       // Initialize the WASM module (uses inlined bytes)
       await module.default();
 
-      wasmModule = module;
-      wasmInitialized = true;
+      globalState.wasmModule = module;
+      globalState.wasmInitialized = true;
     } catch (err) {
-      initPromise = null;
+      globalState.initPromise = null;
       throw err;
     }
   })();
 
-  return initPromise;
+  return globalState.initPromise;
 }
 
 /**
  * Check if the Iroh WASM module is initialized.
  */
 export function isIrohWasmReady(): boolean {
-  return wasmInitialized;
+  return getGlobalState().wasmInitialized;
+}
+
+/**
+ * Wait for any pending transport cleanups to complete.
+ * Call this before creating a new transport to prevent WASM memory exhaustion.
+ */
+export async function waitForPendingCleanups(): Promise<void> {
+  const pendingCleanups = getGlobalCleanups();
+  if (pendingCleanups.size > 0) {
+    await Promise.all(pendingCleanups);
+  }
 }
 
 /**
@@ -129,10 +184,19 @@ export class IrohTransport implements Transport {
   }
 
   async initialize(): Promise<void> {
-    if (!wasmModule) {
+    const globalState = getGlobalState();
+
+    if (!globalState.wasmModule) {
       throw TransportErrors.wasmLoadFailed(
         "Iroh WASM module not initialized. Call initIrohWasm() first.",
       );
+    }
+
+    // Wait for any pending cleanups to complete before creating new endpoint
+    // This prevents WASM memory exhaustion when plugins reload rapidly
+    if (globalState.pendingCleanups.size > 0) {
+      this.config.logger.debug(`Waiting for ${globalState.pendingCleanups.size} pending cleanup(s)...`);
+      await Promise.all(globalState.pendingCleanups);
     }
 
     // Load existing secret key or create new one
@@ -140,29 +204,67 @@ export class IrohTransport implements Transport {
     const keyBytes = storedKey && storedKey.length === 32 ? storedKey : null;
 
     this.config.logger.debug("Creating Iroh endpoint...");
+    globalState.activeEndpoints++;
 
-    // Create the endpoint
-    // Pass relay URLs for when WASM wrapper supports custom relays
-    this.endpoint = await wasmModule.WasmEndpoint.create(
-      keyBytes ?? undefined,
-      this.config.relayUrls,
-    );
+    try {
+      // Try creating endpoint with custom relays first, fall back to defaults on failure
+      const hasCustomRelays = this.config.relayUrls && this.config.relayUrls.length > 0;
 
-    // Save the key if we generated a new one
-    if (!keyBytes) {
-      const newKey = this.endpoint.secretKeyBytes();
-      await this.config.storage.saveSecretKey(newKey);
-      this.config.logger.info("Generated new Iroh identity");
+      if (hasCustomRelays) {
+        try {
+          this.config.logger.debug("Trying custom relay servers:", this.config.relayUrls);
+          this.endpoint = await globalState.wasmModule!.WasmEndpoint.create(
+            keyBytes ?? undefined,
+            this.config.relayUrls,
+          );
+        } catch (relayErr) {
+          this.config.logger.warn("Custom relay failed, falling back to defaults:", relayErr);
+          // Retry with default relays (pass undefined)
+          this.endpoint = await globalState.wasmModule!.WasmEndpoint.create(
+            keyBytes ?? undefined,
+            undefined,
+          );
+          this.config.logger.info("Connected using default relay servers");
+        }
+      } else {
+        // No custom relays, use defaults
+        this.endpoint = await globalState.wasmModule!.WasmEndpoint.create(
+          keyBytes ?? undefined,
+          undefined,
+        );
+      }
+
+      // Save the key if we generated a new one
+      if (!keyBytes) {
+        const newKey = this.endpoint.secretKeyBytes();
+        await this.config.storage.saveSecretKey(newKey);
+        this.config.logger.info("Generated new Iroh identity");
+      }
+
+      this.ready = true;
+      this.config.logger.info(
+        "IrohTransport initialized with nodeId:",
+        this.endpoint.nodeId(),
+      );
+
+      // Start accepting incoming connections
+      this.startAcceptLoop();
+    } catch (err) {
+      // Failed to create endpoint - decrement count so other transports can try
+      globalState.activeEndpoints--;
+
+      // Check for WASM memory errors and provide a helpful message
+      const errStr = String(err);
+      if (errStr.includes("Out of memory") || errStr.includes("memory")) {
+        throw TransportErrors.wasmLoadFailed(
+          `WASM memory exhausted. This usually means another vault with PeerVault is already running. ` +
+          `Please close other vault(s) or disable PeerVault in them, then reload this plugin. ` +
+          `Original error: ${errStr}`
+        );
+      }
+
+      throw err;
     }
-
-    this.ready = true;
-    this.config.logger.info(
-      "IrohTransport initialized with nodeId:",
-      this.endpoint.nodeId(),
-    );
-
-    // Start accepting incoming connections
-    this.startAcceptLoop();
   }
 
   getNodeId(): string {
@@ -211,6 +313,12 @@ export class IrohTransport implements Transport {
     );
     this.connections.set(peerId, connection);
 
+    // Trace connection
+    protocolTracer.trace("", peerId, "transport", "connection.opened", {
+      role: "initiator",
+      rttMs: connection.getRttMs(),
+    });
+
     this.config.logger.info("Connected to peer:", peerId);
     return connection;
   }
@@ -233,26 +341,53 @@ export class IrohTransport implements Transport {
       const MAX_DELAY_MS = 30000;
       let consecutiveErrors = 0;
 
+      // Trace that the accept loop has started
+      protocolTracer.trace("", "", "transport", "accept.loop.started", {
+        ready: this.ready,
+        hasEndpoint: !!this.endpoint,
+        callbackCount: this.incomingCallbacks.length,
+      });
+
       while (this.ready && this.endpoint) {
         try {
           this.config.logger.debug("Waiting for incoming connection...");
+          protocolTracer.trace("", "", "transport", "accept.loop.waiting", {});
           const wasmConn = await this.endpoint.acceptConnection();
+
+          // Log what we got
+          protocolTracer.trace("", "", "transport", "accept.loop.returned", {
+            gotConnection: wasmConn !== null,
+            nodeId: wasmConn?.remoteNodeId()?.slice(0, 8) ?? "null",
+          });
 
           // acceptConnection can return null (e.g., endpoint closing)
           if (!wasmConn) {
             if (this.ready) {
               this.config.logger.debug("acceptConnection returned null, retrying...");
+              protocolTracer.trace("", "", "transport", "accept.loop.null", {});
               continue;
             }
             break;
           }
+
+          // Trace that we got a connection
+          protocolTracer.trace("", wasmConn.remoteNodeId(), "transport", "accept.loop.received", {});
 
           // Reset error counter on successful accept
           consecutiveErrors = 0;
 
           const peerId = wasmConn.remoteNodeId();
 
-          this.config.logger.info("Incoming connection from:", peerId);
+          // Check if we already have a connection to this peer (e.g., from connectWithTicket)
+          const existingConn = this.connections.get(peerId);
+          if (existingConn?.isConnected()) {
+            this.config.logger.debug(`[IrohTransport] Already have connection to ${peerId.slice(0, 8)}, skipping duplicate`);
+            // We already have a valid connection - don't create a duplicate
+            // Don't notify callbacks since handleIncomingConnection already ran from connectWithTicket path
+            continue;
+          }
+
+          this.config.logger.info(`[IrohTransport] Incoming connection from ${peerId.slice(0, 8)}, ${this.incomingCallbacks.length} callbacks registered`);
 
           // Create wrapper
           const connection = new IrohPeerConnection(
@@ -261,6 +396,12 @@ export class IrohTransport implements Transport {
             this.config.logger,
           );
           this.connections.set(peerId, connection);
+
+          // Trace incoming connection
+          protocolTracer.trace("", peerId, "transport", "connection.opened", {
+            role: "acceptor",
+            rttMs: connection.getRttMs(),
+          });
 
           // Notify callbacks
           for (const callback of this.incomingCallbacks) {
@@ -285,6 +426,11 @@ export class IrohTransport implements Transport {
               `Error accepting connection (attempt ${consecutiveErrors}), retrying in ${delay.toFixed(0)}ms:`,
               err,
             );
+            protocolTracer.trace("", "", "transport", "accept.loop.error", {
+              error: err instanceof Error ? err.message : String(err),
+              consecutiveErrors,
+              delay: delay.toFixed(0),
+            });
             await new Promise((resolve) => setTimeout(resolve, delay));
           }
         }
@@ -328,20 +474,39 @@ export class IrohTransport implements Transport {
     this.ready = false;
     this.acceptLoopRunning = false;
 
+    // Track this cleanup so other transports wait for it before creating endpoints
+    const pendingCleanups = getGlobalCleanups();
+    const cleanupPromise = this.performCleanup();
+    pendingCleanups.add(cleanupPromise);
+
+    try {
+      await cleanupPromise;
+    } finally {
+      pendingCleanups.delete(cleanupPromise);
+    }
+  }
+
+  private async performCleanup(): Promise<void> {
     // Close all connections
     for (const conn of this.connections.values()) {
       await conn.close();
     }
     this.connections.clear();
 
-    // Clear incoming connection callbacks to prevent leaks on reinitialization
+    // Clear callbacks
     this.incomingCallbacks = [];
 
-    // Close the endpoint
+    // Close the endpoint and free WASM memory
     if (this.endpoint) {
       await this.endpoint.close();
       this.endpoint.free();
       this.endpoint = null;
+
+      // Decrement active endpoint count
+      const globalState = getGlobalState();
+      if (globalState.activeEndpoints > 0) {
+        globalState.activeEndpoints--;
+      }
     }
 
     this.config.logger.info("IrohTransport shut down");
@@ -393,14 +558,22 @@ class IrohPeerConnection implements PeerConnection {
     if (this.acceptStreamLoopRunning) return;
     this.acceptStreamLoopRunning = true;
 
+    protocolTracer.trace("", this.peerId, "transport", "stream.loop.started", {});
+
     const loop = async () => {
       while (this.state === "connected") {
         try {
+          protocolTracer.trace("", this.peerId, "transport", "stream.loop.waiting", {});
           const wasmStream = await this.wasmConn.acceptStream();
           const streamId = `${this.peerId}-in-${++this.streamCounter}`;
           const stream = new IrohSyncStream(wasmStream, streamId);
 
           this.logger.debug("Accepted incoming stream:", streamId);
+
+          // Trace incoming stream
+          protocolTracer.traceStream("", this.peerId, streamId, "transport", "stream.opened", {
+            direction: "incoming",
+          });
 
           // Priority 1: Resolve any pending acceptStream() promise
           if (this.pendingAccepts.length > 0) {
@@ -411,6 +584,10 @@ class IrohPeerConnection implements PeerConnection {
 
           // Priority 2: Notify onStream() callbacks (persistent listeners)
           if (this.streamCallbacks.length > 0) {
+            // Trace stream being fired to callback
+            protocolTracer.traceStream("", this.peerId, streamId, "transport", "stream.callback.fired", {
+              source: "loop",
+            });
             for (const callback of this.streamCallbacks) {
               try {
                 callback(stream);
@@ -420,6 +597,10 @@ class IrohPeerConnection implements PeerConnection {
             }
           } else {
             // Priority 3: Queue for later acceptStream() call
+            protocolTracer.trace("", this.peerId, "transport", "stream.pending", {
+              streamId,
+              count: this.pendingStreams.length + 1,
+            });
             this.pendingStreams.push(stream);
           }
         } catch (err) {
@@ -461,6 +642,11 @@ class IrohPeerConnection implements PeerConnection {
 
     this.state = "disconnected";
 
+    // Trace disconnection
+    protocolTracer.trace("", this.peerId, "transport", "connection.closed", {
+      reason: "disconnected",
+    });
+
     // Reject all pending acceptStream() promises
     const pendingAccepts = this.pendingAccepts;
     this.pendingAccepts = [];
@@ -494,6 +680,11 @@ class IrohPeerConnection implements PeerConnection {
     this.streams.set(streamId, stream);
     this.logger.debug("Opened stream:", streamId);
 
+    // Trace stream opened
+    protocolTracer.traceStream("", this.peerId, streamId, "transport", "stream.opened", {
+      direction: "outgoing",
+    });
+
     return stream;
   }
 
@@ -519,6 +710,11 @@ class IrohPeerConnection implements PeerConnection {
     if (this.state === "disconnected") return;
 
     this.state = "disconnected";
+
+    // Trace connection close
+    protocolTracer.trace("", this.peerId, "transport", "connection.closed", {
+      reason: "closed",
+    });
 
     // Close all active streams
     for (const stream of this.streams.values()) {
@@ -589,6 +785,39 @@ class IrohPeerConnection implements PeerConnection {
 
   onStream(callback: (stream: SyncStream) => void): () => void {
     this.streamCallbacks.push(callback);
+
+    // Trace callback registration
+    protocolTracer.trace("", this.peerId, "transport", "stream.callback.registered", {
+      pendingCount: this.pendingStreams.length,
+    });
+
+    // CRITICAL: Drain any pending streams to the callback immediately
+    // This prevents a race condition where:
+    // 1. Caller registers callback via onStream
+    // 2. Accept loop delivers pending stream to callback
+    // 3. Caller calls acceptStream expecting pending stream
+    // 4. acceptStream blocks forever because stream was already delivered
+    //
+    // By draining here, pending streams go to the callback, and acceptStream
+    // won't be called for streams that don't exist.
+    while (this.pendingStreams.length > 0) {
+      const stream = this.pendingStreams.shift()!;
+      this.logger.debug(
+        `[${this.peerId.slice(0, 8)}] onStream: draining pending stream ${stream.id} to callback`
+      );
+
+      // Trace stream being fired to callback
+      protocolTracer.traceStream("", this.peerId, stream.id, "transport", "stream.callback.fired", {
+        source: "drain",
+      });
+
+      try {
+        callback(stream);
+      } catch (err) {
+        this.logger.error("Error in stream callback while draining:", err);
+      }
+    }
+
     return () => {
       const idx = this.streamCallbacks.indexOf(callback);
       if (idx >= 0) this.streamCallbacks.splice(idx, 1);

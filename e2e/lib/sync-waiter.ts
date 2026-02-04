@@ -3,6 +3,7 @@
  *
  * Utilities for waiting on sync completion between vaults.
  * Uses version vector comparison and file existence checks.
+ * Features adaptive exponential backoff for efficient polling.
  */
 
 import type { CDPClient } from "./cdp-client";
@@ -13,6 +14,47 @@ import { config } from "../config";
 export interface SyncWaitOptions {
   timeoutMs?: number;
   pollIntervalMs?: number;
+}
+
+/**
+ * Exponential backoff polling utility.
+ * Starts fast (minInterval) and backs off to maxInterval.
+ * Returns early as soon as condition is met.
+ */
+async function pollWithBackoff<T>(
+  check: () => Promise<T>,
+  isComplete: (result: T) => boolean,
+  options: {
+    timeoutMs: number;
+    minInterval?: number;
+    maxInterval?: number;
+    multiplier?: number;
+  }
+): Promise<{ success: true; result: T } | { success: false; lastResult: T | undefined }> {
+  const {
+    timeoutMs,
+    minInterval = config.sync.minPollInterval,
+    maxInterval = config.sync.maxPollInterval,
+    multiplier = config.sync.backoffMultiplier,
+  } = options;
+
+  const startTime = Date.now();
+  let currentInterval = minInterval;
+  let lastResult: T | undefined;
+
+  while (Date.now() - startTime < timeoutMs) {
+    const result = await check();
+    lastResult = result;
+
+    if (isComplete(result)) {
+      return { success: true, result };
+    }
+
+    await new Promise((r) => setTimeout(r, currentInterval));
+    currentInterval = Math.min(currentInterval * multiplier, maxInterval);
+  }
+
+  return { success: false, lastResult };
 }
 
 /**
@@ -37,23 +79,19 @@ export class SyncWaiter {
     path: string,
     options: SyncWaitOptions = {}
   ): Promise<void> {
-    const {
-      timeoutMs = config.sync.defaultTimeout,
-      pollIntervalMs = config.sync.pollInterval,
-    } = options;
+    const { timeoutMs = config.sync.defaultTimeout } = options;
 
-    const startTime = Date.now();
-
-    while (Date.now() - startTime < timeoutMs) {
-      const exists = await this.vault.fileExists(path);
-      if (exists) return;
-
-      await new Promise((r) => setTimeout(r, pollIntervalMs));
-    }
-
-    throw new Error(
-      `File "${path}" not found in vault "${this.vaultName}" after ${timeoutMs}ms`
+    const result = await pollWithBackoff(
+      () => this.vault.fileExists(path),
+      (exists) => exists,
+      { timeoutMs }
     );
+
+    if (!result.success) {
+      throw new Error(
+        `File "${path}" not found in vault "${this.vaultName}" after ${timeoutMs}ms`
+      );
+    }
   }
 
   /**
@@ -64,49 +102,47 @@ export class SyncWaiter {
     expectedContent: string,
     options: SyncWaitOptions = {}
   ): Promise<void> {
-    const {
-      timeoutMs = config.sync.defaultTimeout,
-      pollIntervalMs = config.sync.pollInterval,
-    } = options;
+    const { timeoutMs = config.sync.defaultTimeout } = options;
 
-    const startTime = Date.now();
     let lastError: Error | undefined;
     let lastContent: string | undefined;
 
-    while (Date.now() - startTime < timeoutMs) {
-      try {
-        const content = await this.vault.readFile(path);
-        lastContent = content;
-        lastError = undefined; // Clear error once file exists
-        if (content === expectedContent) return;
-      } catch (err) {
-        // Track the error - "File not found" is transient (expected), others are not
-        lastError = err instanceof Error ? err : new Error(String(err));
-        const isFileNotFound = lastError.message.includes("not found");
-        if (!isFileNotFound) {
-          // Non-transient error - log it for debugging
-          console.warn(`[SyncWaiter] Unexpected error reading ${path}:`, lastError.message);
+    const result = await pollWithBackoff(
+      async () => {
+        try {
+          const content = await this.vault.readFile(path);
+          lastContent = content;
+          lastError = undefined;
+          return { found: true, content };
+        } catch (err) {
+          lastError = err instanceof Error ? err : new Error(String(err));
+          const isFileNotFound = lastError.message.includes("not found");
+          if (!isFileNotFound) {
+            console.warn(`[SyncWaiter] Unexpected error reading ${path}:`, lastError.message);
+          }
+          return { found: false, content: undefined };
         }
+      },
+      (r) => r.found && r.content === expectedContent,
+      { timeoutMs }
+    );
+
+    if (!result.success) {
+      let details = "";
+      if (lastContent !== undefined) {
+        details = `Got: "${lastContent.slice(0, 100)}${lastContent.length > 100 ? "..." : ""}"`;
+      } else if (lastError) {
+        details = `Error: ${lastError.message}`;
+      } else {
+        details = "File not found";
       }
 
-      await new Promise((r) => setTimeout(r, pollIntervalMs));
+      throw new Error(
+        `File "${path}" content mismatch after ${timeoutMs}ms. ` +
+          `Expected: "${expectedContent.slice(0, 100)}${expectedContent.length > 100 ? "..." : ""}". ` +
+          details
+      );
     }
-
-    // Build detailed error message
-    let details = "";
-    if (lastContent !== undefined) {
-      details = `Got: "${lastContent.slice(0, 100)}${lastContent.length > 100 ? "..." : ""}"`;
-    } else if (lastError) {
-      details = `Error: ${lastError.message}`;
-    } else {
-      details = "File not found";
-    }
-
-    throw new Error(
-      `File "${path}" content mismatch after ${timeoutMs}ms. ` +
-        `Expected: "${expectedContent.slice(0, 100)}${expectedContent.length > 100 ? "..." : ""}". ` +
-        details
-    );
   }
 
   /**
@@ -117,42 +153,43 @@ export class SyncWaiter {
     substring: string,
     options: SyncWaitOptions = {}
   ): Promise<void> {
-    const {
-      timeoutMs = config.sync.defaultTimeout,
-      pollIntervalMs = config.sync.pollInterval,
-    } = options;
+    const { timeoutMs = config.sync.defaultTimeout } = options;
 
-    const startTime = Date.now();
     let lastError: Error | undefined;
     let lastContent: string | undefined;
 
-    while (Date.now() - startTime < timeoutMs) {
-      try {
-        const content = await this.vault.readFile(path);
-        lastContent = content;
-        lastError = undefined;
-        if (content.includes(substring)) return;
-      } catch (err) {
-        lastError = err instanceof Error ? err : new Error(String(err));
-        const isFileNotFound = lastError.message.includes("not found");
-        if (!isFileNotFound) {
-          console.warn(`[SyncWaiter] Unexpected error reading ${path}:`, lastError.message);
+    const result = await pollWithBackoff(
+      async () => {
+        try {
+          const content = await this.vault.readFile(path);
+          lastContent = content;
+          lastError = undefined;
+          return { found: true, contains: content.includes(substring) };
+        } catch (err) {
+          lastError = err instanceof Error ? err : new Error(String(err));
+          const isFileNotFound = lastError.message.includes("not found");
+          if (!isFileNotFound) {
+            console.warn(`[SyncWaiter] Unexpected error reading ${path}:`, lastError.message);
+          }
+          return { found: false, contains: false };
         }
+      },
+      (r) => r.found && r.contains,
+      { timeoutMs }
+    );
+
+    if (!result.success) {
+      let details = "";
+      if (lastContent !== undefined) {
+        details = ` Current content: "${lastContent.slice(0, 100)}${lastContent.length > 100 ? "..." : ""}"`;
+      } else if (lastError) {
+        details = ` Error: ${lastError.message}`;
       }
 
-      await new Promise((r) => setTimeout(r, pollIntervalMs));
+      throw new Error(
+        `File "${path}" does not contain "${substring}" after ${timeoutMs}ms.${details}`
+      );
     }
-
-    let details = "";
-    if (lastContent !== undefined) {
-      details = ` Current content: "${lastContent.slice(0, 100)}${lastContent.length > 100 ? "..." : ""}"`;
-    } else if (lastError) {
-      details = ` Error: ${lastError.message}`;
-    }
-
-    throw new Error(
-      `File "${path}" does not contain "${substring}" after ${timeoutMs}ms.${details}`
-    );
   }
 
   /**
@@ -162,23 +199,19 @@ export class SyncWaiter {
     path: string,
     options: SyncWaitOptions = {}
   ): Promise<void> {
-    const {
-      timeoutMs = config.sync.defaultTimeout,
-      pollIntervalMs = config.sync.pollInterval,
-    } = options;
+    const { timeoutMs = config.sync.defaultTimeout } = options;
 
-    const startTime = Date.now();
-
-    while (Date.now() - startTime < timeoutMs) {
-      const exists = await this.vault.fileExists(path);
-      if (!exists) return;
-
-      await new Promise((r) => setTimeout(r, pollIntervalMs));
-    }
-
-    throw new Error(
-      `File "${path}" still exists in vault "${this.vaultName}" after ${timeoutMs}ms`
+    const result = await pollWithBackoff(
+      () => this.vault.fileExists(path),
+      (exists) => !exists,
+      { timeoutMs }
     );
+
+    if (!result.success) {
+      throw new Error(
+        `File "${path}" still exists in vault "${this.vaultName}" after ${timeoutMs}ms`
+      );
+    }
   }
 
   /**
@@ -188,61 +221,60 @@ export class SyncWaiter {
     status: "idle" | "syncing" | "offline" | "error",
     options: SyncWaitOptions = {}
   ): Promise<void> {
-    const {
-      timeoutMs = config.sync.defaultTimeout,
-      pollIntervalMs = config.sync.pollInterval,
-    } = options;
+    const { timeoutMs = config.sync.defaultTimeout } = options;
 
-    const startTime = Date.now();
-
-    while (Date.now() - startTime < timeoutMs) {
-      const currentStatus = await this.plugin.getStatus();
-      if (currentStatus === status) return;
-
-      await new Promise((r) => setTimeout(r, pollIntervalMs));
-    }
-
-    const finalStatus = await this.plugin.getStatus();
-    throw new Error(
-      `Plugin status not "${status}" after ${timeoutMs}ms. Current: "${finalStatus}"`
+    const result = await pollWithBackoff(
+      () => this.plugin.getStatus(),
+      (current) => current === status,
+      { timeoutMs }
     );
+
+    if (result.success === false) {
+      throw new Error(
+        `Plugin status not "${status}" after ${timeoutMs}ms. Current: "${result.lastResult}"`
+      );
+    }
   }
 
   /**
    * Wait for sync to complete (status returns to idle).
    */
   async waitForSyncComplete(options: SyncWaitOptions = {}): Promise<void> {
-    const {
-      timeoutMs = config.sync.defaultTimeout,
-      pollIntervalMs = config.sync.pollInterval,
-    } = options;
+    const { timeoutMs = config.sync.defaultTimeout } = options;
 
-    const startTime = Date.now();
-
-    // First wait for syncing to start (if not already)
     let sawSyncing = false;
-    while (Date.now() - startTime < timeoutMs) {
-      const status = await this.plugin.getStatus();
+    let idleChecks = 0;
 
-      if (status === "syncing") {
-        sawSyncing = true;
-      } else if (sawSyncing && status === "idle") {
-        // Sync completed
-        return;
-      } else if (status === "idle") {
-        // Already idle, might be syncing via live mode
-        // Give it a moment then check again
-        await new Promise((r) => setTimeout(r, pollIntervalMs * 2));
-        const checkStatus = await this.plugin.getStatus();
-        if (checkStatus === "idle") return;
-      } else if (status === "error") {
-        throw new Error("Sync failed with error status");
-      }
+    const result = await pollWithBackoff(
+      async () => {
+        const status = await this.plugin.getStatus();
 
-      await new Promise((r) => setTimeout(r, pollIntervalMs));
+        if (status === "syncing") {
+          sawSyncing = true;
+          return { done: false, error: false };
+        } else if (sawSyncing && status === "idle") {
+          return { done: true, error: false };
+        } else if (status === "idle") {
+          // Already idle - wait a bit to confirm not just between syncs
+          idleChecks++;
+          if (idleChecks >= 2) return { done: true, error: false };
+          return { done: false, error: false };
+        } else if (status === "error") {
+          return { done: false, error: true };
+        }
+        return { done: false, error: false };
+      },
+      (r) => r.done || r.error,
+      { timeoutMs }
+    );
+
+    if (result.success && result.result.error) {
+      throw new Error("Sync failed with error status");
     }
 
-    throw new Error(`Sync did not complete after ${timeoutMs}ms`);
+    if (!result.success) {
+      throw new Error(`Sync did not complete after ${timeoutMs}ms`);
+    }
   }
 
   /**
@@ -252,26 +284,24 @@ export class SyncWaiter {
     nodeId: string,
     options: SyncWaitOptions = {}
   ): Promise<void> {
-    const {
-      timeoutMs = config.sync.defaultTimeout,
-      pollIntervalMs = config.sync.pollInterval,
-    } = options;
-
-    const startTime = Date.now();
+    const { timeoutMs = config.sync.defaultTimeout } = options;
     const shortId = nodeId.slice(0, 8);
 
-    while (Date.now() - startTime < timeoutMs) {
-      const peers = await this.plugin.getConnectedPeers();
-      const peer = peers.find(
-        (p) => p.nodeId === nodeId || p.nodeId.startsWith(shortId)
-      );
+    const result = await pollWithBackoff(
+      async () => {
+        const peers = await this.plugin.getConnectedPeers();
+        const peer = peers.find(
+          (p) => p.nodeId === nodeId || p.nodeId.startsWith(shortId)
+        );
+        return peer?.connectionState === "connected";
+      },
+      (connected) => connected,
+      { timeoutMs }
+    );
 
-      if (peer?.connectionState === "connected") return;
-
-      await new Promise((r) => setTimeout(r, pollIntervalMs));
+    if (!result.success) {
+      throw new Error(`Peer ${shortId} not connected after ${timeoutMs}ms`);
     }
-
-    throw new Error(`Peer ${shortId} not connected after ${timeoutMs}ms`);
   }
 
   /**
@@ -282,30 +312,28 @@ export class SyncWaiter {
     targetState: string,
     options: SyncWaitOptions = {}
   ): Promise<void> {
-    const {
-      timeoutMs = config.sync.defaultTimeout,
-      pollIntervalMs = config.sync.pollInterval,
-    } = options;
-
-    const startTime = Date.now();
+    const { timeoutMs = config.sync.defaultTimeout } = options;
     const shortId = peerId.slice(0, 8);
 
-    while (Date.now() - startTime < timeoutMs) {
-      const sessions = await this.plugin.getSessionStates();
-      const session = sessions.find(
-        (s) => s.peerId === peerId || s.peerId.startsWith(shortId)
-      );
-
-      if (session?.state === targetState) return;
-
-      await new Promise((r) => setTimeout(r, pollIntervalMs));
-    }
-
-    const finalSessions = await this.plugin.getSessionStates();
-    throw new Error(
-      `Session for ${shortId} not in state "${targetState}" after ${timeoutMs}ms. ` +
-        `Sessions: ${JSON.stringify(finalSessions)}`
+    const result = await pollWithBackoff(
+      async () => {
+        const sessions = await this.plugin.getSessionStates();
+        const session = sessions.find(
+          (s) => s.peerId === peerId || s.peerId.startsWith(shortId)
+        );
+        return { found: !!session, state: session?.state, sessions };
+      },
+      (r) => r.found && r.state === targetState,
+      { timeoutMs }
     );
+
+    if (result.success === false) {
+      const sessions = result.lastResult?.sessions ?? [];
+      throw new Error(
+        `Session for ${shortId} not in state "${targetState}" after ${timeoutMs}ms. ` +
+          `Sessions: ${JSON.stringify(sessions)}`
+      );
+    }
   }
 
   /**
@@ -331,37 +359,29 @@ export async function waitForVersionConvergence(
   waiter2: SyncWaiter,
   options: SyncWaitOptions = {}
 ): Promise<void> {
-  const {
-    timeoutMs = config.sync.defaultTimeout,
-    pollIntervalMs = config.sync.pollInterval,
-  } = options;
+  const { timeoutMs = config.sync.defaultTimeout } = options;
 
-  const startTime = Date.now();
-
-  while (Date.now() - startTime < timeoutMs) {
-    const [version1, version2] = await Promise.all([
-      waiter1.getVersion(),
-      waiter2.getVersion(),
-    ]);
-
-    // Versions should be non-empty and match
-    if (version1 && version2 && version1 === version2) {
-      return;
-    }
-
-    await new Promise((r) => setTimeout(r, pollIntervalMs));
-  }
-
-  const [finalV1, finalV2] = await Promise.all([
-    waiter1.getVersion(),
-    waiter2.getVersion(),
-  ]);
-
-  throw new Error(
-    `Versions did not converge after ${timeoutMs}ms. ` +
-      `${waiter1.vaultName}: ${finalV1}, ` +
-      `${waiter2.vaultName}: ${finalV2}`
+  const result = await pollWithBackoff(
+    async () => {
+      const [version1, version2] = await Promise.all([
+        waiter1.getVersion(),
+        waiter2.getVersion(),
+      ]);
+      return { version1, version2 };
+    },
+    (r) => !!(r.version1 && r.version2 && r.version1 === r.version2),
+    { timeoutMs }
   );
+
+  if (result.success === false) {
+    const v1 = result.lastResult?.version1 ?? "unknown";
+    const v2 = result.lastResult?.version2 ?? "unknown";
+    throw new Error(
+      `Versions did not converge after ${timeoutMs}ms. ` +
+        `${waiter1.vaultName}: ${v1}, ` +
+        `${waiter2.vaultName}: ${v2}`
+    );
+  }
 }
 
 /**
@@ -372,44 +392,34 @@ export async function waitForFileListConvergence(
   waiter2: SyncWaiter,
   options: SyncWaitOptions = {}
 ): Promise<void> {
-  const {
-    timeoutMs = config.sync.defaultTimeout,
-    pollIntervalMs = config.sync.pollInterval,
-  } = options;
+  const { timeoutMs = config.sync.defaultTimeout } = options;
 
-  const startTime = Date.now();
-
-  while (Date.now() - startTime < timeoutMs) {
-    const [files1, files2] = await Promise.all([
-      waiter1.getCrdtFiles(),
-      waiter2.getCrdtFiles(),
-    ]);
-
-    // Sort and compare
-    const sorted1 = [...files1].sort();
-    const sorted2 = [...files2].sort();
-
-    if (JSON.stringify(sorted1) === JSON.stringify(sorted2)) {
-      return;
-    }
-
-    await new Promise((r) => setTimeout(r, pollIntervalMs));
-  }
-
-  const [finalFiles1, finalFiles2] = await Promise.all([
-    waiter1.getCrdtFiles(),
-    waiter2.getCrdtFiles(),
-  ]);
-
-  // Find differences
-  const only1 = finalFiles1.filter((f) => !finalFiles2.includes(f));
-  const only2 = finalFiles2.filter((f) => !finalFiles1.includes(f));
-
-  throw new Error(
-    `File lists did not converge after ${timeoutMs}ms. ` +
-      `Only in ${waiter1.vaultName}: [${only1.join(", ")}], ` +
-      `Only in ${waiter2.vaultName}: [${only2.join(", ")}]`
+  const result = await pollWithBackoff(
+    async () => {
+      const [files1, files2] = await Promise.all([
+        waiter1.getCrdtFiles(),
+        waiter2.getCrdtFiles(),
+      ]);
+      const sorted1 = [...files1].sort();
+      const sorted2 = [...files2].sort();
+      return { files1: sorted1, files2: sorted2 };
+    },
+    (r) => JSON.stringify(r.files1) === JSON.stringify(r.files2),
+    { timeoutMs }
   );
+
+  if (result.success === false) {
+    const files1 = result.lastResult?.files1 ?? [];
+    const files2 = result.lastResult?.files2 ?? [];
+    const only1 = files1.filter((f: string) => !files2.includes(f));
+    const only2 = files2.filter((f: string) => !files1.includes(f));
+
+    throw new Error(
+      `File lists did not converge after ${timeoutMs}ms. ` +
+        `Only in ${waiter1.vaultName}: [${only1.join(", ")}], ` +
+        `Only in ${waiter2.vaultName}: [${only2.join(", ")}]`
+    );
+  }
 }
 
 /**

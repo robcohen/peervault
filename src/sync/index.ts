@@ -38,4 +38,4 @@ export {
   createBlobSyncCompleteMessage,
 } from "./messages";
 
-export { SyncSession, type SyncSessionConfig } from "./sync-session";
+export { SyncSession, type SyncSessionConfig, type SyncProgress } from "./sync-session";

@@ -12,12 +12,15 @@ import type { Logger } from "../utils/logger";
 import type { StorageAdapter } from "../types";
 import { SyncSession } from "../sync/sync-session";
 import { EventEmitter } from "../utils/events";
+import { protocolTracer } from "../utils/protocol-tracer";
 import type {
   PeerInfo,
   StoredPeerInfo,
   PeerState,
   PeerManagerConfig,
   PairingRequest,
+  ConnectionHealth,
+  ConnectionQuality,
 } from "./types";
 import { PeerGroupManager, DEFAULT_GROUP_ID } from "./groups";
 import { PeerErrors } from "../errors";
@@ -137,6 +140,20 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     }
     this.initialized = true;
 
+    // Clear any stale sessions from previous plugin instance
+    // (async cleanup from previous onunload may not have completed)
+    if (this.sessions.size > 0) {
+      this.logger.warn(`Clearing ${this.sessions.size} stale sessions from previous instance`);
+      for (const [nodeId, session] of this.sessions) {
+        try {
+          await session.close();
+        } catch (err) {
+          this.logger.debug(`Error closing stale session for ${nodeId.slice(0, 8)}:`, err);
+        }
+      }
+      this.sessions.clear();
+    }
+
     // Initialize group manager
     this.groupManager = new PeerGroupManager(
       this.documentManager.getLoro(),
@@ -158,9 +175,11 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       await this.handleIncomingConnection(conn);
     });
 
-    // Start auto-sync if enabled
+    // Always do initial sync on startup to reconnect to peers
+    // Periodic sync is optional and controlled by autoSyncInterval
+    this.startInitialSync();
     if (this.config.autoSyncInterval > 0) {
-      this.startAutoSync();
+      this.startPeriodicSync();
     }
 
     this.logger.info("PeerManager initialized");
@@ -354,6 +373,128 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   }
 
   /**
+   * Record a ping result for connection health monitoring.
+   * @param nodeId Peer's node ID
+   * @param rttMs RTT in milliseconds, or undefined if ping failed
+   */
+  recordPingResult(nodeId: string, rttMs: number | undefined): void {
+    const peer = this.peers.get(nodeId);
+    if (!peer) return;
+
+    // Initialize health if not present
+    if (!peer.health) {
+      peer.health = {
+        quality: "good",
+        avgRttMs: 0,
+        jitterMs: 0,
+        failedPings: 0,
+        successfulPings: 0,
+        rttHistory: [],
+      };
+    }
+
+    const previousQuality = peer.health.quality;
+
+    if (rttMs !== undefined) {
+      // Successful ping
+      peer.health.failedPings = 0;
+      peer.health.successfulPings++;
+      peer.health.lastPingAt = Date.now();
+
+      // Update RTT history (keep last 20 samples)
+      peer.health.rttHistory.push(rttMs);
+      if (peer.health.rttHistory.length > 20) {
+        peer.health.rttHistory.shift();
+      }
+
+      // Calculate average RTT
+      const sum = peer.health.rttHistory.reduce((a, b) => a + b, 0);
+      peer.health.avgRttMs = sum / peer.health.rttHistory.length;
+
+      // Calculate jitter (standard deviation)
+      if (peer.health.rttHistory.length > 1) {
+        const variance = peer.health.rttHistory.reduce(
+          (acc, val) => acc + Math.pow(val - peer.health!.avgRttMs, 2),
+          0,
+        ) / peer.health.rttHistory.length;
+        peer.health.jitterMs = Math.sqrt(variance);
+      }
+    } else {
+      // Failed ping
+      peer.health.failedPings++;
+    }
+
+    // Assess quality
+    peer.health.quality = this.assessConnectionQuality(peer.health);
+
+    // Emit event if quality changed
+    if (peer.health.quality !== previousQuality) {
+      this.logger.event("info", "peer.health_change", {
+        nodeId: nodeId.slice(0, 8),
+        quality: peer.health.quality,
+        previousQuality,
+        avgRttMs: peer.health.avgRttMs,
+        jitterMs: peer.health.jitterMs,
+        failedPings: peer.health.failedPings,
+      }, `Connection quality changed: ${previousQuality} → ${peer.health.quality}`);
+
+      this.emit("peer:health-change", {
+        nodeId,
+        quality: peer.health.quality,
+        previousQuality,
+      });
+    }
+  }
+
+  /**
+   * Assess connection quality based on health metrics.
+   */
+  private assessConnectionQuality(health: ConnectionHealth): ConnectionQuality {
+    // Disconnected if many consecutive failures
+    if (health.failedPings >= 5) {
+      return "disconnected";
+    }
+
+    // Poor if recent failures
+    if (health.failedPings >= 2) {
+      return "poor";
+    }
+
+    // Need some data to assess
+    if (health.rttHistory.length === 0) {
+      return "good"; // Default until we have data
+    }
+
+    const avgRtt = health.avgRttMs;
+    const jitter = health.jitterMs;
+
+    // Excellent: low RTT and low jitter
+    if (avgRtt < 50 && jitter < 10) {
+      return "excellent";
+    }
+
+    // Good: reasonable RTT and jitter
+    if (avgRtt < 150 && jitter < 30) {
+      return "good";
+    }
+
+    // Fair: higher RTT or jitter
+    if (avgRtt < 300 && jitter < 60) {
+      return "fair";
+    }
+
+    // Poor: high RTT or jitter
+    return "poor";
+  }
+
+  /**
+   * Get connection health for a peer.
+   */
+  getConnectionHealth(nodeId: string): ConnectionHealth | undefined {
+    return this.peers.get(nodeId)?.health;
+  }
+
+  /**
    * Update peer nickname.
    */
   async setNickname(nodeId: string, nickname: string): Promise<void> {
@@ -407,7 +548,9 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
 
     // Register persistent stream listener for this connection.
     // This allows the peer to initiate new sync sessions at any time.
+    this.logger.info(`[acceptPairingRequest] Registering onStream callback for peer ${peer.nodeId.slice(0, 8)}`);
     const unsubscribeStream = connection.onStream((stream) => {
+      this.logger.info(`[acceptPairingRequest] onStream callback fired for peer ${peer.nodeId.slice(0, 8)}, stream ${stream.id}`);
       this.handleIncomingStream(stream, connection, peer).catch((err) => {
         this.logger.error("Error handling incoming stream:", err);
       });
@@ -424,11 +567,18 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     // a stream and is waiting for us to accept it and respond.
     // We become the acceptor in this sync session.
     // Process any pending streams (the initiator's stream is likely already queued)
+    // Add timeout to prevent blocking the UI thread indefinitely
     try {
-      await this.processPendingStreams(connection, peer);
+      await Promise.race([
+        this.processPendingStreams(connection, peer),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("processPendingStreams timeout")), 10000)
+        ),
+      ]);
     } catch (error) {
-      this.logger.error("Failed to start sync after accepting pairing:", error);
-      this.updatePeerState(nodeId, "error");
+      this.logger.warn("Failed to process pending streams after accepting pairing:", error);
+      // Don't set error state - the initiator (peer) will retry and we'll accept then
+      // Setting up the stream listener above ensures we can accept future streams
     }
 
     return peer;
@@ -547,6 +697,46 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     }
   }
 
+  /**
+   * Get aggregated sync progress from all active sessions.
+   */
+  getSyncProgress(): {
+    activeSessions: number;
+    totalBlobsToSend: number;
+    totalBlobsSent: number;
+    totalBlobsToReceive: number;
+    totalBlobsReceived: number;
+    totalBytesSent: number;
+    totalBytesReceived: number;
+  } {
+    let totalBlobsToSend = 0;
+    let totalBlobsSent = 0;
+    let totalBlobsToReceive = 0;
+    let totalBlobsReceived = 0;
+    let totalBytesSent = 0;
+    let totalBytesReceived = 0;
+
+    for (const session of this.sessions.values()) {
+      const progress = session.getProgress();
+      totalBlobsToSend += progress.blobsToSend;
+      totalBlobsSent += progress.blobsSent;
+      totalBlobsToReceive += progress.blobsToReceive;
+      totalBlobsReceived += progress.blobsReceived;
+      totalBytesSent += progress.bytesSent;
+      totalBytesReceived += progress.bytesReceived;
+    }
+
+    return {
+      activeSessions: this.sessions.size,
+      totalBlobsToSend,
+      totalBlobsSent,
+      totalBlobsToReceive,
+      totalBlobsReceived,
+      totalBytesSent,
+      totalBytesReceived,
+    };
+  }
+
   // ===========================================================================
   // Manual Sync
   // ===========================================================================
@@ -602,12 +792,13 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     const existingSession = this.sessions.get(nodeId);
     if (existingSession) {
       const state = existingSession.getState();
-      if (state === "live") {
-        // Already synced and in live mode
+      // Preserve sessions that are actively working or just created
+      // "idle" means the session was just created and sync is about to start
+      if (state === "idle" || state === "live" || state === "exchanging_versions" || state === "syncing") {
+        this.logger.debug(`Session for ${nodeId.slice(0, 8)} already active (state: ${state}), skipping`);
         return;
       }
-      // Session exists but not in live state - it may be stale/stuck.
-      // Close it with timeout to prevent blocking.
+      // Session exists but in error or closed state - close it
       this.logger.debug(`Closing stale session for peer ${nodeId.slice(0, 8)} (state: ${state})`);
       try {
         await Promise.race([
@@ -643,6 +834,19 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       throw PeerErrors.notFound(nodeId);
     }
 
+    // Check if peer has pending streams for us - if so, handle those first
+    // This prevents the race condition where both sides try to initiate simultaneously
+    const pendingCount = connection.getPendingStreamCount();
+    if (pendingCount > 0) {
+      this.logger.debug(`Peer ${nodeId.slice(0, 8)} has ${pendingCount} pending stream(s), handling as acceptor`);
+      await this.processPendingStreams(connection, peer);
+      // Check if we now have an active session from handling the pending stream
+      const session = this.sessions.get(nodeId);
+      if (session && session.getState() !== "error") {
+        return; // Session created from incoming stream, don't also initiate
+      }
+    }
+
     try {
       await this.startSyncSession(connection, peer);
     } catch (error) {
@@ -662,11 +866,21 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     const nodeId = connection.peerId;
     this.logger.info("Incoming connection from:", nodeId);
 
+    protocolTracer.trace("", nodeId, "peer", "incoming.connection", {
+      peerCount: this.peers.size,
+      hasPeer: this.peers.has(nodeId),
+    });
+
     // Check if peer is known
     const peer = this.peers.get(nodeId);
     if (!peer) {
       // Unknown peer - check rate limits before accepting pairing request
-      if (!this.checkPairingRateLimit(nodeId)) {
+      const rateLimited = !this.checkPairingRateLimit(nodeId);
+      protocolTracer.trace("", nodeId, "peer", "pairing.creating", {
+        rateLimited,
+      });
+
+      if (rateLimited) {
         this.logger.warn("Pairing request rate limited:", nodeId);
         await connection.close();
         return;
@@ -693,6 +907,10 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
 
       // Store the connection and unsubscribe so we can accept/deny later
       this.pendingPairingRequests.set(nodeId, { request, connection, unsubscribeStateChange });
+
+      protocolTracer.trace("", nodeId, "peer", "pairing.stored", {
+        pendingCount: this.pendingPairingRequests.size,
+      });
 
       // Emit event for UI to show the request
       this.emit("peer:pairing-request", request);
@@ -758,6 +976,26 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
 
     session.on("sync:complete", () => {
       peer.lastSynced = Date.now();
+
+      // Collect bandwidth stats from this session
+      const sessionStats = session.getBandwidthStats();
+      const now = Date.now();
+      if (!peer.bandwidth) {
+        peer.bandwidth = {
+          bytesSent: 0,
+          bytesReceived: 0,
+          lastSessionBytesSent: 0,
+          lastSessionBytesReceived: 0,
+          lastUpdated: now,
+        };
+      }
+      // Accumulate totals and record last session stats
+      peer.bandwidth.bytesSent += sessionStats.bytesSent;
+      peer.bandwidth.bytesReceived += sessionStats.bytesReceived;
+      peer.bandwidth.lastSessionBytesSent = sessionStats.bytesSent;
+      peer.bandwidth.lastSessionBytesReceived = sessionStats.bytesReceived;
+      peer.bandwidth.lastUpdated = now;
+
       this.savePeers().catch((err) =>
         this.logger.error("Failed to save peers:", err),
       );
@@ -850,8 +1088,13 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     this.sessions.set(peer.nodeId, session);
     this.updatePeerState(peer.nodeId, "syncing");
 
-    // Open stream and start sync
-    const stream = await connection.openStream();
+    // Open stream and start sync with timeout to prevent indefinite blocking
+    const stream = await Promise.race([
+      connection.openStream(),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("openStream timeout")), 30000)
+      ),
+    ]);
     await session.startSync(stream);
   }
 
@@ -953,19 +1196,48 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     connection: PeerConnection,
     peer: PeerInfo,
   ): Promise<void> {
-    this.logger.debug(`Handling incoming stream from ${peer.nodeId.slice(0, 8)}`);
+    this.logger.info(`[handleIncomingStream] Starting for peer ${peer.nodeId.slice(0, 8)}, stream ${stream.id}`);
+
+    // Trace stream handling
+    protocolTracer.traceStream("", peer.nodeId, stream.id, "peer", "stream.handling", {
+      existingSession: this.sessions.has(peer.nodeId),
+    });
 
     // Close existing session if any (with timeout to prevent blocking)
+    // IMPORTANT: When a peer opens a NEW stream to us, it means their old session died
+    // (e.g., they reloaded their plugin). We must close our old session and accept the new one.
     const existingSession = this.sessions.get(peer.nodeId);
     if (existingSession) {
       const state = existingSession.getState();
-      // Don't interrupt a live session for a new stream - the peer should use the existing one
-      if (state === "live") {
-        this.logger.debug("Already in live session, ignoring new stream");
-        return;
+
+      // Handle the case where both sides try to initiate simultaneously
+      // Use deterministic tie-breaking: lower node ID wins (becomes initiator)
+      if (state === "exchanging_versions") {
+        const ourNodeId = this.transport.getNodeId();
+        const weAreInitiator = ourNodeId < peer.nodeId;
+
+        if (weAreInitiator) {
+          // We have lower node ID - we should be initiator
+          // Ignore incoming stream, peer should accept our stream instead
+          this.logger.debug(
+            `Ignoring incoming stream - we are initiator (our ID < peer ID), peer should accept our stream`
+          );
+          return;
+        } else {
+          // Peer has lower node ID - they should be initiator
+          // Close our initiator session and become acceptor
+          this.logger.debug(
+            `Abandoning our initiator session - peer has lower node ID, becoming acceptor`
+          );
+        }
+      } else {
+        // Peer is reconnecting - their old session died, ours is stale
+        this.logger.debug(
+          `Peer reconnecting - closing existing session (state: ${state}) to accept new stream`
+        );
       }
-      // Close non-live sessions (error, syncing, etc.) to accept reconnection
-      this.logger.debug(`Closing existing session (state: ${state}) to accept incoming stream`);
+
+      // Close the existing session to accept the new incoming stream
       try {
         await Promise.race([
           existingSession.close(),
@@ -1056,15 +1328,24 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   ): Promise<void> {
     // Process all pending streams without blocking
     // We check the count first to avoid adding orphaned pendingAccepts entries
+    const initialCount = connection.getPendingStreamCount();
+    this.logger.debug(`[processPendingStreams ${peer.nodeId.slice(0, 8)}] Starting with ${initialCount} pending streams`);
+
+    let processed = 0;
     while (connection.getPendingStreamCount() > 0) {
       try {
+        this.logger.debug(`[processPendingStreams ${peer.nodeId.slice(0, 8)}] Accepting stream ${processed + 1}...`);
         const stream = await connection.acceptStream();
+        this.logger.debug(`[processPendingStreams ${peer.nodeId.slice(0, 8)}] Got stream ${stream.id}, handling...`);
         await this.handleIncomingStream(stream, connection, peer);
+        processed++;
+        this.logger.debug(`[processPendingStreams ${peer.nodeId.slice(0, 8)}] Stream ${stream.id} handled`);
       } catch (err) {
-        this.logger.warn("Error processing pending stream:", err);
+        this.logger.warn(`[processPendingStreams ${peer.nodeId.slice(0, 8)}] Error processing pending stream:`, err);
         break;
       }
     }
+    this.logger.debug(`[processPendingStreams ${peer.nodeId.slice(0, 8)}] Done, processed ${processed} streams`);
   }
 
   private handleSyncError(nodeId: string, isCleanDisconnect = false): void {
@@ -1135,19 +1416,27 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   // Private: Auto Sync
   // ===========================================================================
 
-  private startAutoSync(): void {
-    // Sync after a short delay on startup to allow incoming connections to arrive first
+  /**
+   * Start initial sync after a short delay.
+   * This always runs on startup to reconnect to stored peers.
+   */
+  private startInitialSync(): void {
     this.initialSyncTimeout = setTimeout(() => {
       this.initialSyncTimeout = null; // Clear reference after firing
       this.syncAll().catch((err) => {
-        this.logger.error("Initial auto sync failed:", err);
+        this.logger.error("Initial sync failed:", err);
       });
-    }, 500); // Reduced from 3000 for faster initial sync
+    }, 500); // Short delay to allow incoming connections to arrive first
+  }
 
-    // Then sync periodically
+  /**
+   * Start periodic sync timer.
+   * Only runs if autoSyncInterval > 0.
+   */
+  private startPeriodicSync(): void {
     this.autoSyncTimer = setInterval(() => {
       this.syncAll().catch((err) => {
-        this.logger.error("Auto sync failed:", err);
+        this.logger.error("Periodic sync failed:", err);
       });
       // Periodically clean up stale entries to prevent memory leaks
       this.cleanupStaleEntries();
@@ -1329,6 +1618,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
             lastSeen: sp.lastSeen,
             trusted: sp.trusted,
             groupIds: sp.groupIds,
+            bandwidth: sp.bandwidth,
           });
         }
         this.logger.debug(`Loaded ${this.peers.size} stored peers`);
@@ -1350,6 +1640,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
         lastSeen: p.lastSeen,
         trusted: p.trusted,
         groupIds: p.groupIds,
+        bandwidth: p.bandwidth,
       }),
     );
 

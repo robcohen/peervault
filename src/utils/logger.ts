@@ -33,13 +33,40 @@ export interface LogEntry {
   level: LogLevel;
   prefix: string;
   message: string;
+  /** Structured event name (e.g., "sync.started", "peer.connected") */
+  event?: string;
+  /** Structured metadata */
+  data?: Record<string, unknown>;
 }
+
+/** Structured log event for machine-parseable logs */
+export interface StructuredLogEvent {
+  event: string;
+  data?: Record<string, unknown>;
+}
+
+/** Log level priority for filtering */
+const LOG_LEVEL_PRIORITY: Record<LogLevel, number> = {
+  debug: 0,
+  info: 1,
+  warn: 2,
+  error: 3,
+};
+
+/** Minimum log level for console output (default: info) */
+let minLogLevel: LogLevel = "info";
 
 /** Global log buffer for "Copy Logs" feature */
 const LOG_BUFFER: LogEntry[] = [];
 const MAX_LOG_ENTRIES = 500;
 
-function addToBuffer(level: LogLevel, prefix: string, args: unknown[]): void {
+function addToBuffer(
+  level: LogLevel,
+  prefix: string,
+  args: unknown[],
+  event?: string,
+  data?: Record<string, unknown>,
+): void {
   const message = args.map(arg => {
     let str: string;
     if (arg instanceof Error) {
@@ -53,12 +80,53 @@ function addToBuffer(level: LogLevel, prefix: string, args: unknown[]): void {
     return redactSensitive(str);
   }).join(" ");
 
-  LOG_BUFFER.push({ timestamp: Date.now(), level, prefix, message });
+  // Redact sensitive data from structured data
+  const redactedData = data ? redactDataObject(data) : undefined;
+
+  LOG_BUFFER.push({ timestamp: Date.now(), level, prefix, message, event, data: redactedData });
 
   // Trim buffer if too large
   if (LOG_BUFFER.length > MAX_LOG_ENTRIES) {
     LOG_BUFFER.splice(0, LOG_BUFFER.length - MAX_LOG_ENTRIES);
   }
+}
+
+/**
+ * Redact sensitive data from an object.
+ */
+function redactDataObject(data: Record<string, unknown>): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(data)) {
+    if (typeof value === "string") {
+      result[key] = redactSensitive(value);
+    } else if (typeof value === "object" && value !== null) {
+      result[key] = redactDataObject(value as Record<string, unknown>);
+    } else {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+
+/**
+ * Check if a log level should be output based on minimum level.
+ */
+function shouldLog(level: LogLevel): boolean {
+  return LOG_LEVEL_PRIORITY[level] >= LOG_LEVEL_PRIORITY[minLogLevel];
+}
+
+/**
+ * Set the minimum log level for console output.
+ */
+export function setMinLogLevel(level: LogLevel): void {
+  minLogLevel = level;
+}
+
+/**
+ * Get the current minimum log level.
+ */
+export function getMinLogLevel(): LogLevel {
+  return minLogLevel;
 }
 
 /** Get all buffered logs as a string */
@@ -81,6 +149,33 @@ export function getRecentLogs(count = 100): string {
     const time = new Date(entry.timestamp).toISOString().slice(11, 23);
     return `${time} [${entry.level.toUpperCase().padEnd(5)}] ${entry.prefix} ${entry.message}`;
   }).join("\n");
+}
+
+/** Get logs as JSON array for machine parsing */
+export function getLogsAsJson(count?: number): LogEntry[] {
+  const logs = count ? LOG_BUFFER.slice(-count) : [...LOG_BUFFER];
+  return logs;
+}
+
+/** Get only structured events (logs with event names) */
+export function getStructuredEvents(count?: number): LogEntry[] {
+  const logs = LOG_BUFFER.filter(entry => entry.event);
+  return count ? logs.slice(-count) : logs;
+}
+
+/** Export logs as NDJSON (newline-delimited JSON) for log aggregation */
+export function exportLogsAsNdjson(count?: number): string {
+  const logs = count ? LOG_BUFFER.slice(-count) : LOG_BUFFER;
+  return logs.map(entry => JSON.stringify(entry)).join("\n");
+}
+
+/** Filter logs by level */
+export function getLogsByLevel(level: LogLevel, count?: number): LogEntry[] {
+  const minPriority = LOG_LEVEL_PRIORITY[level];
+  const filtered = LOG_BUFFER.filter(
+    entry => LOG_LEVEL_PRIORITY[entry.level] >= minPriority,
+  );
+  return count ? filtered.slice(-count) : filtered;
 }
 
 export class Logger {
@@ -108,7 +203,7 @@ export class Logger {
    */
   debug(...args: unknown[]): void {
     addToBuffer("debug", this.prefix, args);
-    if (this.isDebugEnabled()) {
+    if (this.isDebugEnabled() && shouldLog("debug")) {
       console.debug(this.prefix, ...args);
     }
   }
@@ -118,7 +213,9 @@ export class Logger {
    */
   info(...args: unknown[]): void {
     addToBuffer("info", this.prefix, args);
-    console.info(this.prefix, ...args);
+    if (shouldLog("info")) {
+      console.info(this.prefix, ...args);
+    }
   }
 
   /**
@@ -126,7 +223,9 @@ export class Logger {
    */
   warn(...args: unknown[]): void {
     addToBuffer("warn", this.prefix, args);
-    console.warn(this.prefix, ...args);
+    if (shouldLog("warn")) {
+      console.warn(this.prefix, ...args);
+    }
   }
 
   /**
@@ -134,7 +233,46 @@ export class Logger {
    */
   error(...args: unknown[]): void {
     addToBuffer("error", this.prefix, args);
-    console.error(this.prefix, ...args);
+    if (shouldLog("error")) {
+      console.error(this.prefix, ...args);
+    }
+  }
+
+  /**
+   * Log a structured event with optional data.
+   * Useful for machine-parseable logs and analytics.
+   *
+   * @param level Log level
+   * @param event Event name (e.g., "sync.started", "peer.connected")
+   * @param data Optional structured data
+   * @param message Optional human-readable message
+   */
+  event(
+    level: LogLevel,
+    event: string,
+    data?: Record<string, unknown>,
+    message?: string,
+  ): void {
+    const displayMessage = message || event;
+    const args: unknown[] = [displayMessage];
+    if (data) {
+      args.push(data);
+    }
+    addToBuffer(level, this.prefix, args, event, data);
+
+    // Only output to console if level is enabled
+    const shouldOutput = level === "debug"
+      ? this.isDebugEnabled() && shouldLog(level)
+      : shouldLog(level);
+
+    if (shouldOutput) {
+      const consoleMethod = console[level] || console.log;
+      if (data) {
+        consoleMethod(this.prefix, displayMessage, data);
+      } else {
+        consoleMethod(this.prefix, displayMessage);
+      }
+    }
   }
 
   /**

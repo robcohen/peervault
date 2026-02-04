@@ -93,6 +93,41 @@ export class BlobStore {
   }
 
   /**
+   * Add a blob with hash verification.
+   * Verifies the content hash matches the expected hash before storing.
+   * @returns true if hash matches and blob was stored, false if hash mismatch
+   * @throws Error if content exceeds max blob size
+   */
+  async verifyAndAdd(
+    content: Uint8Array,
+    expectedHash: string,
+    mimeType: string = "application/octet-stream",
+  ): Promise<boolean> {
+    // Compute the actual hash
+    const actualHash = await this.computeHash(content);
+
+    // Verify hash matches
+    if (actualHash !== expectedHash) {
+      this.logger.warn(
+        `Blob integrity check failed: expected ${expectedHash.slice(0, 8)}, got ${actualHash.slice(0, 8)}`,
+      );
+      return false;
+    }
+
+    // Store the blob (will use the computed hash)
+    await this.add(content, mimeType);
+    return true;
+  }
+
+  /**
+   * Compute SHA-256 hash of content.
+   * Public method for hash verification.
+   */
+  async computeHash(content: Uint8Array): Promise<string> {
+    return this.hashContent(content);
+  }
+
+  /**
    * Get the maximum allowed blob size.
    */
   getMaxBlobSize(): number {

@@ -13,6 +13,41 @@ export type PeerState =
   | "offline"
   | "error";
 
+/** Bandwidth statistics for a peer */
+export interface PeerBandwidthStats {
+  /** Total bytes sent to this peer */
+  bytesSent: number;
+  /** Total bytes received from this peer */
+  bytesReceived: number;
+  /** Bytes sent in the last sync session */
+  lastSessionBytesSent: number;
+  /** Bytes received in the last sync session */
+  lastSessionBytesReceived: number;
+  /** Timestamp of last stats update */
+  lastUpdated: number;
+}
+
+/** Connection quality level */
+export type ConnectionQuality = "excellent" | "good" | "fair" | "poor" | "disconnected";
+
+/** Connection health metrics for a peer */
+export interface ConnectionHealth {
+  /** Current quality assessment */
+  quality: ConnectionQuality;
+  /** Average RTT in ms (rolling average) */
+  avgRttMs: number;
+  /** RTT jitter in ms (standard deviation) */
+  jitterMs: number;
+  /** Number of consecutive ping failures */
+  failedPings: number;
+  /** Total successful pings */
+  successfulPings: number;
+  /** Last successful ping timestamp */
+  lastPingAt?: number;
+  /** RTT history (last N samples) */
+  rttHistory: number[];
+}
+
 /** Information about a known peer */
 export interface PeerInfo {
   /** Peer's node ID */
@@ -44,6 +79,12 @@ export interface PeerInfo {
 
   /** Groups this peer belongs to */
   groupIds?: string[];
+
+  /** Bandwidth usage statistics */
+  bandwidth?: PeerBandwidthStats;
+
+  /** Connection health metrics */
+  health?: ConnectionHealth;
 }
 
 /** Serialized peer info for storage */
@@ -57,6 +98,8 @@ export interface StoredPeerInfo {
   lastSeen?: number;
   trusted: boolean;
   groupIds?: string[];
+  /** Bandwidth usage statistics (persisted for cumulative totals) */
+  bandwidth?: PeerBandwidthStats;
 }
 
 /** Incoming pairing request from unknown peer */
@@ -78,6 +121,7 @@ export interface PeerManagerEvents {
   "peer:pairing-request": PairingRequest;
   "peer:pairing-accepted": string; // nodeId
   "peer:pairing-denied": string; // nodeId
+  "peer:health-change": { nodeId: string; quality: ConnectionQuality; previousQuality: ConnectionQuality };
   "status:change": "idle" | "syncing" | "offline" | "error";
 }
 

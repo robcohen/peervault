@@ -136,6 +136,61 @@ export class PeerVaultStatusModal extends Modal {
     filesRow.createSpan({ text: "Files tracked:", cls: "peervault-label" });
     const fileCount = this.plugin.documentManager?.listAllPaths().length ?? 0;
     filesRow.createSpan({ text: String(fileCount), cls: "peervault-value" });
+
+    // Show sync progress when syncing
+    if (status === "syncing") {
+      this.renderSyncProgress(statusEl);
+    }
+  }
+
+  private renderSyncProgress(container: HTMLElement): void {
+    const progress = this.plugin.peerManager?.getSyncProgress();
+    if (!progress) return;
+
+    const progressEl = container.createDiv({ cls: "peervault-sync-progress" });
+    progressEl.createEl("h4", { text: "Sync Progress" });
+
+    const progressGrid = progressEl.createDiv({ cls: "peervault-status-grid" });
+
+    // Active sessions
+    const sessionsRow = progressGrid.createDiv({ cls: "peervault-status-row" });
+    sessionsRow.createSpan({ text: "Active syncs:", cls: "peervault-label" });
+    sessionsRow.createSpan({ text: String(progress.activeSessions), cls: "peervault-value" });
+
+    // Blobs sending
+    if (progress.totalBlobsToSend > 0) {
+      const sendRow = progressGrid.createDiv({ cls: "peervault-status-row" });
+      sendRow.createSpan({ text: "Sending:", cls: "peervault-label" });
+      sendRow.createSpan({
+        text: `${progress.totalBlobsSent} / ${progress.totalBlobsToSend} blobs`,
+        cls: "peervault-value",
+      });
+    }
+
+    // Blobs receiving
+    if (progress.totalBlobsToReceive > 0) {
+      const receiveRow = progressGrid.createDiv({ cls: "peervault-status-row" });
+      receiveRow.createSpan({ text: "Receiving:", cls: "peervault-label" });
+      receiveRow.createSpan({
+        text: `${progress.totalBlobsReceived} / ${progress.totalBlobsToReceive} blobs`,
+        cls: "peervault-value",
+      });
+    }
+
+    // Bytes transferred
+    const bytesRow = progressGrid.createDiv({ cls: "peervault-status-row" });
+    bytesRow.createSpan({ text: "Transferred:", cls: "peervault-label" });
+    bytesRow.createSpan({
+      text: `↑ ${this.formatBytes(progress.totalBytesSent)} / ↓ ${this.formatBytes(progress.totalBytesReceived)}`,
+      cls: "peervault-value",
+    });
+  }
+
+  private formatBytes(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
   }
 
   private renderPeers(container: HTMLElement): void {

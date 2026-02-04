@@ -117,17 +117,18 @@ bump:
     set -euo pipefail
     # Get current version and bump patch
     CURRENT=$(jq -r '.version' manifest.json)
+    MIN_APP_VERSION=$(jq -r '.minAppVersion' manifest.json)
     MAJOR=$(echo "$CURRENT" | cut -d. -f1)
     MINOR=$(echo "$CURRENT" | cut -d. -f2)
     PATCH=$(echo "$CURRENT" | cut -d. -f3)
     NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
-    echo "Bumping version: $CURRENT -> $NEW_VERSION"
+    echo "Bumping version: $CURRENT -> $NEW_VERSION (minAppVersion: $MIN_APP_VERSION)"
 
     # Update manifest.json
     jq ".version = \"$NEW_VERSION\"" manifest.json > manifest.json.tmp && mv manifest.json.tmp manifest.json
 
-    # Update versions.json
-    jq ". + {\"$NEW_VERSION\": \"1.4.0\"}" versions.json > versions.json.tmp && mv versions.json.tmp versions.json
+    # Update versions.json (reads minAppVersion from manifest.json)
+    jq ". + {\"$NEW_VERSION\": \"$MIN_APP_VERSION\"}" versions.json > versions.json.tmp && mv versions.json.tmp versions.json
 
     # Build
     bun run build
@@ -135,8 +136,52 @@ bump:
     # Create tarball
     tar -czvf "peervault-$NEW_VERSION.tar.gz" -C dist main.js manifest.json styles.css
 
+    echo ""
     echo "Ready for release v$NEW_VERSION"
-    echo "Run: gh release create v$NEW_VERSION peervault-$NEW_VERSION.tar.gz dist/main.js dist/manifest.json dist/styles.css --title \"v$NEW_VERSION\" --generate-notes"
+    echo "To publish, run:"
+    echo "  git add manifest.json versions.json && git commit -m 'Release v$NEW_VERSION'"
+    echo "  git tag v$NEW_VERSION && git push && git push --tags"
+    echo "  gh release create v$NEW_VERSION peervault-$NEW_VERSION.tar.gz dist/main.js dist/manifest.json dist/styles.css --title 'v$NEW_VERSION' --generate-notes"
+
+# Create a full release (bump, commit, tag, push, create GitHub release)
+release-full:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    # Check for uncommitted changes
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+        echo "Error: Uncommitted changes detected. Commit or stash them first."
+        exit 1
+    fi
+
+    # Run bump
+    just bump
+
+    # Get the new version
+    NEW_VERSION=$(jq -r '.version' manifest.json)
+
+    # Commit and tag
+    git add manifest.json versions.json
+    git commit -m "Release v$NEW_VERSION"
+    git tag "v$NEW_VERSION"
+
+    # Push
+    git push && git push --tags
+
+    # Create GitHub release
+    gh release create "v$NEW_VERSION" \
+        "peervault-$NEW_VERSION.tar.gz" \
+        dist/main.js \
+        dist/manifest.json \
+        dist/styles.css \
+        --title "v$NEW_VERSION" \
+        --generate-notes
+
+    echo ""
+    echo "Released v$NEW_VERSION!"
+
+    # Clean up tarball
+    rm -f "peervault-$NEW_VERSION.tar.gz"
 
 # Copy plugin to Obsidian vault for testing (set OBSIDIAN_VAULT env var)
 deploy:

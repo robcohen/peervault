@@ -24,7 +24,6 @@ export default [
       const fileCount = 20;
       const files: Array<{ path: string; content: string }> = [];
 
-      // Create files rapidly
       for (let i = 0; i < fileCount; i++) {
         const path = `bulk/rapid-${i.toString().padStart(2, "0")}.md`;
         const content = `# Rapid File ${i}\n\nCreated in bulk test.`;
@@ -35,7 +34,7 @@ export default [
 
       // Wait for last file to sync
       await ctx.test2.sync.waitForFile(files[files.length - 1].path, {
-        timeoutMs: 60000,
+        timeoutMs: 30000,
       });
 
       // Verify all files exist
@@ -49,14 +48,12 @@ export default [
   {
     name: "Sync standard test fixture set",
     async fn(ctx: TestContext) {
-      // Load standard fixtures into TEST2
       const fixtures = createStandardTestSet();
       const count = await loadInlineFixtures(ctx.test2.vault, fixtures);
       console.log(`  Loaded ${count} fixtures into TEST2`);
 
-      // Wait for all to sync to TEST
       for (const fixture of fixtures) {
-        await ctx.test.sync.waitForFile(fixture.path, { timeoutMs: 60000 });
+        await ctx.test.sync.waitForFile(fixture.path, { timeoutMs: 30000 });
       }
       console.log(`  All fixtures synced to TEST`);
     },
@@ -65,12 +62,10 @@ export default [
   {
     name: "Sync files from fixtures/text directory",
     async fn(ctx: TestContext) {
-      // Load text fixtures
       const count = await loadFixturesByName(ctx.test.vault, "text");
       console.log(`  Loaded ${count} text fixtures into TEST`);
 
-      // Wait for sync by checking for a specific file
-      await ctx.test2.sync.waitForFile("simple.md", { timeoutMs: 30000 });
+      await ctx.test2.sync.waitForFile("simple.md");
       console.log("  Text fixtures synced");
     },
   },
@@ -78,7 +73,6 @@ export default [
   {
     name: "Sync deeply nested folder structure",
     async fn(ctx: TestContext) {
-      // Create deep nesting
       let path = "";
       const depth = 8;
 
@@ -91,8 +85,7 @@ export default [
       }
       console.log(`  Created ${depth}-level deep structure`);
 
-      // Wait for deepest file
-      await ctx.test2.sync.waitForFile(`${path}/file.md`, { timeoutMs: 60000 });
+      await ctx.test2.sync.waitForFile(`${path}/file.md`, { timeoutMs: 30000 });
       console.log("  Deep structure synced");
     },
   },
@@ -100,14 +93,10 @@ export default [
   {
     name: "Bulk delete syncs correctly",
     async fn(ctx: TestContext) {
-      // Delete the bulk folder we created earlier
       await ctx.test.vault.deleteFolder("bulk");
       console.log("  Deleted bulk folder from TEST");
 
-      // Wait for deletion
-      await ctx.test2.sync.waitForFileDeletion("bulk/rapid-00.md", {
-        timeoutMs: 30000,
-      });
+      await ctx.test2.sync.waitForFileDeletion("bulk/rapid-00.md");
       console.log("  Bulk deletion synced");
     },
   },
@@ -115,7 +104,7 @@ export default [
   {
     name: "CRDT file lists match after bulk operations",
     async fn(ctx: TestContext) {
-      await ctx.waitForFileListMatch(60000);
+      await ctx.waitForFileListMatch(30000);
       console.log("  CRDT file lists match");
     },
   },
@@ -123,7 +112,7 @@ export default [
   {
     name: "CRDT versions converge after bulk operations",
     async fn(ctx: TestContext) {
-      await ctx.waitForConvergence(60000);
+      await ctx.waitForConvergence();
       console.log("  CRDT versions converged");
     },
   },

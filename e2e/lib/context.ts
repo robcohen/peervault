@@ -127,6 +127,15 @@ export async function createTestContext(): Promise<TestContext> {
   const testContext = createVaultContext(testPage, testClient);
   const test2Context = createVaultContext(test2Page, test2Client);
 
+  // Enable auto-accept for vault adoption requests on both vaults
+  // This handles the "Join Sync Network?" modal that appears on first pairing
+  console.log("Enabling auto-accept for vault adoption...");
+  await Promise.all([
+    testContext.plugin.enableAutoAcceptVaultAdoption(),
+    test2Context.plugin.enableAutoAcceptVaultAdoption(),
+  ]);
+  console.log("Auto-accept enabled on both vaults");
+
   // Create full context
   const context: TestContext = {
     test: testContext,

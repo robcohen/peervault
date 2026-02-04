@@ -14,14 +14,39 @@ import {
 
 export default [
   {
+    name: "Check sync prerequisites",
+    async fn(ctx: TestContext) {
+      // Check current session state - don't try to force sync as it may deadlock
+      const sessions1 = await ctx.test.plugin.getActiveSessions();
+      const sessions2 = await ctx.test2.plugin.getActiveSessions();
+
+      console.log(`  TEST sessions: ${JSON.stringify(sessions1)}`);
+      console.log(`  TEST2 sessions: ${JSON.stringify(sessions2)}`);
+
+      const hasLive1 = sessions1.some(s => s.state === "live");
+      const hasLive2 = sessions2.some(s => s.state === "live");
+
+      if (hasLive1 || hasLive2) {
+        console.log("  Sync sessions active - conflict tests can run");
+      } else {
+        // Sessions aren't live - this is a known issue with the sync protocol
+        // Skip with a clear message rather than timing out
+        console.log("  WARNING: No live sessions available");
+        console.log("  Sync may be stuck - run full E2E suite from 00-setup to establish sync");
+        // Don't assert - let subsequent tests fail with clear errors
+      }
+    },
+  },
+
+  {
     name: "Concurrent edits to same file are merged",
     async fn(ctx: TestContext) {
       const path = "concurrent-edit.md";
       const initialContent = "# Concurrent Edit Test\n\nInitial content.";
 
-      // Create initial file and sync
-      await ctx.test.vault.createFile(path, initialContent);
-      await ctx.test2.sync.waitForFile(path, { timeoutMs: 30000 });
+      // Create initial file (overwrite if exists from previous run)
+      await ctx.test.vault.createFile(path, initialContent, true);
+      await ctx.test2.sync.waitForFile(path);
       console.log("  Initial file synced");
 
       // Make concurrent edits on both vaults
@@ -36,8 +61,8 @@ export default [
       console.log("  Made concurrent edits");
 
       // Wait for sync to settle
-      await new Promise((r) => setTimeout(r, 5000));
-      await ctx.waitForConvergence(30000);
+      await new Promise((r) => setTimeout(r, 3000));
+      await ctx.waitForConvergence();
 
       // Read final content from both
       const [final1, final2] = await Promise.all([
@@ -61,9 +86,9 @@ export default [
       const path = "concurrent-append.md";
       const initial = "# Append Test\n\n- Item 1\n";
 
-      // Create and sync
-      await ctx.test.vault.createFile(path, initial);
-      await ctx.test2.sync.waitForFile(path, { timeoutMs: 30000 });
+      // Create and sync (overwrite if exists)
+      await ctx.test.vault.createFile(path, initial, true);
+      await ctx.test2.sync.waitForFile(path);
 
       // Append different content on each vault
       const testAppend = initial + "- Item from TEST\n";
@@ -75,8 +100,8 @@ export default [
       ]);
 
       // Wait for sync
-      await new Promise((r) => setTimeout(r, 5000));
-      await ctx.waitForConvergence(30000);
+      await new Promise((r) => setTimeout(r, 3000));
+      await ctx.waitForConvergence();
 
       // Both appends should be present (in some order)
       const [final1, final2] = await Promise.all([
@@ -98,9 +123,9 @@ export default [
     async fn(ctx: TestContext) {
       const path = "edit-delete-conflict.md";
 
-      // Create and sync
-      await ctx.test.vault.createFile(path, "Original content");
-      await ctx.test2.sync.waitForFile(path, { timeoutMs: 30000 });
+      // Create and sync (overwrite if exists)
+      await ctx.test.vault.createFile(path, "Original content", true);
+      await ctx.test2.sync.waitForFile(path);
 
       // Edit on TEST, delete on TEST2 simultaneously
       await Promise.all([
@@ -109,8 +134,8 @@ export default [
       ]);
 
       // Wait for sync
-      await new Promise((r) => setTimeout(r, 5000));
-      await ctx.waitForConvergence(30000);
+      await new Promise((r) => setTimeout(r, 3000));
+      await ctx.waitForConvergence();
 
       // Check final state - with CRDT, delete typically wins
       const [exists1, exists2] = await Promise.all([
@@ -133,6 +158,15 @@ export default [
     async fn(ctx: TestContext) {
       const path = "same-name-create.md";
 
+      // Delete first if exists from previous run
+      try {
+        await ctx.test.vault.deleteFile(path);
+      } catch { /* ignore if not exists */ }
+      try {
+        await ctx.test2.vault.deleteFile(path);
+      } catch { /* ignore if not exists */ }
+      await new Promise((r) => setTimeout(r, 500));
+
       // Create same file on both vaults simultaneously
       await Promise.all([
         ctx.test.vault.createFile(path, "Created in TEST"),
@@ -140,8 +174,8 @@ export default [
       ]);
 
       // Wait for sync
-      await new Promise((r) => setTimeout(r, 5000));
-      await ctx.waitForConvergence(30000);
+      await new Promise((r) => setTimeout(r, 3000));
+      await ctx.waitForConvergence();
 
       // Read from both
       const [content1, content2] = await Promise.all([
@@ -167,9 +201,16 @@ export default [
       const newName1 = "rename-conflict-test.md";
       const newName2 = "rename-conflict-test2.md";
 
+      // Clean up any existing files from previous runs
+      for (const p of [original, newName1, newName2]) {
+        try { await ctx.test.vault.deleteFile(p); } catch { /* ignore */ }
+        try { await ctx.test2.vault.deleteFile(p); } catch { /* ignore */ }
+      }
+      await new Promise((r) => setTimeout(r, 500));
+
       // Create and sync
       await ctx.test.vault.createFile(original, "Content for rename conflict");
-      await ctx.test2.sync.waitForFile(original, { timeoutMs: 30000 });
+      await ctx.test2.sync.waitForFile(original);
 
       // Rename to different names simultaneously
       await Promise.all([
@@ -178,8 +219,8 @@ export default [
       ]);
 
       // Wait for sync
-      await new Promise((r) => setTimeout(r, 5000));
-      await ctx.waitForConvergence(30000);
+      await new Promise((r) => setTimeout(r, 3000));
+      await ctx.waitForConvergence();
 
       // Check what files exist
       const [exists1, exists2, existsOrig1, existsOrig2] = await Promise.all([

@@ -43,6 +43,7 @@ import { PeerManager } from "./peer";
 import { MigrationRunner, MIGRATIONS } from "./core/migration";
 import { GarbageCollector } from "./core/gc";
 import { ConfigErrors } from "./errors";
+import { protocolTracer } from "./utils/protocol-tracer";
 
 export default class PeerVaultPlugin extends Plugin {
   settings!: PeerVaultSettings;
@@ -76,6 +77,19 @@ export default class PeerVaultPlugin extends Plugin {
 
     // Load settings
     await this.loadSettings();
+
+    // Initialize protocol tracer
+    protocolTracer.initialize(this.app);
+    protocolTracer.setEnabled(this.settings.enableProtocolTracing);
+    protocolTracer.setLevel(this.settings.protocolTraceLevel);
+    // Expose for E2E tests
+    (window as unknown as { __protocolTracer: typeof protocolTracer }).__protocolTracer = protocolTracer;
+
+    // Debug: log trace to verify tracer is working
+    protocolTracer.trace("", "", "plugin", "initialized", {
+      tracingEnabled: this.settings.enableProtocolTracing,
+      eventCount: (protocolTracer as unknown as { events: unknown[] }).events?.length,
+    });
 
     // Initialize storage adapter
     this.storage = new ObsidianStorageAdapter(this);

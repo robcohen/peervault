@@ -4,10 +4,11 @@
 //! Exposes Iroh's Endpoint, Connection, and Stream to JavaScript.
 
 use iroh::{Endpoint, EndpointAddr, RelayMap, RelayMode, RelayUrl, SecretKey};
-use js_sys::{Array, Uint8Array};
+use js_sys::{Array, Promise, Uint8Array};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::future_to_promise;
 
 /// Protocol identifier for PeerVault sync
 const PEERVAULT_ALPN: &[u8] = b"peervault/sync/1";
@@ -197,34 +198,40 @@ impl WasmConnection {
     }
 
     /// Open a new bidirectional stream.
+    /// Returns a Promise to avoid holding a borrow of self during the async operation.
     #[wasm_bindgen(js_name = openStream)]
-    pub async fn open_stream(&self) -> Result<WasmStream, JsValue> {
-        // Clone the connection to avoid holding any lock during the async operation
+    pub fn open_stream(&self) -> Promise {
+        // Clone the connection immediately so we don't hold a borrow of self
         let conn = self.connection.clone();
-        let (send, recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| JsValue::from_str(&format!("Stream open failed: {}", e)))?;
+        future_to_promise(async move {
+            let (send, recv) = conn
+                .open_bi()
+                .await
+                .map_err(|e| JsValue::from_str(&format!("Stream open failed: {}", e)))?;
 
-        Ok(WasmStream {
-            send: Arc::new(Mutex::new(send)),
-            recv: Arc::new(Mutex::new(recv)),
+            Ok(JsValue::from(WasmStream {
+                send: Arc::new(Mutex::new(send)),
+                recv: Arc::new(Mutex::new(recv)),
+            }))
         })
     }
 
     /// Accept an incoming stream.
+    /// Returns a Promise to avoid holding a borrow of self during the async operation.
     #[wasm_bindgen(js_name = acceptStream)]
-    pub async fn accept_stream(&self) -> Result<WasmStream, JsValue> {
-        // Clone the connection to avoid holding any lock during the async operation
+    pub fn accept_stream(&self) -> Promise {
+        // Clone the connection immediately so we don't hold a borrow of self
         let conn = self.connection.clone();
-        let (send, recv) = conn
-            .accept_bi()
-            .await
-            .map_err(|e| JsValue::from_str(&format!("Stream accept failed: {}", e)))?;
+        future_to_promise(async move {
+            let (send, recv) = conn
+                .accept_bi()
+                .await
+                .map_err(|e| JsValue::from_str(&format!("Stream accept failed: {}", e)))?;
 
-        Ok(WasmStream {
-            send: Arc::new(Mutex::new(send)),
-            recv: Arc::new(Mutex::new(recv)),
+            Ok(JsValue::from(WasmStream {
+                send: Arc::new(Mutex::new(send)),
+                recv: Arc::new(Mutex::new(recv)),
+            }))
         })
     }
 

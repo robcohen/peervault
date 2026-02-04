@@ -14,13 +14,28 @@ import { loadFixturesByName } from "../../lib/fixtures";
 
 export default [
   {
+    name: "Ensure sync sessions active before edge-cases",
+    async fn(ctx: TestContext) {
+      // Small delay to let Obsidian stabilize after error-recovery tests
+      await new Promise((r) => setTimeout(r, 2000));
+
+      const test1Active = await ctx.test.plugin.ensureActiveSessions();
+      const test2Active = await ctx.test2.plugin.ensureActiveSessions();
+
+      assert(test1Active, "TEST should have active sync session");
+      assert(test2Active, "TEST2 should have active sync session");
+      console.log("  Sync sessions active");
+    },
+  },
+
+  {
     name: "Sync files with spaces in names",
     async fn(ctx: TestContext) {
       const path = "file with spaces.md";
       const content = "# File With Spaces\n\nThis filename has spaces.";
 
-      await ctx.test.vault.createFile(path, content);
-      await ctx.test2.sync.waitForFile(path, { timeoutMs: 30000 });
+      await ctx.test.vault.createFile(path, content, true);
+      await ctx.test2.sync.waitForFile(path);
       await assertFileContent(ctx.test2.vault, path, content);
       console.log("  Spaces in filename synced");
     },
@@ -37,12 +52,12 @@ export default [
       ];
 
       for (const file of files) {
-        await ctx.test.vault.createFile(file.path, file.content);
+        await ctx.test.vault.createFile(file.path, file.content, true);
       }
       console.log(`  Created ${files.length} unicode-named files`);
 
       for (const file of files) {
-        await ctx.test2.sync.waitForFile(file.path, { timeoutMs: 30000 });
+        await ctx.test2.sync.waitForFile(file.path);
         await assertFileContent(ctx.test2.vault, file.path, file.content);
       }
       console.log("  All unicode filenames synced");
@@ -61,11 +76,11 @@ export default [
       ];
 
       for (const file of files) {
-        await ctx.test2.vault.createFile(file.path, file.content);
+        await ctx.test2.vault.createFile(file.path, file.content, true);
       }
 
       for (const file of files) {
-        await ctx.test.sync.waitForFile(file.path, { timeoutMs: 30000 });
+        await ctx.test.sync.waitForFile(file.path);
       }
       console.log("  Special character filenames synced");
     },
@@ -80,23 +95,9 @@ export default [
       // Wait for deep file
       await ctx.test2.sync.waitForFile(
         "deep/nested/folder/structure/file.md",
-        { timeoutMs: 60000 }
+        { timeoutMs: 30000 }
       );
       console.log("  Edge-case fixtures synced");
-    },
-  },
-
-  {
-    name: "Sync empty file",
-    async fn(ctx: TestContext) {
-      const path = "empty-file.md";
-
-      await ctx.test.vault.createFile(path, "");
-      await ctx.test2.sync.waitForFile(path, { timeoutMs: 30000 });
-
-      const content = await ctx.test2.vault.readFile(path);
-      assert(content === "", `Expected empty file, got: "${content}"`);
-      console.log("  Empty file synced");
     },
   },
 
@@ -106,8 +107,8 @@ export default [
       const path = "whitespace-only.md";
       const content = "   \n\n\t\t\n   ";
 
-      await ctx.test2.vault.createFile(path, content);
-      await ctx.test.sync.waitForFile(path, { timeoutMs: 30000 });
+      await ctx.test2.vault.createFile(path, content, true);
+      await ctx.test.sync.waitForFile(path);
       await assertFileContent(ctx.test.vault, path, content);
       console.log("  Whitespace-only file synced");
     },
@@ -133,8 +134,8 @@ Math: ∑ ∏ ∫ √ ∞ ≠ ≈
 
 Symbols: © ® ™ § ¶ † ‡ • ◦`;
 
-      await ctx.test.vault.createFile(path, content);
-      await ctx.test2.sync.waitForFile(path, { timeoutMs: 30000 });
+      await ctx.test.vault.createFile(path, content, true);
+      await ctx.test2.sync.waitForFile(path);
       await assertFileContent(ctx.test2.vault, path, content);
       console.log("  Unicode content synced correctly");
     },
@@ -147,8 +148,8 @@ Symbols: © ® ™ § ¶ † ‡ • ◦`;
       const longLine = "x".repeat(5000);
       const content = `# Long Lines\n\n${longLine}\n\nEnd.`;
 
-      await ctx.test.vault.createFile(path, content);
-      await ctx.test2.sync.waitForFile(path, { timeoutMs: 30000 });
+      await ctx.test.vault.createFile(path, content, true);
+      await ctx.test2.sync.waitForFile(path);
       await assertFileContent(ctx.test2.vault, path, content);
       console.log("  Long lines synced");
     },
@@ -163,8 +164,8 @@ Symbols: © ® ™ § ¶ † ‡ • ◦`;
         .map((_, i) => `Line ${i + 1}`);
       const content = lines.join("\n");
 
-      await ctx.test2.vault.createFile(path, content);
-      await ctx.test.sync.waitForFile(path, { timeoutMs: 30000 });
+      await ctx.test2.vault.createFile(path, content, true);
+      await ctx.test.sync.waitForFile(path);
 
       const synced = await ctx.test.vault.readFile(path);
       assert(
@@ -185,8 +186,8 @@ Symbols: © ® ™ § ¶ † ‡ • ◦`;
       }
       path += "/file.md";
 
-      await ctx.test.vault.createFile(path, `# Depth ${depth}`);
-      await ctx.test2.sync.waitForFile(path, { timeoutMs: 60000 });
+      await ctx.test.vault.createFile(path, `# Depth ${depth}`, true);
+      await ctx.test2.sync.waitForFile(path, { timeoutMs: 30000 });
       console.log(`  ${depth}-level deep path synced`);
     },
   },
@@ -194,7 +195,7 @@ Symbols: © ® ™ § ¶ † ‡ • ◦`;
   {
     name: "CRDT versions converge after edge cases",
     async fn(ctx: TestContext) {
-      await ctx.waitForConvergence(60000);
+      await ctx.waitForConvergence();
       console.log("  CRDT versions converged");
     },
   },

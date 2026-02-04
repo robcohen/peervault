@@ -9,6 +9,7 @@ import type { DocumentManager } from "../core/document-manager";
 import type { BlobStore } from "../core/blob-store";
 import type { Logger } from "../utils/logger";
 import { SyncErrors, TransportErrors } from "../errors";
+import { protocolTracer } from "../utils/protocol-tracer";
 import {
   SyncMessageType,
   SyncErrorCode,
@@ -40,6 +41,15 @@ import { EventEmitter } from "../utils/events";
 
 /** Maximum length for peer hostname/nickname to prevent abuse */
 const MAX_PEER_NAME_LENGTH = 64;
+
+/** Number of blobs to load in parallel from disk during sync */
+const BLOB_BATCH_SIZE = 8;
+
+/** Maximum retries for individual blob operations */
+const BLOB_MAX_RETRIES = 3;
+
+/** Delay between blob retry attempts (ms) */
+const BLOB_RETRY_DELAY_MS = 500;
 
 /**
  * Sanitize peer-provided string to prevent excessively long values.
@@ -104,10 +114,29 @@ const DEFAULT_CONFIG: Omit<Required<SyncSessionConfig>, "ourTicket" | "ourHostna
   allowVaultAdoption: false,
 };
 
+/** Sync progress information */
+export interface SyncProgress {
+  /** Current sync phase */
+  phase: "connecting" | "exchanging_versions" | "syncing_documents" | "syncing_blobs" | "live";
+  /** Number of blobs to send */
+  blobsToSend: number;
+  /** Number of blobs sent so far */
+  blobsSent: number;
+  /** Number of blobs to receive */
+  blobsToReceive: number;
+  /** Number of blobs received so far */
+  blobsReceived: number;
+  /** Bytes sent in this session */
+  bytesSent: number;
+  /** Bytes received in this session */
+  bytesReceived: number;
+}
+
 /** Sync session events */
 interface SyncSessionEvents extends Record<string, unknown> {
   "state:change": SyncSessionState;
   "sync:complete": void;
+  "sync:progress": SyncProgress;
   "ticket:received": string;
   "peer:info": { hostname: string; nickname?: string };
   "peer:removed": string | undefined; // reason
@@ -140,6 +169,20 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
   private readonly MAX_PENDING_BYTES = 1024 * 1024; // 1MB
   private pendingBytes = 0;
 
+  // Bandwidth tracking
+  private _bytesSent = 0;
+  private _bytesReceived = 0;
+
+  // Protocol tracing session ID
+  private traceSessionId = "";
+
+  // Progress tracking
+  private _progressPhase: SyncProgress["phase"] = "connecting";
+  private _blobsToSend = 0;
+  private _blobsSent = 0;
+  private _blobsToReceive = 0;
+  private _blobsReceived = 0;
+
   constructor(
     private peerId: string,
     private documentManager: DocumentManager,
@@ -164,6 +207,41 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
   }
 
   /**
+   * Get bandwidth statistics for this session.
+   */
+  getBandwidthStats(): { bytesSent: number; bytesReceived: number } {
+    return {
+      bytesSent: this._bytesSent,
+      bytesReceived: this._bytesReceived,
+    };
+  }
+
+  /**
+   * Get current sync progress.
+   */
+  getProgress(): SyncProgress {
+    return {
+      phase: this._progressPhase,
+      blobsToSend: this._blobsToSend,
+      blobsSent: this._blobsSent,
+      blobsToReceive: this._blobsToReceive,
+      blobsReceived: this._blobsReceived,
+      bytesSent: this._bytesSent,
+      bytesReceived: this._bytesReceived,
+    };
+  }
+
+  /**
+   * Update and emit progress.
+   */
+  private emitProgress(phase?: SyncProgress["phase"]): void {
+    if (phase) {
+      this._progressPhase = phase;
+    }
+    this.emit("sync:progress", this.getProgress());
+  }
+
+  /**
    * Start sync with the given stream.
    */
   async startSync(stream: SyncStream): Promise<void> {
@@ -176,28 +254,47 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
 
     this.stream = stream;
     this.aborted = false;
+
+    // Start protocol trace session
+    this.traceSessionId = protocolTracer.startSession(this.peerId);
+    protocolTracer.trace(this.traceSessionId, this.peerId, "sync", "session.started", {
+      role: "initiator",
+      streamId: stream.id,
+    });
+
     this.setState("exchanging_versions");
+    this.emitProgress("exchanging_versions");
 
     try {
       // Step 1: Exchange version vectors
+      this.logger.debug("[SYNC-TRACE] Starting version exchange (initiator)");
       await this.exchangeVersions();
+      this.logger.debug("[SYNC-TRACE] Version exchange complete (initiator)");
 
       if (this.aborted) return;
 
       // Step 2: Sync document updates
       this.setState("syncing");
+      this.emitProgress("syncing_documents");
+      this.logger.debug("[SYNC-TRACE] Starting document sync (initiator)");
       await this.syncUpdates();
+      this.logger.debug("[SYNC-TRACE] Document sync complete (initiator)");
 
       if (this.aborted) return;
 
       // Step 3: Sync blobs (if blob store available)
       if (this.blobStore) {
+        this.emitProgress("syncing_blobs");
+        this.logger.debug("[SYNC-TRACE] Starting blob sync (initiator)");
         await this.syncBlobs();
+        this.logger.debug("[SYNC-TRACE] Blob sync complete (initiator)");
         if (this.aborted) return;
       }
 
       // Step 4: Enter live mode
+      this.logger.debug("[SYNC-TRACE] Entering live mode (initiator)");
       this.setState("live");
+      this.emitProgress("live");
       this.startPingTimer();
       this.subscribeToLocalUpdates();
       this.startLiveLoop().catch((err) => {
@@ -208,6 +305,10 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       this.emit("sync:complete", undefined);
     } catch (error) {
       this.logger.error("Sync session error:", error);
+      protocolTracer.trace(this.traceSessionId, this.peerId, "sync", "error", {
+        message: error instanceof Error ? error.message : String(error),
+        phase: this._progressPhase,
+      });
       this.setState("error");
       this.emit("error", error as Error);
     }
@@ -223,11 +324,22 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
 
     this.stream = stream;
     this.aborted = false;
+
+    // Start protocol trace session
+    this.traceSessionId = protocolTracer.startSession(this.peerId);
+    protocolTracer.trace(this.traceSessionId, this.peerId, "sync", "session.started", {
+      role: "acceptor",
+      streamId: stream.id,
+    });
+
     this.setState("exchanging_versions");
+    this.emitProgress("exchanging_versions");
 
     try {
       // Wait for peer's version info first
+      this.logger.debug("[SYNC-TRACE] Waiting for VERSION_INFO (acceptor)");
       const peerMessage = await this.receiveMessage();
+      this.logger.debug("[SYNC-TRACE] Received message type:", peerMessage.type, "(acceptor)");
 
       if (peerMessage.type !== SyncMessageType.VERSION_INFO) {
         throw SyncErrors.protocolError(`Expected VERSION_INFO, got: ${peerMessage.type}`);
@@ -294,18 +406,26 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
 
       // Step 2: Sync document updates
       this.setState("syncing");
+      this.emitProgress("syncing_documents");
+      this.logger.debug("[SYNC-TRACE] Starting document sync (acceptor)");
       await this.syncUpdatesAsReceiver(peerVersionInfo.versionBytes);
+      this.logger.debug("[SYNC-TRACE] Document sync complete (acceptor)");
 
       if (this.aborted) return;
 
       // Step 3: Sync blobs (if blob store available)
       if (this.blobStore) {
+        this.emitProgress("syncing_blobs");
+        this.logger.debug("[SYNC-TRACE] Starting blob sync (acceptor)");
         await this.syncBlobsAsReceiver();
+        this.logger.debug("[SYNC-TRACE] Blob sync complete (acceptor)");
         if (this.aborted) return;
       }
 
       // Step 4: Enter live mode
+      this.logger.debug("[SYNC-TRACE] Entering live mode (acceptor)");
       this.setState("live");
+      this.emitProgress("live");
       this.startPingTimer();
       this.subscribeToLocalUpdates();
       this.startLiveLoop().catch((err) => {
@@ -316,6 +436,10 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       this.emit("sync:complete", undefined);
     } catch (error) {
       this.logger.error("Incoming sync session error:", error);
+      protocolTracer.trace(this.traceSessionId, this.peerId, "sync", "error", {
+        message: error instanceof Error ? error.message : String(error),
+        phase: this._progressPhase,
+      });
       this.setState("error");
       this.emit("error", error as Error);
     }
@@ -405,6 +529,9 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
    * Close the sync session.
    */
   async close(): Promise<void> {
+    // End protocol trace session
+    protocolTracer.endSession(this.traceSessionId, this.state);
+
     this.aborted = true;
     this.stopPingTimer();
     this.stopLocalUpdateSubscription();
@@ -444,8 +571,16 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
   private setState(state: SyncSessionState): void {
     if (this.state === state) return;
 
-    this.logger.debug(`Sync session ${this.peerId}: ${this.state} -> ${state}`);
+    const prevState = this.state;
+    this.logger.debug(`Sync session ${this.peerId}: ${prevState} -> ${state}`);
     this.state = state;
+
+    // Trace state change
+    protocolTracer.trace(this.traceSessionId, this.peerId, "sync", "state.changed", {
+      from: prevState,
+      to: state,
+    });
+
     this.emit("state:change", state);
   }
 
@@ -527,10 +662,13 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
    */
   private async syncUpdates(): Promise<void> {
     // Initiator: send first, then receive
+    this.logger.debug("[SYNC-TRACE] syncUpdates: sending our updates");
     await this.sendOurUpdates();
+    this.logger.debug("[SYNC-TRACE] syncUpdates: sent, now receiving");
     await this.receiveAndImportUpdates();
+    this.logger.debug("[SYNC-TRACE] syncUpdates: received, now exchanging complete");
     await this.exchangeSyncComplete(true);
-    this.logger.debug("Sync complete");
+    this.logger.debug("[SYNC-TRACE] syncUpdates: done");
   }
 
   // ===========================================================================
@@ -541,10 +679,13 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     _peerVersionBytes: Uint8Array,
   ): Promise<void> {
     // Receiver: receive first, then send
+    this.logger.debug("[SYNC-TRACE] syncUpdatesAsReceiver: receiving updates");
     await this.receiveAndImportUpdates();
+    this.logger.debug("[SYNC-TRACE] syncUpdatesAsReceiver: received, now sending ours");
     await this.sendOurUpdates();
+    this.logger.debug("[SYNC-TRACE] syncUpdatesAsReceiver: sent, now exchanging complete");
     await this.exchangeSyncComplete(false);
-    this.logger.debug("Sync complete (receiver)");
+    this.logger.debug("[SYNC-TRACE] syncUpdatesAsReceiver: done");
   }
 
   // ===========================================================================
@@ -564,7 +705,9 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
    * Handles the UPDATES message type and respects read-only peer settings.
    */
   private async receiveAndImportUpdates(): Promise<void> {
+    this.logger.debug("[SYNC-TRACE] receiveAndImportUpdates: waiting for UPDATES");
     const peerMessage = await this.receiveMessage();
+    this.logger.debug("[SYNC-TRACE] receiveAndImportUpdates: received type", peerMessage.type);
 
     if (peerMessage.type === SyncMessageType.UPDATES) {
       const updatesMsg = peerMessage as UpdatesMessage;
@@ -589,20 +732,28 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
    */
   private async exchangeSyncComplete(sendFirst: boolean): Promise<void> {
     const finalVersion = this.documentManager.getVersionBytes();
+    this.logger.debug("[SYNC-TRACE] exchangeSyncComplete: sendFirst=", sendFirst);
 
     if (sendFirst) {
+      this.logger.debug("[SYNC-TRACE] exchangeSyncComplete: sending SYNC_COMPLETE");
       await this.sendMessage(createSyncCompleteMessage(finalVersion));
+      this.logger.debug("[SYNC-TRACE] exchangeSyncComplete: waiting for peer SYNC_COMPLETE");
       const completeMsg = await this.receiveMessage();
+      this.logger.debug("[SYNC-TRACE] exchangeSyncComplete: received type", completeMsg.type);
       if (completeMsg.type !== SyncMessageType.SYNC_COMPLETE) {
         this.logger.warn("Expected SYNC_COMPLETE, got:", completeMsg.type);
       }
     } else {
+      this.logger.debug("[SYNC-TRACE] exchangeSyncComplete: waiting for peer SYNC_COMPLETE");
       const completeMsg = await this.receiveMessage();
+      this.logger.debug("[SYNC-TRACE] exchangeSyncComplete: received type", completeMsg.type);
       if (completeMsg.type !== SyncMessageType.SYNC_COMPLETE) {
         this.logger.warn("Expected SYNC_COMPLETE, got:", completeMsg.type);
       }
+      this.logger.debug("[SYNC-TRACE] exchangeSyncComplete: sending SYNC_COMPLETE");
       await this.sendMessage(createSyncCompleteMessage(finalVersion));
     }
+    this.logger.debug("[SYNC-TRACE] exchangeSyncComplete: done");
   }
 
   // ===========================================================================
@@ -622,23 +773,28 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
 
     // Get our blob hashes
     const ourHashes = await this.blobStore.list();
-    this.logger.debug("Syncing blobs, we have:", ourHashes.length);
+    this.logger.debug("[SYNC-TRACE] syncBlobs: we have", ourHashes.length, "blobs");
 
     // Send our blob hashes
+    this.logger.debug("[SYNC-TRACE] syncBlobs: sending BLOB_HASHES");
     await this.sendMessage(createBlobHashesMessage(ourHashes));
 
     // Receive peer's blob hashes
+    this.logger.debug("[SYNC-TRACE] syncBlobs: waiting for peer BLOB_HASHES");
     const peerMessage = await this.receiveMessage();
+    this.logger.debug("[SYNC-TRACE] syncBlobs: received message type", peerMessage.type);
     if (peerMessage.type !== SyncMessageType.BLOB_HASHES) {
       throw SyncErrors.protocolError(`Expected BLOB_HASHES, got: ${peerMessage.type}`);
     }
 
     const peerHashes = (peerMessage as BlobHashesMessage).hashes;
-    this.logger.debug("Peer has blobs:", peerHashes.length);
+    this.logger.debug("[SYNC-TRACE] syncBlobs: peer has", peerHashes.length, "blobs");
 
     // Find blobs we're missing
     const missingFromUs = await this.blobStore.getMissing(peerHashes);
     this.logger.debug("Missing from us:", missingFromUs.length);
+    this._blobsToReceive = missingFromUs.length;
+    this.emitProgress();
 
     // Find blobs peer is missing
     const peerSet = new Set(peerHashes);
@@ -660,6 +816,8 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
 
     const peerWants = (peerRequest as BlobRequestMessage).hashes;
     this.logger.debug("Peer wants:", peerWants.length);
+    this._blobsToSend = peerWants.length;
+    this.emitProgress();
 
     // Send blobs peer wants (parallel load, sequential send)
     await this.sendBlobsParallel(peerWants);
@@ -669,12 +827,40 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
 
     // Receive blobs we requested
     let received = 0;
+    let storeFailed = 0;
     while (received < missingFromUs.length) {
       const msg = await this.receiveMessage();
       if (msg.type === SyncMessageType.BLOB_DATA) {
         const blobMsg = msg as BlobDataMessage;
-        await this.blobStore.add(blobMsg.data, blobMsg.mimeType);
+        // Retry storing blob on failure
+        let stored = false;
+        for (let attempt = 1; attempt <= BLOB_MAX_RETRIES && !stored; attempt++) {
+          try {
+            // Verify blob integrity before storing
+            const verified = await this.blobStore.verifyAndAdd(
+              blobMsg.data,
+              blobMsg.hash,
+              blobMsg.mimeType,
+            );
+            if (!verified) {
+              this.logger.warn(`Blob integrity check failed for ${blobMsg.hash.slice(0, 8)}`);
+              storeFailed++;
+              break; // Don't retry on integrity failure - data is corrupted
+            }
+            stored = true;
+          } catch (err) {
+            if (attempt < BLOB_MAX_RETRIES) {
+              this.logger.debug(`Blob store failed (attempt ${attempt}/${BLOB_MAX_RETRIES}), retrying:`, blobMsg.hash.slice(0, 8));
+              await new Promise(r => setTimeout(r, BLOB_RETRY_DELAY_MS * attempt));
+            } else {
+              this.logger.warn(`Failed to store blob after ${BLOB_MAX_RETRIES} attempts:`, blobMsg.hash.slice(0, 8));
+              storeFailed++;
+            }
+          }
+        }
         received++;
+        this._blobsReceived = received;
+        this.emitProgress();
         this.logger.debug("Received blob:", blobMsg.hash);
       } else if (msg.type === SyncMessageType.BLOB_SYNC_COMPLETE) {
         // Peer is done sending
@@ -682,6 +868,9 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       } else {
         throw SyncErrors.protocolError(`Unexpected message during blob sync: ${msg.type}`);
       }
+    }
+    if (storeFailed > 0) {
+      this.logger.warn(`Blob receive completed with ${storeFailed} store failure(s)`);
     }
 
     // Wait for peer's blob sync complete if we haven't received it
@@ -736,6 +925,9 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     // Find blobs we're missing and request them
     const missingFromUs = await this.blobStore.getMissing(peerHashes);
     this.logger.debug("Missing from us:", missingFromUs.length);
+    this._blobsToReceive = missingFromUs.length;
+    this._blobsToSend = peerWants.length;
+    this.emitProgress();
 
     if (missingFromUs.length > 0) {
       await this.sendMessage(createBlobRequestMessage(missingFromUs));
@@ -745,12 +937,40 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
 
     // Receive blobs from peer first (peer sends their requested blobs first)
     let received = 0;
+    let storeFailed = 0;
     while (received < missingFromUs.length) {
       const msg = await this.receiveMessage();
       if (msg.type === SyncMessageType.BLOB_DATA) {
         const blobMsg = msg as BlobDataMessage;
-        await this.blobStore.add(blobMsg.data, blobMsg.mimeType);
+        // Retry storing blob on failure
+        let stored = false;
+        for (let attempt = 1; attempt <= BLOB_MAX_RETRIES && !stored; attempt++) {
+          try {
+            // Verify blob integrity before storing
+            const verified = await this.blobStore.verifyAndAdd(
+              blobMsg.data,
+              blobMsg.hash,
+              blobMsg.mimeType,
+            );
+            if (!verified) {
+              this.logger.warn(`Blob integrity check failed for ${blobMsg.hash.slice(0, 8)}`);
+              storeFailed++;
+              break; // Don't retry on integrity failure - data is corrupted
+            }
+            stored = true;
+          } catch (err) {
+            if (attempt < BLOB_MAX_RETRIES) {
+              this.logger.debug(`Blob store failed (attempt ${attempt}/${BLOB_MAX_RETRIES}), retrying:`, blobMsg.hash.slice(0, 8));
+              await new Promise(r => setTimeout(r, BLOB_RETRY_DELAY_MS * attempt));
+            } else {
+              this.logger.warn(`Failed to store blob after ${BLOB_MAX_RETRIES} attempts:`, blobMsg.hash.slice(0, 8));
+              storeFailed++;
+            }
+          }
+        }
         received++;
+        this._blobsReceived = received;
+        this.emitProgress();
         this.logger.debug("Received blob:", blobMsg.hash);
       } else if (msg.type === SyncMessageType.BLOB_SYNC_COMPLETE) {
         // Peer is done sending
@@ -758,6 +978,9 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       } else {
         throw SyncErrors.protocolError(`Unexpected message during blob sync: ${msg.type}`);
       }
+    }
+    if (storeFailed > 0) {
+      this.logger.warn(`Blob receive completed with ${storeFailed} store failure(s)`);
     }
 
     // Wait for peer's blob sync complete if we haven't received it
@@ -779,33 +1002,62 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
 
   /**
    * Send blobs with parallel disk loading for better performance.
-   * Loads blobs in batches of 4 from disk, then sends sequentially.
+   * Loads blobs in batches from disk, then sends sequentially.
+   * Individual blob failures are retried and logged but don't abort the sync.
    */
   private async sendBlobsParallel(hashes: string[]): Promise<void> {
     if (!this.blobStore || hashes.length === 0) return;
 
-    const BATCH_SIZE = 4;
+    const failedBlobs: string[] = [];
 
-    for (let i = 0; i < hashes.length; i += BATCH_SIZE) {
-      const batch = hashes.slice(i, i + BATCH_SIZE);
+    for (let i = 0; i < hashes.length; i += BLOB_BATCH_SIZE) {
+      const batch = hashes.slice(i, i + BLOB_BATCH_SIZE);
 
       // Load batch in parallel
       const blobsWithData = await Promise.all(
         batch.map(async (hash) => {
-          const data = await this.blobStore!.get(hash);
-          const meta = data ? await this.blobStore!.getMeta(hash) : null;
-          return { hash, data, mimeType: meta?.mimeType };
+          try {
+            const data = await this.blobStore!.get(hash);
+            const meta = data ? await this.blobStore!.getMeta(hash) : null;
+            return { hash, data, mimeType: meta?.mimeType, error: null };
+          } catch (err) {
+            this.logger.warn(`Failed to load blob ${hash.slice(0, 8)}:`, err);
+            return { hash, data: null, mimeType: undefined, error: err };
+          }
         }),
       );
 
-      // Send loaded blobs sequentially (protocol requires ordered messages)
+      // Send loaded blobs sequentially with retry
       for (const blob of blobsWithData) {
-        if (blob.data) {
-          await this.sendMessage(
-            createBlobDataMessage(blob.hash, blob.data, blob.mimeType),
-          );
+        if (!blob.data) {
+          failedBlobs.push(blob.hash);
+          continue;
+        }
+
+        let sent = false;
+        for (let attempt = 1; attempt <= BLOB_MAX_RETRIES && !sent; attempt++) {
+          try {
+            await this.sendMessage(
+              createBlobDataMessage(blob.hash, blob.data, blob.mimeType),
+            );
+            sent = true;
+            this._blobsSent++;
+            this.emitProgress();
+          } catch (err) {
+            if (attempt < BLOB_MAX_RETRIES) {
+              this.logger.debug(`Blob send failed (attempt ${attempt}/${BLOB_MAX_RETRIES}), retrying:`, blob.hash.slice(0, 8));
+              await new Promise(r => setTimeout(r, BLOB_RETRY_DELAY_MS * attempt));
+            } else {
+              this.logger.warn(`Failed to send blob after ${BLOB_MAX_RETRIES} attempts:`, blob.hash.slice(0, 8));
+              failedBlobs.push(blob.hash);
+            }
+          }
         }
       }
+    }
+
+    if (failedBlobs.length > 0) {
+      this.logger.warn(`Blob sync completed with ${failedBlobs.length} failed blob(s)`);
     }
   }
 
@@ -874,13 +1126,21 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
           }
 
           case SyncMessageType.BLOB_DATA: {
-            // Peer is sending blob data - store it
+            // Peer is sending blob data - verify and store it
             const blobMsg = message as BlobDataMessage;
             if (this.blobStore) {
-              await this.blobStore.add(blobMsg.data, blobMsg.mimeType);
-              this.logger.debug("Received blob in live mode:", blobMsg.hash.slice(0, 16));
-              // Emit event so VaultSync can retry writing the file
-              this.emit("blob:received", blobMsg.hash);
+              const verified = await this.blobStore.verifyAndAdd(
+                blobMsg.data,
+                blobMsg.hash,
+                blobMsg.mimeType,
+              );
+              if (verified) {
+                this.logger.debug("Received blob in live mode:", blobMsg.hash.slice(0, 16));
+                // Emit event so VaultSync can retry writing the file
+                this.emit("blob:received", blobMsg.hash);
+              } else {
+                this.logger.warn("Blob integrity check failed in live mode:", blobMsg.hash.slice(0, 16));
+              }
             }
             break;
           }
@@ -980,9 +1240,18 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       this.unsubscribeLocalUpdates();
     }
 
+    protocolTracer.trace(this.traceSessionId, this.peerId, "sync", "localUpdates.subscribing", {});
+
     // Subscribe to local updates and send them to peer
     this.unsubscribeLocalUpdates = this.documentManager.subscribeLocalUpdates(
       (updates: Uint8Array) => {
+        protocolTracer.trace(this.traceSessionId, this.peerId, "sync", "localUpdates.received", {
+          bytes: updates.length,
+          state: this.state,
+          hasStream: !!this.stream,
+          aborted: this.aborted,
+        });
+
         if (this.state === "live" && this.stream && !this.aborted) {
           this.sendUpdate(updates).catch((err) => {
             this.logger.error("Failed to push local update:", err);
@@ -990,6 +1259,8 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
         }
       },
     );
+
+    protocolTracer.trace(this.traceSessionId, this.peerId, "sync", "localUpdates.subscribed", {});
   }
 
   private stopLocalUpdateSubscription(): void {
@@ -1009,7 +1280,22 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     }
 
     const bytes = serializeMessage(message);
+    this._bytesSent += bytes.length;
+
+    // Trace message send
+    protocolTracer.trace(this.traceSessionId, this.peerId, "sync", "message.sending", {
+      type: SyncMessageType[message.type] || message.type,
+      bytes: bytes.length,
+    });
+
+    const startTime = Date.now();
     await this.stream.send(bytes);
+    const durationMs = Date.now() - startTime;
+
+    protocolTracer.trace(this.traceSessionId, this.peerId, "sync", "message.sent", {
+      type: SyncMessageType[message.type] || message.type,
+      bytes: bytes.length,
+    }, durationMs);
   }
 
   /**
@@ -1026,29 +1312,56 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     }
 
     const timeout = timeoutMs ?? this.config.receiveTimeout;
+    const startTime = Date.now();
+
+    // Trace that we're starting to receive
+    protocolTracer.trace(this.traceSessionId, this.peerId, "sync", "message.receiving", {
+      timeoutMs: timeout === Infinity ? "infinite" : timeout,
+    });
 
     // No timeout (e.g., during live loop where we wait indefinitely)
     if (timeout <= 0 || timeout === Infinity) {
       const bytes = await this.stream.receive();
-      return deserializeMessage(bytes);
+      this._bytesReceived += bytes.length;
+      const message = deserializeMessage(bytes);
+      const durationMs = Date.now() - startTime;
+
+      protocolTracer.trace(this.traceSessionId, this.peerId, "sync", "message.received", {
+        type: SyncMessageType[message.type] || message.type,
+        bytes: bytes.length,
+      }, durationMs);
+
+      return message;
     }
 
     // Race between receive and timeout with guaranteed cleanup
     let timer: ReturnType<typeof setTimeout> | null = null;
-    let timedOut = false;
 
     try {
       const receivePromise = this.stream.receive();
 
       const timeoutPromise = new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
-          timedOut = true;
+          const waitedMs = Date.now() - startTime;
+          protocolTracer.trace(this.traceSessionId, this.peerId, "sync", "message.timeout", {
+            waitedMs,
+            timeoutMs: timeout,
+          });
           reject(SyncErrors.timeout(`Receive timeout after ${timeout}ms`));
         }, timeout);
       });
 
       const bytes = await Promise.race([receivePromise, timeoutPromise]);
-      return deserializeMessage(bytes);
+      this._bytesReceived += bytes.length;
+      const message = deserializeMessage(bytes);
+      const durationMs = Date.now() - startTime;
+
+      protocolTracer.trace(this.traceSessionId, this.peerId, "sync", "message.received", {
+        type: SyncMessageType[message.type] || message.type,
+        bytes: bytes.length,
+      }, durationMs);
+
+      return message;
     } finally {
       // Always clean up timer, regardless of success or failure
       if (timer !== null) {
@@ -1069,6 +1382,19 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
 
     const message = error.message.toLowerCase();
 
+    // Non-transient: protocol errors, vault mismatch, explicit errors
+    // Check these first as they should never be retried
+    if (
+      message.includes("protocol") ||
+      message.includes("mismatch") ||
+      message.includes("invalid") ||
+      message.includes("denied") ||
+      message.includes("removed") ||
+      message.includes("vault id")
+    ) {
+      return false;
+    }
+
     // Transient: timeout, network, connection issues
     if (
       message.includes("timeout") ||
@@ -1076,21 +1402,18 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       message.includes("connection") ||
       message.includes("econnreset") ||
       message.includes("econnrefused") ||
+      message.includes("enotconn") ||
+      message.includes("ehostunreach") ||
+      message.includes("enetunreach") ||
       message.includes("epipe") ||
-      message.includes("temporarily")
+      message.includes("temporarily") ||
+      message.includes("stream") ||
+      message.includes("closed unexpectedly") ||
+      message.includes("aborted") ||
+      message.includes("reset by peer") ||
+      message.includes("broken pipe")
     ) {
       return true;
-    }
-
-    // Non-transient: protocol errors, vault mismatch, explicit errors
-    if (
-      message.includes("protocol") ||
-      message.includes("mismatch") ||
-      message.includes("invalid") ||
-      message.includes("denied") ||
-      message.includes("removed")
-    ) {
-      return false;
     }
 
     // Default: assume transient for unknown errors

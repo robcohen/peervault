@@ -12,6 +12,7 @@ import type { BlobStore } from "./blob-store";
 import { isBinaryFile } from "./blob-store";
 import type { Logger } from "../utils/logger";
 import { isPathInExcludedFolders } from "../utils/validation";
+import { protocolTracer } from "../utils/protocol-tracer";
 
 /** Configuration for vault sync */
 export interface VaultSyncConfig {
@@ -108,12 +109,24 @@ export class VaultSync {
    * Handle a file modification in the vault.
    */
   async handleFileModify(file: TAbstractFile): Promise<void> {
+    protocolTracer.trace("", "", "vault", "file.modify.received", {
+      path: file.path,
+      shouldSync: this.shouldSync(file.path),
+      isProcessingRemote: this.isProcessingRemote,
+    });
+
     if (!this.shouldSync(file.path)) return;
     if (this.isProcessingRemote) return;
 
     this.debounceChange(file.path, async () => {
+      protocolTracer.trace("", "", "vault", "file.modify.debounced", {
+        path: file.path,
+      });
       await this.documentManager.handleFileModify(file.path);
       await this.syncFileContent(file.path);
+      protocolTracer.trace("", "", "vault", "file.modify.complete", {
+        path: file.path,
+      });
     });
   }
 
@@ -121,6 +134,12 @@ export class VaultSync {
    * Handle a file deletion in the vault.
    */
   async handleFileDelete(file: TAbstractFile): Promise<void> {
+    protocolTracer.trace("", "", "vault", "file.delete.received", {
+      path: file.path,
+      shouldSync: this.shouldSync(file.path),
+      isProcessingRemote: this.isProcessingRemote,
+    });
+
     if (!this.shouldSync(file.path)) return;
     if (this.isProcessingRemote) return;
 
@@ -132,6 +151,9 @@ export class VaultSync {
     }
 
     await this.documentManager.handleFileDelete(file.path);
+    protocolTracer.trace("", "", "vault", "file.delete.complete", {
+      path: file.path,
+    });
   }
 
   /**
@@ -184,11 +206,23 @@ export class VaultSync {
         const content = await this.app.vault.readBinary(tfile);
         const hash = await this.blobStore.add(new Uint8Array(content));
         this.documentManager.setBlobHash(path, hash);
+        protocolTracer.trace("", "", "vault", "content.synced.binary", {
+          path,
+          hash: hash.slice(0, 16),
+        });
         this.logger.debug("Synced binary file to document:", path);
       } else {
         // Text file - read and store in document
         const content = await this.app.vault.read(tfile);
+        protocolTracer.trace("", "", "vault", "content.syncing.text", {
+          path,
+          contentLength: content.length,
+        });
         this.documentManager.setTextContent(path, content);
+        protocolTracer.trace("", "", "vault", "content.synced.text", {
+          path,
+          contentLength: content.length,
+        });
         this.logger.debug("Synced text file to document:", path);
       }
     } catch (error) {

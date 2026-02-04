@@ -473,8 +473,22 @@ export class WebRTCPeerConnection implements PeerConnection {
 
   /**
    * Create SDP offer (for signaling).
+   * Creates an initial DataChannel to ensure data channel support is negotiated.
    */
   async createOffer(): Promise<RTCSessionDescriptionInit> {
+    // Create an initial data channel to ensure SCTP is negotiated in the SDP
+    // Without this, the SDP won't include DataChannel support
+    const initialChannel = this.pc.createDataChannel(
+      WEBRTC_CONSTANTS.MAIN_CHANNEL_LABEL,
+      { ordered: true },
+    );
+    this.logger.debug(`[WebRTC ${this.peerId}] Created initial DataChannel for SDP`);
+
+    // Wait for the channel to be ready (or just proceed if it fails)
+    initialChannel.onopen = () => {
+      this.logger.debug(`[WebRTC ${this.peerId}] Initial DataChannel opened`);
+    };
+
     const offer = await this.pc.createOffer();
     await this.pc.setLocalDescription(offer);
     return offer;

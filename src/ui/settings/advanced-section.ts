@@ -6,6 +6,8 @@
 
 import { Setting, Notice } from "obsidian";
 import type { SectionContext } from "./types";
+import { protocolTracer } from "../../utils/protocol-tracer";
+import type { ProtocolTraceLevel } from "../../types";
 
 export function renderAdvancedSection(
   container: HTMLElement,
@@ -101,6 +103,62 @@ export function renderAdvancedSection(
         }
       }),
     );
+
+  // Protocol tracing toggle
+  new Setting(container)
+    .setName("Protocol tracing")
+    .setDesc("Enable detailed tracing of sync protocol messages for debugging")
+    .addToggle((toggle) =>
+      toggle
+        .setValue(plugin.settings.enableProtocolTracing)
+        .onChange(async (value) => {
+          plugin.settings.enableProtocolTracing = value;
+          protocolTracer.setEnabled(value);
+          await plugin.saveSettings();
+        }),
+    );
+
+  // Protocol trace level (only show if tracing is enabled)
+  if (plugin.settings.enableProtocolTracing) {
+    new Setting(container)
+      .setName("Trace level")
+      .setDesc("minimal = state changes only, standard = + messages, verbose = + details")
+      .addDropdown((dropdown) =>
+        dropdown
+          .addOption("minimal", "Minimal")
+          .addOption("standard", "Standard")
+          .addOption("verbose", "Verbose")
+          .setValue(plugin.settings.protocolTraceLevel)
+          .onChange(async (value) => {
+            plugin.settings.protocolTraceLevel = value as ProtocolTraceLevel;
+            protocolTracer.setLevel(value as ProtocolTraceLevel);
+            await plugin.saveSettings();
+          }),
+      );
+
+    // Copy protocol traces
+    new Setting(container)
+      .setName("Copy protocol traces")
+      .setDesc(`Export trace events as NDJSON (${protocolTracer.getEventCount()} events)`)
+      .addButton((btn) =>
+        btn.setButtonText("Copy Traces").onClick(async () => {
+          const ndjson = protocolTracer.exportAsNdjson();
+          if (ndjson) {
+            await navigator.clipboard.writeText(ndjson);
+            new Notice("Traces copied to clipboard!");
+          } else {
+            new Notice("No trace events available");
+          }
+        }),
+      )
+      .addButton((btn) =>
+        btn.setButtonText("Clear").onClick(() => {
+          protocolTracer.clear();
+          new Notice("Traces cleared");
+          refresh();
+        }),
+      );
+  }
 
   // Custom relay server
   new Setting(container)
