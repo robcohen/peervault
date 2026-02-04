@@ -32,15 +32,13 @@ import {
   createAnswer,
   createIceCandidate,
   createReady,
-  isSignalingMessageType,
+  hasSignalingMagic,
+  SIGNALING_MAGIC_LENGTH,
 } from "./webrtc/signaling";
 import { isWebRTCAvailable } from "./webrtc";
 
-/** Delay before attempting WebRTC upgrade (ms) - longer to avoid sync interference */
-const UPGRADE_DELAY_MS = 5000;  // 5s delay to allow initial sync handshake first
-
-/** Time to wait for first message when detecting stream type (ms) */
-const STREAM_DETECT_TIMEOUT_MS = 2000;
+/** Delay before attempting WebRTC upgrade (ms) - allows initial sync handshake first */
+const UPGRADE_DELAY_MS = 5000;
 
 /**
  * Hybrid transport configuration.
@@ -207,9 +205,6 @@ export class HybridTransport implements Transport {
 
     // Delay to let sync establish first
     setTimeout(() => {
-      // Mark that upgrade timer has fired - now we should detect signaling streams
-      conn.markUpgradeScheduled();
-
       if (!conn.isConnected() || conn.isWebRTCActive()) {
         return; // Connection closed or already upgraded
       }
@@ -299,7 +294,6 @@ export class HybridConnection implements PeerConnection {
 
   private upgradeInProgress = false;
   private signalingStream: SyncStream | null = null;
-  private upgradeScheduled = false;  // True after the upgrade timer has fired
 
   constructor(
     peerId: string,
@@ -357,89 +351,45 @@ export class HybridConnection implements PeerConnection {
   }
 
   /**
-   * Handle incoming stream - detect type when WebRTC upgrade is expected.
+   * Handle incoming stream - always detect type using magic prefix.
+   * This enables instant stream classification without timing dependencies.
    */
   private handleIncomingStream(stream: SyncStream): void {
-    // Only detect stream type if we're expecting a WebRTC upgrade
-    // (after the upgrade timer has fired and WebRTC isn't already connected)
-    if (this.upgradeScheduled && !this.webrtcConn) {
+    // Always detect stream type using magic prefix - no timing dependency
+    // WebRTC signaling streams start with "PVWS" magic, sync streams don't
+    if (!this.webrtcConn) {
       this.detectAndHandleStream(stream).catch((err) => {
         this.logger.error(`[Hybrid ${this.peerId}] Stream handling error:`, err);
       });
     } else {
-      // Normal case: forward directly to callbacks
+      // WebRTC already connected - forward directly to callbacks
       this.forwardStreamToCallbacks(stream);
     }
   }
 
   /**
-   * Detect stream type by reading first message and handle appropriately.
-   * Uses a timeout to avoid blocking forever, but never loses data.
+   * Detect stream type by reading first message and checking for magic prefix.
+   * Uses the "PVWS" magic to instantly classify streams:
+   * - Starts with "PVWS" → WebRTC signaling stream
+   * - Otherwise → Sync stream (forward with replay)
    */
   private async detectAndHandleStream(stream: SyncStream): Promise<void> {
     const streamId = stream.id;
-    this.logger.debug(`[Hybrid ${this.peerId}] detectAndHandleStream: stream ${streamId} - starting detection`);
 
     try {
-      // Start receiving the first message
-      const receivePromise = stream.receive();
+      // Receive the first message
+      const firstMessage = await stream.receive();
 
-      // Race against timeout
-      let firstMessage: Uint8Array | undefined;
-      let timedOut = false;
-
-      const timeoutPromise = new Promise<void>((resolve) => {
-        setTimeout(() => {
-          timedOut = true;
-          resolve();
-        }, STREAM_DETECT_TIMEOUT_MS);
-      });
-
-      await Promise.race([
-        receivePromise.then((data) => { firstMessage = data; }),
-        timeoutPromise,
-      ]);
-
-      if (timedOut && firstMessage === undefined) {
-        // Timeout - create lazy replay stream that awaits the pending receive
-        this.logger.debug(`[Hybrid ${this.peerId}] Stream ${streamId} detection timeout, forwarding with lazy replay`);
-        const lazyStream = this.createLazyReplayStream(stream, receivePromise);
-        this.forwardStreamToCallbacks(lazyStream);
-        return;
-      }
-
-      // We have the first message (either received before timeout or race completed)
-      const message = firstMessage ?? await receivePromise;
-      this.logger.debug(`[Hybrid ${this.peerId}] Stream ${streamId} first byte: 0x${message[0]?.toString(16).padStart(2, '0')} (len=${message.length})`);
-
-
-      // Check the first byte to determine stream type
-      if (message.length === 0) {
-        // Empty message - treat as sync stream
-        const replayStream = this.createReplayStream(stream, message);
-        this.forwardStreamToCallbacks(replayStream);
-        return;
-      }
-
-      const firstByte = message[0]!; // Safe: we checked length > 0 above
-
-      if (firstByte === SignalingMessageType.UPGRADE_REQUEST) {
-        // This is a signaling stream with an upgrade request
-        this.logger.debug(`[Hybrid ${this.peerId}] Received WebRTC upgrade request on stream ${streamId}`);
-        await this.handleWebRTCUpgradeRequest(stream, message);
-        return;
-      }
-
-      if (isSignalingMessageType(firstByte)) {
-        // Other signaling message - unexpected, close stream
-        this.logger.warn(`[Hybrid ${this.peerId}] Unexpected signaling message type ${firstByte}`);
-        await stream.close();
+      // Check for signaling magic prefix (instant, no timeout needed)
+      if (hasSignalingMagic(firstMessage)) {
+        // This is a WebRTC signaling stream
+        this.logger.debug(`[Hybrid ${this.peerId}] Received WebRTC signaling message on stream ${streamId}`);
+        await this.handleWebRTCUpgradeRequest(stream, firstMessage);
         return;
       }
 
       // Regular sync stream - create replay wrapper and forward
-      this.logger.debug(`[Hybrid ${this.peerId}] Stream ${streamId} forwarding as sync stream`);
-      const replayStream = this.createReplayStream(stream, message);
+      const replayStream = this.createReplayStream(stream, firstMessage);
       this.forwardStreamToCallbacks(replayStream);
 
     } catch (err) {
@@ -447,28 +397,6 @@ export class HybridConnection implements PeerConnection {
       // On error, try to forward the original stream
       this.forwardStreamToCallbacks(stream);
     }
-  }
-
-  /**
-   * Create a lazy replay stream that awaits a pending first message promise.
-   * This prevents data loss when stream detection times out.
-   */
-  private createLazyReplayStream(stream: SyncStream, firstMessagePromise: Promise<Uint8Array>): SyncStream {
-    let firstMessageConsumed = false;
-
-    return {
-      id: stream.id,
-      send: (data: Uint8Array) => stream.send(data),
-      receive: async () => {
-        if (!firstMessageConsumed) {
-          firstMessageConsumed = true;
-          return await firstMessagePromise;
-        }
-        return stream.receive();
-      },
-      close: () => stream.close(),
-      isOpen: () => stream.isOpen(),
-    };
   }
 
   /**
@@ -1044,14 +972,6 @@ export class HybridConnection implements PeerConnection {
    */
   isWebRTCActive(): boolean {
     return this.webrtcConn?.isConnected() ?? false;
-  }
-
-  /**
-   * Mark that the upgrade timer has fired.
-   * After this, we should start detecting signaling streams.
-   */
-  markUpgradeScheduled(): void {
-    this.upgradeScheduled = true;
   }
 
   /**

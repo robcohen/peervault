@@ -3,6 +3,9 @@
  *
  * Serialization/deserialization of WebRTC signaling messages.
  * These messages are exchanged over Iroh to establish WebRTC connections.
+ *
+ * All signaling messages are prefixed with a 4-byte magic number "PVWS"
+ * (PeerVault WebRTC Signaling) to enable instant stream type detection.
  */
 
 import {
@@ -18,35 +21,63 @@ import {
 } from "./types";
 
 /**
+ * Magic number prefix for WebRTC signaling messages.
+ * "PVWS" = PeerVault WebRTC Signaling
+ * This enables instant stream type detection without timing dependencies.
+ */
+export const SIGNALING_MAGIC = new Uint8Array([0x50, 0x56, 0x57, 0x53]); // "PVWS"
+export const SIGNALING_MAGIC_LENGTH = 4;
+
+/**
+ * Check if data starts with the signaling magic prefix.
+ * This enables instant stream type detection.
+ */
+export function hasSignalingMagic(data: Uint8Array): boolean {
+  if (data.length < SIGNALING_MAGIC_LENGTH) {
+    return false;
+  }
+  return (
+    data[0] === SIGNALING_MAGIC[0] &&
+    data[1] === SIGNALING_MAGIC[1] &&
+    data[2] === SIGNALING_MAGIC[2] &&
+    data[3] === SIGNALING_MAGIC[3]
+  );
+}
+
+/**
  * Serialize a signaling message to binary format.
  *
  * Format:
+ * - 4 bytes: magic "PVWS"
  * - 1 byte: message type
  * - 8 bytes: timestamp (big-endian)
  * - remaining: message-specific payload
  */
 export function serializeSignalingMessage(message: SignalingMessage): Uint8Array {
   const encoder = new TextEncoder();
+  const magicLen = SIGNALING_MAGIC_LENGTH;
 
   switch (message.type) {
     case SignalingMessageType.UPGRADE_REQUEST:
     case SignalingMessageType.UPGRADE_ACCEPT:
     case SignalingMessageType.READY: {
       // No payload
-      const buffer = new Uint8Array(9);
-      buffer[0] = message.type;
-      writeTimestamp(buffer, 1, message.timestamp);
+      const buffer = new Uint8Array(magicLen + 9);
+      buffer.set(SIGNALING_MAGIC, 0);
+      buffer[magicLen] = message.type;
+      writeTimestamp(buffer, magicLen + 1, message.timestamp);
       return buffer;
     }
 
     case SignalingMessageType.UPGRADE_REJECT: {
       const msg = message as UpgradeRejectMessage;
       const reasonBytes = encoder.encode(msg.reason);
-      const buffer = new Uint8Array(9 + 4 + reasonBytes.length);
-      buffer[0] = message.type;
-      writeTimestamp(buffer, 1, message.timestamp);
-      writeUint32(buffer, 9, reasonBytes.length);
-      buffer.set(reasonBytes, 13);
+      const buffer = new Uint8Array(magicLen + 9 + 4 + reasonBytes.length);
+      buffer.set(SIGNALING_MAGIC, 0);
+      buffer[magicLen] = message.type;
+      writeTimestamp(buffer, magicLen + 1, message.timestamp);
+      writeUint32(buffer, magicLen + 9, reasonBytes.length);
+      buffer.set(reasonBytes, magicLen + 13);
       return buffer;
     }
 
@@ -54,11 +85,12 @@ export function serializeSignalingMessage(message: SignalingMessage): Uint8Array
     case SignalingMessageType.ANSWER: {
       const msg = message as OfferMessage | AnswerMessage;
       const sdpBytes = encoder.encode(msg.sdp);
-      const buffer = new Uint8Array(9 + 4 + sdpBytes.length);
-      buffer[0] = message.type;
-      writeTimestamp(buffer, 1, message.timestamp);
-      writeUint32(buffer, 9, sdpBytes.length);
-      buffer.set(sdpBytes, 13);
+      const buffer = new Uint8Array(magicLen + 9 + 4 + sdpBytes.length);
+      buffer.set(SIGNALING_MAGIC, 0);
+      buffer[magicLen] = message.type;
+      writeTimestamp(buffer, magicLen + 1, message.timestamp);
+      writeUint32(buffer, magicLen + 9, sdpBytes.length);
+      buffer.set(sdpBytes, magicLen + 13);
       return buffer;
     }
 
@@ -68,12 +100,14 @@ export function serializeSignalingMessage(message: SignalingMessage): Uint8Array
       const sdpMidBytes = msg.sdpMid ? encoder.encode(msg.sdpMid) : new Uint8Array(0);
       const sdpMLineIndex = msg.sdpMLineIndex ?? -1;
 
-      // Format: type + timestamp + candidateLen + candidate + sdpMidLen + sdpMid + sdpMLineIndex
+      // Format: magic + type + timestamp + candidateLen + candidate + sdpMidLen + sdpMid + sdpMLineIndex
       const buffer = new Uint8Array(
-        9 + 4 + candidateBytes.length + 4 + sdpMidBytes.length + 4,
+        magicLen + 9 + 4 + candidateBytes.length + 4 + sdpMidBytes.length + 4,
       );
 
       let offset = 0;
+      buffer.set(SIGNALING_MAGIC, offset);
+      offset += magicLen;
       buffer[offset++] = message.type;
       writeTimestamp(buffer, offset, message.timestamp);
       offset += 8;
@@ -99,16 +133,25 @@ export function serializeSignalingMessage(message: SignalingMessage): Uint8Array
 
 /**
  * Deserialize a signaling message from binary format.
+ * Expects the magic prefix to be present.
  */
 export function deserializeSignalingMessage(data: Uint8Array): SignalingMessage {
   const decoder = new TextDecoder();
+  const magicLen = SIGNALING_MAGIC_LENGTH;
 
-  if (data.length < 9) {
+  // Minimum: magic (4) + type (1) + timestamp (8) = 13 bytes
+  if (data.length < magicLen + 9) {
     throw new Error("Signaling message too short");
   }
 
-  const type = data[0] as SignalingMessageType;
-  const timestamp = readTimestamp(data, 1);
+  // Verify magic prefix
+  if (!hasSignalingMagic(data)) {
+    throw new Error("Invalid signaling message: missing magic prefix");
+  }
+
+  // Skip magic prefix for parsing
+  const type = data[magicLen] as SignalingMessageType;
+  const timestamp = readTimestamp(data, magicLen + 1);
 
   switch (type) {
     case SignalingMessageType.UPGRADE_REQUEST:
@@ -121,25 +164,25 @@ export function deserializeSignalingMessage(data: Uint8Array): SignalingMessage 
       return { type, timestamp } as ReadyMessage;
 
     case SignalingMessageType.UPGRADE_REJECT: {
-      const reasonLength = readUint32(data, 9);
-      const reason = decoder.decode(data.slice(13, 13 + reasonLength));
+      const reasonLength = readUint32(data, magicLen + 9);
+      const reason = decoder.decode(data.slice(magicLen + 13, magicLen + 13 + reasonLength));
       return { type, timestamp, reason } as UpgradeRejectMessage;
     }
 
     case SignalingMessageType.OFFER: {
-      const sdpLength = readUint32(data, 9);
-      const sdp = decoder.decode(data.slice(13, 13 + sdpLength));
+      const sdpLength = readUint32(data, magicLen + 9);
+      const sdp = decoder.decode(data.slice(magicLen + 13, magicLen + 13 + sdpLength));
       return { type, timestamp, sdp } as OfferMessage;
     }
 
     case SignalingMessageType.ANSWER: {
-      const sdpLength = readUint32(data, 9);
-      const sdp = decoder.decode(data.slice(13, 13 + sdpLength));
+      const sdpLength = readUint32(data, magicLen + 9);
+      const sdp = decoder.decode(data.slice(magicLen + 13, magicLen + 13 + sdpLength));
       return { type, timestamp, sdp } as AnswerMessage;
     }
 
     case SignalingMessageType.ICE_CANDIDATE: {
-      let offset = 9;
+      let offset = magicLen + 9;
 
       const candidateLength = readUint32(data, offset);
       offset += 4;
