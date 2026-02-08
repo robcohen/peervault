@@ -3,7 +3,7 @@
 //! WASM bindings for Iroh P2P networking in PeerVault.
 //! Exposes Iroh's Endpoint, Connection, and Stream to JavaScript.
 
-use iroh::{Endpoint, EndpointAddr, RelayMap, RelayMode, RelayUrl, SecretKey};
+use iroh::{Endpoint, EndpointAddr, RelayMap, RelayMode, RelayUrl, SecretKey, Watcher};
 use iroh_tickets::{endpoint::EndpointTicket, Ticket};
 use js_sys::{Array, Promise, Uint8Array};
 use std::sync::Arc;
@@ -165,6 +165,7 @@ impl WasmEndpoint {
         Ok(WasmConnection {
             connection,
             remote_node_id: remote_endpoint_id,
+            endpoint: Arc::clone(&self.endpoint),
         })
     }
 
@@ -213,6 +214,7 @@ impl WasmEndpoint {
         Ok(WasmConnection {
             connection,
             remote_node_id,
+            endpoint: Arc::clone(&self.endpoint),
         })
     }
 
@@ -230,6 +232,7 @@ impl WasmEndpoint {
 pub struct WasmConnection {
     connection: iroh::endpoint::Connection,
     remote_node_id: String,
+    endpoint: Arc<Endpoint>,
 }
 
 #[wasm_bindgen]
@@ -303,6 +306,29 @@ impl WasmConnection {
             rtt.as_secs_f64() * 1000.0,
             remote_id
         )
+    }
+
+    /// Get the connection type (direct, relay, mixed, or none).
+    /// Returns a string: "direct", "relay", "mixed", or "none".
+    #[wasm_bindgen(js_name = getConnectionType)]
+    pub fn get_connection_type(&self) -> String {
+        use iroh::endpoint::ConnectionType;
+
+        let remote_id = self.connection.remote_id();
+
+        // conn_type returns Option<Watcher<ConnectionType>>
+        match self.endpoint.conn_type(remote_id) {
+            Some(mut watcher) => {
+                let conn_type = watcher.get();
+                match conn_type {
+                    ConnectionType::Direct(_) => "direct".to_string(),
+                    ConnectionType::Relay(_) => "relay".to_string(),
+                    ConnectionType::Mixed(_, _) => "mixed".to_string(),
+                    ConnectionType::None => "none".to_string(),
+                }
+            }
+            None => "none".to_string(),
+        }
     }
 
     /// Close the connection.

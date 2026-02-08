@@ -369,7 +369,21 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
       : (peer.nickname || nodeIdToWords(peer.nodeId));
 
     const shortId = peer.nodeId.substring(0, 8) + "...";
-    const description = options.showDragHint ? `Drag to group • ${shortId}` : shortId;
+
+    // Get connection type for connected peers
+    let connectionTypeStr = "";
+    if (peer.state === "connected") {
+      const connType = this.plugin.peerManager?.getPeerConnectionType(peer.nodeId);
+      if (connType) {
+        connectionTypeStr = connType === "direct" ? "🔗 direct" : connType === "relay" ? "☁️ relay" : connType === "mixed" ? "🔀 mixed" : "";
+      }
+    }
+
+    const descParts: string[] = [];
+    if (options.showDragHint) descParts.push("Drag to group");
+    if (connectionTypeStr) descParts.push(connectionTypeStr);
+    descParts.push(shortId);
+    const description = descParts.join(" • ");
 
     const setting = new Setting(container)
       .setName(`${stateIcon} ${displayName}`)

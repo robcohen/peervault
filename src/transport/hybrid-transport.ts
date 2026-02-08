@@ -11,6 +11,7 @@ import type {
   SyncStream,
   TransportConfig,
   ConnectionState,
+  ConnectionType,
   TransportLogger,
 } from "./types";
 import { IrohTransport } from "./iroh-transport";
@@ -199,21 +200,26 @@ export class HybridTransport implements Transport {
    * Uses deterministic initiator selection based on peer ID comparison.
    */
   private scheduleWebRTCUpgrade(conn: HybridConnection): void {
+    this.logger.info(`[HybridTransport] scheduleWebRTCUpgrade called for ${conn.peerId.slice(0, 8)}, shouldAttempt=${this.shouldAttemptWebRTC()}, autoUpgrade=${this.config.autoUpgradeToWebRTC}`);
     if (!this.shouldAttemptWebRTC() || this.config.autoUpgradeToWebRTC === false) {
+      this.logger.debug(`[HybridTransport] WebRTC upgrade not scheduled - disabled`);
       return;
     }
 
     // Delay to let sync establish first
+    this.logger.info(`[HybridTransport] Scheduling WebRTC upgrade in ${UPGRADE_DELAY_MS}ms`);
     setTimeout(() => {
+      this.logger.info(`[HybridTransport] WebRTC upgrade timer fired, connected=${conn.isConnected()}, webrtcActive=${conn.isWebRTCActive()}`);
       if (!conn.isConnected() || conn.isWebRTCActive()) {
+        this.logger.debug(`[HybridTransport] WebRTC upgrade skipped - connection ${!conn.isConnected() ? 'closed' : 'already upgraded'}`);
         return; // Connection closed or already upgraded
       }
 
       // Deterministic initiator: lower peer ID initiates
       const shouldInitiate = this.nodeId < conn.peerId;
 
-      this.logger.debug(
-        `[Hybrid ${conn.peerId}] Scheduling WebRTC upgrade (initiator: ${shouldInitiate})`,
+      this.logger.info(
+        `[HybridTransport] Attempting WebRTC upgrade (initiator: ${shouldInitiate}, myNodeId: ${this.nodeId.slice(0, 8)}, peerId: ${conn.peerId.slice(0, 8)})`,
       );
 
       conn.attemptWebRTCUpgrade(shouldInitiate).catch((err) => {
@@ -291,6 +297,7 @@ export class HybridConnection implements PeerConnection {
   private _state: ConnectionState = "connected";
   private stateCallbacks: Array<(state: ConnectionState) => void> = [];
   private streamCallbacks: Array<(stream: SyncStream) => void> = [];
+  private pendingStreams: SyncStream[] = [];
 
   private upgradeInProgress = false;
   private signalingStream: SyncStream | null = null;
@@ -351,20 +358,22 @@ export class HybridConnection implements PeerConnection {
   }
 
   /**
-   * Handle incoming stream - always detect type using magic prefix.
-   * This enables instant stream classification without timing dependencies.
+   * Handle incoming stream - always detect stream type by checking magic prefix.
+   *
+   * The acceptor side doesn't know when an upgrade is coming, so we must always
+   * check for WebRTC signaling magic on incoming streams. The magic check is fast
+   * (just reads first 4 bytes) and prevents signaling streams from being
+   * misrouted to sync sessions.
    */
   private handleIncomingStream(stream: SyncStream): void {
-    // Always detect stream type using magic prefix - no timing dependency
-    // WebRTC signaling streams start with "PVWS" magic, sync streams don't
-    if (!this.webrtcConn) {
-      this.detectAndHandleStream(stream).catch((err) => {
-        this.logger.error(`[Hybrid ${this.peerId}] Stream handling error:`, err);
-      });
-    } else {
-      // WebRTC already connected - forward directly to callbacks
-      this.forwardStreamToCallbacks(stream);
-    }
+    this.logger.info(`[Hybrid ${this.peerId.slice(0, 8)}] handleIncomingStream: stream ${stream.id}, upgradeInProgress=${this.upgradeInProgress}, webrtcConn=${!!this.webrtcConn}, callbacks=${this.streamCallbacks.length}`);
+
+    // Always detect stream type by checking magic prefix.
+    // The acceptor doesn't know when a WebRTC upgrade is coming, so we must
+    // always check for signaling streams on incoming connections.
+    this.detectAndHandleStream(stream).catch((err) => {
+      this.logger.error(`[Hybrid ${this.peerId}] Stream handling error:`, err);
+    });
   }
 
   /**
@@ -375,20 +384,23 @@ export class HybridConnection implements PeerConnection {
    */
   private async detectAndHandleStream(stream: SyncStream): Promise<void> {
     const streamId = stream.id;
+    this.logger.debug(`[Hybrid ${this.peerId.slice(0, 8)}] detectAndHandleStream: waiting for first message on stream ${streamId}`);
 
     try {
       // Receive the first message
       const firstMessage = await stream.receive();
+      this.logger.debug(`[Hybrid ${this.peerId.slice(0, 8)}] detectAndHandleStream: received ${firstMessage.length} bytes, first 4: [${Array.from(firstMessage.slice(0, 4)).map(b => b.toString(16)).join(',')}]`);
 
       // Check for signaling magic prefix (instant, no timeout needed)
       if (hasSignalingMagic(firstMessage)) {
         // This is a WebRTC signaling stream
-        this.logger.debug(`[Hybrid ${this.peerId}] Received WebRTC signaling message on stream ${streamId}`);
+        this.logger.info(`[Hybrid ${this.peerId.slice(0, 8)}] Detected WebRTC signaling stream (magic prefix found)`);
         await this.handleWebRTCUpgradeRequest(stream, firstMessage);
         return;
       }
 
       // Regular sync stream - create replay wrapper and forward
+      this.logger.debug(`[Hybrid ${this.peerId.slice(0, 8)}] detectAndHandleStream: forwarding sync stream ${streamId}`);
       const replayStream = this.createReplayStream(stream, firstMessage);
       this.forwardStreamToCallbacks(replayStream);
 
@@ -423,12 +435,13 @@ export class HybridConnection implements PeerConnection {
   /**
    * Forward stream to registered callbacks.
    * Called by the forwarding callback registered on IrohPeerConnection.
+   * If no callbacks are registered, queue the stream for later delivery.
    */
   private forwardStreamToCallbacks(stream: SyncStream): void {
-    // This should only be called when callbacks are registered
+    // If no callbacks registered, queue the stream
     if (this.streamCallbacks.length === 0) {
-      // This shouldn't happen, but log if it does
-      this.logger.warn(`[Hybrid ${this.peerId.slice(0, 8)}] forwardStreamToCallbacks called with no callbacks registered!`);
+      this.logger.debug(`[Hybrid ${this.peerId.slice(0, 8)}] No callbacks registered, queuing stream ${stream.id}`);
+      this.pendingStreams.push(stream);
       return;
     }
 
@@ -446,6 +459,7 @@ export class HybridConnection implements PeerConnection {
    * The first message (UPGRADE_REQUEST) has already been received.
    */
   private async handleWebRTCUpgradeRequest(stream: SyncStream, firstMessage: Uint8Array): Promise<void> {
+    this.logger.info(`[Hybrid ${this.peerId.slice(0, 8)}] handleWebRTCUpgradeRequest: received upgrade request on stream ${stream.id}`);
 
     // Verify it's actually an upgrade request
     try {
@@ -455,6 +469,7 @@ export class HybridConnection implements PeerConnection {
         await stream.close();
         return;
       }
+      this.logger.info(`[Hybrid ${this.peerId.slice(0, 8)}] Verified UPGRADE_REQUEST message`);
     } catch (err) {
       this.logger.warn(`[Hybrid ${this.peerId}] Invalid upgrade request message:`, err);
       await stream.close();
@@ -463,7 +478,7 @@ export class HybridConnection implements PeerConnection {
 
     // Check if we can accept the upgrade
     if (this.upgradeInProgress) {
-      this.logger.debug(`[Hybrid ${this.peerId}] Rejecting upgrade - already in progress`);
+      this.logger.info(`[Hybrid ${this.peerId.slice(0, 8)}] Rejecting upgrade - already in progress`);
       try {
         await stream.send(serializeSignalingMessage(createUpgradeReject("Already upgrading")));
       } catch { /* ignore */ }
@@ -472,7 +487,7 @@ export class HybridConnection implements PeerConnection {
     }
 
     if (this.webrtcConn) {
-      this.logger.debug(`[Hybrid ${this.peerId}] Rejecting upgrade - already connected`);
+      this.logger.info(`[Hybrid ${this.peerId.slice(0, 8)}] Rejecting upgrade - already connected`);
       try {
         await stream.send(serializeSignalingMessage(createUpgradeReject("Already connected")));
       } catch { /* ignore */ }
@@ -481,7 +496,7 @@ export class HybridConnection implements PeerConnection {
     }
 
     if (!isWebRTCAvailable()) {
-      this.logger.debug(`[Hybrid ${this.peerId}] Rejecting upgrade - WebRTC not available`);
+      this.logger.info(`[Hybrid ${this.peerId.slice(0, 8)}] Rejecting upgrade - WebRTC not available`);
       try {
         await stream.send(serializeSignalingMessage(createUpgradeReject("WebRTC not available")));
       } catch { /* ignore */ }
@@ -492,11 +507,13 @@ export class HybridConnection implements PeerConnection {
     // Accept and handle the upgrade
     this.upgradeInProgress = true;
     this.signalingStream = stream;
+    this.logger.info(`[Hybrid ${this.peerId.slice(0, 8)}] Accepting WebRTC upgrade request, stream=${stream.id}, isOpen=${stream.isOpen()}`);
 
     try {
       // Send accept
+      this.logger.info(`[Hybrid ${this.peerId.slice(0, 8)}] Sending UPGRADE_ACCEPT...`);
       await this.sendSignaling(createUpgradeAccept());
-      this.logger.debug(`[Hybrid ${this.peerId}] Accepted WebRTC upgrade request`);
+      this.logger.info(`[Hybrid ${this.peerId.slice(0, 8)}] Sent UPGRADE_ACCEPT successfully`);
 
       // Create WebRTC peer connection
       this.webrtcConn = createWebRTCPeerConnection(
@@ -548,7 +565,8 @@ export class HybridConnection implements PeerConnection {
         }
       }
     } catch (err) {
-      this.logger.debug(`[Hybrid ${this.peerId}] WebRTC upgrade error:`, err);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      this.logger.info(`[Hybrid ${this.peerId.slice(0, 8)}] WebRTC upgrade error: ${errMsg}`);
       if (this.webrtcConn) {
         await this.webrtcConn.close();
         this.webrtcConn = null;
@@ -569,43 +587,64 @@ export class HybridConnection implements PeerConnection {
    *
    * @param isInitiator - True if we should initiate the upgrade
    */
+  /** Debug info from last attempt - for testing */
+  public lastAttemptDebug: string[] = [];
+
   async attemptWebRTCUpgrade(isInitiator: boolean): Promise<boolean> {
+    this.lastAttemptDebug = [];
+    this.lastAttemptDebug.push(`Called: isInitiator=${isInitiator}`);
+    this.lastAttemptDebug.push(`State: webrtcEnabled=${this.webrtcEnabled}, upgradeInProgress=${this.upgradeInProgress}, webrtcConn=${!!this.webrtcConn}, irohConnected=${this.irohConn.isConnected()}`);
+    this.logger.info(`[Hybrid ${this.peerId.slice(0, 8)}] attemptWebRTCUpgrade called: isInitiator=${isInitiator}, webrtcEnabled=${this.webrtcEnabled}, upgradeInProgress=${this.upgradeInProgress}, webrtcConn=${!!this.webrtcConn}, irohConnected=${this.irohConn.isConnected()}`);
+
     if (!this.webrtcEnabled) {
-      this.logger.debug(`[Hybrid ${this.peerId}] WebRTC upgrade skipped - disabled`);
+      this.lastAttemptDebug.push(`Exit: webrtcEnabled=false`);
+      this.logger.info(`[Hybrid ${this.peerId.slice(0, 8)}] WebRTC upgrade skipped - disabled`);
       return false;
     }
 
     if (this.upgradeInProgress) {
-      this.logger.debug(`[Hybrid ${this.peerId}] WebRTC upgrade skipped - already in progress`);
+      this.lastAttemptDebug.push(`Exit: upgradeInProgress=true`);
+      this.logger.info(`[Hybrid ${this.peerId.slice(0, 8)}] WebRTC upgrade skipped - already in progress`);
       return false;
     }
 
     if (this.webrtcConn) {
-      this.logger.debug(`[Hybrid ${this.peerId}] WebRTC upgrade skipped - already connected`);
+      this.lastAttemptDebug.push(`Exit: webrtcConn exists`);
+      this.logger.info(`[Hybrid ${this.peerId.slice(0, 8)}] WebRTC upgrade skipped - already connected`);
       return false;
     }
 
     if (!this.irohConn.isConnected()) {
-      this.logger.debug(`[Hybrid ${this.peerId}] WebRTC upgrade skipped - Iroh not connected`);
+      this.lastAttemptDebug.push(`Exit: Iroh not connected`);
+      this.logger.info(`[Hybrid ${this.peerId.slice(0, 8)}] WebRTC upgrade skipped - Iroh not connected`);
       return false;
     }
 
+    // Non-initiator just waits for the upgrade request via handleWebRTCUpgradeRequest.
+    // IMPORTANT: Don't set upgradeInProgress for non-initiator! This would cause a race
+    // condition where the initiator's upgrade request arrives before we return and
+    // gets rejected because upgradeInProgress is true.
+    if (!isInitiator) {
+      this.lastAttemptDebug.push(`Exit: non-initiator`);
+      this.logger.debug(`[Hybrid ${this.peerId}] Non-initiator waiting for WebRTC upgrade request`);
+      return false; // Will be handled by handleWebRTCUpgradeRequest
+    }
+
+    // Only initiator sets upgradeInProgress and actually initiates
     this.upgradeInProgress = true;
-    this.logger.debug(
-      `[Hybrid ${this.peerId}] Attempting WebRTC upgrade (initiator: ${isInitiator})`,
+    this.lastAttemptDebug.push(`Proceeding: initiator path`);
+    this.logger.info(
+      `[Hybrid ${this.peerId.slice(0, 8)}] Initiating WebRTC upgrade as initiator`,
     );
 
     try {
-      if (isInitiator) {
-        return await this.initiateWebRTCUpgrade();
-      } else {
-        // Non-initiator waits for upgrade request via incoming stream
-        // The handleIncomingStream will detect and handle it
-        this.logger.debug(`[Hybrid ${this.peerId}] Waiting for WebRTC upgrade request`);
-        return false; // Will be handled by handleWebRTCUpgradeRequest
-      }
+      const result = await this.initiateWebRTCUpgrade();
+      this.lastAttemptDebug.push(`initiateWebRTCUpgrade returned: ${result}`);
+      return result;
     } catch (err) {
-      this.logger.debug(`[Hybrid ${this.peerId}] WebRTC upgrade failed:`, err);
+      const errMsg = err instanceof Error ? err.message : String(err);
+      this.lastAttemptDebug.push(`Error: ${errMsg}`);
+      this.logger.info(`[Hybrid ${this.peerId.slice(0, 8)}] WebRTC upgrade failed: ${errMsg}`);
       return false;
     } finally {
       this.upgradeInProgress = false;
@@ -622,29 +661,38 @@ export class HybridConnection implements PeerConnection {
    * Initiate WebRTC upgrade (we create the offer).
    */
   private async initiateWebRTCUpgrade(): Promise<boolean> {
+    this.logger.info(`[Hybrid ${this.peerId.slice(0, 8)}] initiateWebRTCUpgrade: starting`);
 
     // Open signaling stream
     this.signalingStream = await this.irohConn.openStream();
-    this.logger.debug(`[Hybrid ${this.peerId}] Opened signaling stream`);
+    this.logger.info(`[Hybrid ${this.peerId.slice(0, 8)}] Opened signaling stream ${this.signalingStream.id}`);
 
     // Send upgrade request
     await this.sendSignaling(createUpgradeRequest());
-    this.logger.debug(`[Hybrid ${this.peerId}] Sent upgrade request`);
+    this.logger.info(`[Hybrid ${this.peerId.slice(0, 8)}] Sent UPGRADE_REQUEST, waiting for response...`);
 
     // Wait for response
-    const response = await this.receiveSignalingWithTimeout();
+    let response;
+    try {
+      response = await this.receiveSignalingWithTimeout();
+      this.logger.info(`[Hybrid ${this.peerId.slice(0, 8)}] Received response type: ${response.type}`);
+    } catch (err) {
+      this.logger.info(`[Hybrid ${this.peerId.slice(0, 8)}] Timeout waiting for response: ${err}`);
+      throw err;
+    }
 
     if (response.type === SignalingMessageType.UPGRADE_REJECT) {
       const reason = (response as { reason: string }).reason;
-      this.logger.debug(`[Hybrid ${this.peerId}] WebRTC upgrade rejected: ${reason}`);
+      this.logger.info(`[Hybrid ${this.peerId.slice(0, 8)}] WebRTC upgrade rejected: ${reason}`);
       return false;
     }
 
     if (response.type !== SignalingMessageType.UPGRADE_ACCEPT) {
+      this.logger.info(`[Hybrid ${this.peerId.slice(0, 8)}] Unexpected response type: ${response.type}`);
       throw new Error(`Unexpected response type: ${response.type}`);
     }
 
-    this.logger.debug(`[Hybrid ${this.peerId}] Upgrade accepted, creating WebRTC connection`);
+    this.logger.info(`[Hybrid ${this.peerId.slice(0, 8)}] Upgrade ACCEPTED, creating WebRTC connection`);
 
     // Create WebRTC peer connection
     this.webrtcConn = createWebRTCPeerConnection(
@@ -929,18 +977,32 @@ export class HybridConnection implements PeerConnection {
 
   onStream(callback: (stream: SyncStream) => void): () => void {
     const irohPending = this.irohConn.getPendingStreamCount();
-    this.logger.debug(`[Hybrid ${this.peerId.slice(0, 8)}] onStream: registering callback, ${irohPending} pending in IrohPeerConnection`);
+    const hybridPending = this.pendingStreams.length;
+    this.logger.debug(`[Hybrid ${this.peerId.slice(0, 8)}] onStream: registering callback, ${irohPending} pending in Iroh, ${hybridPending} pending in Hybrid`);
 
     this.streamCallbacks.push(callback);
 
-    // Register a callback on IrohPeerConnection to forward streams to our callbacks
+    // Register a callback on IrohPeerConnection to handle streams
     // This only happens when the first callback is registered
+    // IMPORTANT: Route through handleIncomingStream for magic prefix detection!
     if (this.streamCallbacks.length === 1) {
       this.logger.debug(`[Hybrid ${this.peerId.slice(0, 8)}] Registering forwarding callback on IrohPeerConnection`);
       this.irohConn.onStream((stream) => {
         this.logger.debug(`[Hybrid ${this.peerId.slice(0, 8)}] IrohPeerConnection delivered stream ${stream.id}`);
-        this.forwardStreamToCallbacks(stream);
+        // Route through handleIncomingStream to detect WebRTC signaling via magic prefix
+        this.handleIncomingStream(stream);
       });
+    }
+
+    // Drain any pending streams that arrived before callbacks were registered
+    while (this.pendingStreams.length > 0) {
+      const stream = this.pendingStreams.shift()!;
+      this.logger.debug(`[Hybrid ${this.peerId.slice(0, 8)}] Draining pending stream ${stream.id} to callback`);
+      try {
+        callback(stream);
+      } catch (err) {
+        this.logger.error(`[Hybrid ${this.peerId}] Error in stream callback while draining:`, err);
+      }
     }
 
     return () => {
@@ -961,8 +1023,8 @@ export class HybridConnection implements PeerConnection {
   }
 
   getPendingStreamCount(): number {
-    // Just forward to IrohPeerConnection - we no longer queue streams ourselves
-    return this.irohConn.getPendingStreamCount();
+    // Include both Iroh's pending streams and our own pending queue
+    return this.irohConn.getPendingStreamCount() + this.pendingStreams.length;
   }
 
   // Hybrid-specific methods
@@ -989,12 +1051,39 @@ export class HybridConnection implements PeerConnection {
   }
 
   /**
-   * Get connection type description.
+   * Get connection type (direct, relay, mixed, or none).
+   * - WebRTC direct → "direct"
+   * - WebRTC via TURN → "mixed" (has direct path but may use relay)
+   * - Iroh only → queries Iroh's connection type
    */
-  getConnectionType(): string {
+  getConnectionType(): ConnectionType {
     if (this.webrtcConn?.isConnected()) {
-      return this.webrtcConn.isDirect() ? "WebRTC (direct)" : "WebRTC (relay)";
+      // WebRTC direct means true P2P
+      return this.webrtcConn.isDirect() ? "direct" : "mixed";
     }
-    return "Iroh (relay)";
+    // Delegate to Iroh connection for relay/direct info
+    return this.irohConn.getConnectionType();
+  }
+
+  /**
+   * Get human-readable transport description.
+   * More detailed than getConnectionType for UI display.
+   */
+  getTransportDescription(): string {
+    if (this.webrtcConn?.isConnected()) {
+      return this.webrtcConn.isDirect() ? "WebRTC (direct)" : "WebRTC (TURN)";
+    }
+    // Use Iroh connection type for description
+    const connType = this.irohConn.getConnectionType();
+    switch (connType) {
+      case "direct":
+        return "Iroh (direct)";
+      case "relay":
+        return "Iroh (relay)";
+      case "mixed":
+        return "Iroh (mixed)";
+      default:
+        return "Iroh";
+    }
   }
 }

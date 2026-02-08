@@ -11,6 +11,7 @@ import { STATUS_ICONS } from "./status-icons";
 import { nodeIdToWords } from "../utils/device";
 import { timeAgo } from "./utils/time-utils";
 import { formatUserError } from "../utils/validation";
+import type { CloudSyncStatus } from "../cloud/types";
 
 /** Sync progress info */
 export interface SyncProgress {
@@ -129,6 +130,15 @@ export class ConnectionStatusManager {
   initialize(): void {
     if (!this.plugin.settings.showStatusBar) return;
 
+    // Clean up any stale status bar items from previous plugin instances
+    // Only remove items that are direct children of the status bar container
+    // and have our specific class
+    const statusBarContainer = document.querySelector(".status-bar");
+    if (statusBarContainer) {
+      const staleItems = statusBarContainer.querySelectorAll(":scope > .status-bar-item.peervault-status-bar");
+      staleItems.forEach(item => item.remove());
+    }
+
     this.statusBarItem = this.plugin.addStatusBarItem();
     this.statusBarItem.addClass("peervault-status-bar");
     this.update();
@@ -228,6 +238,41 @@ export class ConnectionStatusManager {
       });
       progressFill.style.width = `${progress.progress}%`;
     }
+
+    // Cloud sync status (if configured)
+    const cloudSync = this.plugin.getCloudSync?.();
+    if (cloudSync?.isConfigured()) {
+      const cloudState = cloudSync.getState();
+      const cloudIcon = this.statusBarItem.createSpan({
+        cls: "peervault-cloud-icon",
+      });
+      cloudIcon.style.marginLeft = "6px";
+
+      switch (cloudState.status) {
+        case "syncing":
+        case "uploading":
+        case "downloading":
+          cloudIcon.setText("☁↕");
+          cloudIcon.addClass("peervault-status-syncing");
+          cloudIcon.title = `Cloud: ${cloudState.status}`;
+          break;
+        case "error":
+          cloudIcon.setText("☁✗");
+          cloudIcon.addClass("peervault-status-error");
+          cloudIcon.title = `Cloud error: ${cloudState.error || "Unknown"}`;
+          break;
+        case "idle":
+          cloudIcon.setText("☁✓");
+          cloudIcon.addClass("peervault-status-connected");
+          cloudIcon.title = cloudState.lastSyncedAt
+            ? `Cloud: synced ${timeAgo(cloudState.lastSyncedAt)}`
+            : "Cloud: connected";
+          break;
+        default:
+          // disabled - don't show icon
+          break;
+      }
+    }
   }
 }
 
@@ -249,6 +294,7 @@ export class ConnectionStatusModal extends Modal {
     contentEl.createEl("h2", { text: "Connection Status" });
 
     this.renderOverview(contentEl);
+    this.renderCloudSync(contentEl);
     this.renderPeers(contentEl);
     this.renderErrors(contentEl);
     this.renderActions(contentEl);
@@ -270,7 +316,7 @@ export class ConnectionStatusModal extends Modal {
 
     // Status badge
     const statusRow = section.createDiv({ cls: "peervault-overview-row" });
-    statusRow.createSpan({ text: "Status: ", cls: "peervault-label" });
+    statusRow.createSpan({ text: "P2P Status: ", cls: "peervault-label" });
     const badge = statusRow.createSpan({
       cls: `peervault-badge peervault-badge-${status}`,
     });
@@ -308,6 +354,106 @@ export class ConnectionStatusModal extends Modal {
     }
   }
 
+  private renderCloudSync(container: HTMLElement): void {
+    const cloudSync = this.plugin.getCloudSync?.();
+    if (!cloudSync?.isConfigured()) {
+      return; // Don't show section if cloud sync not configured
+    }
+
+    const section = container.createDiv({ cls: "peervault-cloud-section" });
+    section.createEl("h3", { text: "Cloud Sync" });
+
+    const state = cloudSync.getState();
+
+    // Cloud status
+    const statusRow = section.createDiv({ cls: "peervault-overview-row" });
+    statusRow.createSpan({ text: "Status: ", cls: "peervault-label" });
+    const badge = statusRow.createSpan({
+      cls: `peervault-badge peervault-badge-${state.status === "idle" ? "connected" : state.status}`,
+    });
+    badge.setText(this.getCloudStatusText(state.status));
+
+    // Last synced
+    if (state.lastSyncedAt) {
+      const syncedRow = section.createDiv({ cls: "peervault-overview-row" });
+      syncedRow.createSpan({ text: "Last Synced: ", cls: "peervault-label" });
+      syncedRow.createSpan({
+        text: timeAgo(state.lastSyncedAt),
+        cls: "peervault-value",
+      });
+    }
+
+    // Pending uploads
+    if (state.pendingUploads > 0) {
+      const pendingRow = section.createDiv({ cls: "peervault-overview-row" });
+      pendingRow.createSpan({ text: "Pending Uploads: ", cls: "peervault-label" });
+      pendingRow.createSpan({
+        text: String(state.pendingUploads),
+        cls: "peervault-value",
+      });
+    }
+
+    // Error message
+    if (state.status === "error" && state.error) {
+      const errorRow = section.createDiv({ cls: "peervault-overview-row peervault-error-row" });
+      errorRow.createSpan({ text: "Error: ", cls: "peervault-label" });
+      errorRow.createSpan({
+        text: state.error,
+        cls: "peervault-value peervault-error-text",
+      });
+    }
+
+    // Cloud sync button
+    new Setting(section).addButton((btn) =>
+      btn
+        .setButtonText("Sync to Cloud")
+        .setDisabled(state.status === "syncing" || state.status === "uploading" || state.status === "downloading")
+        .onClick(async () => {
+          btn.setDisabled(true);
+          btn.setButtonText("Syncing...");
+          try {
+            const result = await cloudSync.sync();
+            if (result.success) {
+              const parts = [];
+              if (result.deltasUploaded > 0 || result.deltasDownloaded > 0) {
+                parts.push(`${result.deltasUploaded}↑ ${result.deltasDownloaded}↓ deltas`);
+              }
+              if (result.blobsUploaded > 0 || result.blobsDownloaded > 0) {
+                parts.push(`${result.blobsUploaded}↑ ${result.blobsDownloaded}↓ blobs`);
+              }
+              new Notice(parts.length > 0 ? `Cloud sync: ${parts.join(", ")}` : "Cloud: Already in sync");
+            } else {
+              new Notice(`Cloud sync failed: ${result.error}`);
+            }
+          } catch (error) {
+            new Notice(`Cloud sync failed: ${formatUserError(error)}`);
+          } finally {
+            btn.setButtonText("Sync to Cloud");
+            btn.setDisabled(false);
+          }
+        }),
+    );
+  }
+
+  private getCloudStatusText(status: CloudSyncStatus): string {
+    switch (status) {
+      case "idle":
+        return "Connected";
+      case "syncing":
+        return "Syncing";
+      case "uploading":
+        return "Uploading";
+      case "downloading":
+        return "Downloading";
+      case "error":
+        return "Error";
+      case "disabled":
+        return "Disabled";
+      default:
+        return "Unknown";
+    }
+  }
+
   private renderPeers(container: HTMLElement): void {
     const section = container.createDiv({ cls: "peervault-peers-section" });
     section.createEl("h3", { text: "Peers" });
@@ -339,6 +485,24 @@ export class ConnectionStatusModal extends Modal {
           ? (peer.nickname ? `${peer.hostname} (${peer.nickname})` : peer.hostname)
           : (peer.nickname || nodeIdToWords(peer.nodeId)),
       );
+
+      // Connection type (for connected peers)
+      if (peer.connectionState === "connected" || peer.connectionState === "syncing") {
+        const connType = this.plugin.peerManager?.getPeerConnectionType(peer.nodeId);
+        if (connType) {
+          const typeEl = item.createSpan({ cls: "peervault-peer-conn-type" });
+          const typeIcon = connType === "direct" ? "🔗" : connType === "relay" ? "☁️" : connType === "mixed" ? "🔀" : "";
+          const typeLabel = connType === "direct" ? "direct" : connType === "relay" ? "relay" : connType === "mixed" ? "mixed" : "";
+          typeEl.setText(`${typeIcon} ${typeLabel}`);
+          typeEl.title = connType === "direct"
+            ? "Direct peer-to-peer connection (local network)"
+            : connType === "relay"
+            ? "Connection via relay server"
+            : connType === "mixed"
+            ? "Mixed connection (direct + relay)"
+            : "Connection type unknown";
+        }
+      }
 
       // State
       const state = item.createSpan({

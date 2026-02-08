@@ -22,10 +22,80 @@ import type {
   ConnectionHealth,
   ConnectionQuality,
 } from "./types";
+import type { KnownPeerInfo, KeyExchangeRequestMessage } from "../sync/types";
+import { SyncMessageType } from "../sync/types";
 import { PeerGroupManager, DEFAULT_GROUP_ID } from "./groups";
 import { PeerErrors } from "../errors";
+import {
+  PairingKeyExchange,
+  isKeyExchangeMessage,
+  parseKeyExchangeMessage,
+} from "../crypto";
+
+/**
+ * A stream wrapper that can prepend buffered data to the first receive() call.
+ * Used when we need to peek at stream data for protocol detection.
+ */
+class BufferedStream implements SyncStream {
+  private bufferedData: Uint8Array | null;
+  private inner: SyncStream;
+
+  constructor(inner: SyncStream, bufferedData: Uint8Array) {
+    this.inner = inner;
+    this.bufferedData = bufferedData;
+  }
+
+  get id(): string {
+    return this.inner.id;
+  }
+
+  async send(data: Uint8Array): Promise<void> {
+    return this.inner.send(data);
+  }
+
+  async receive(): Promise<Uint8Array> {
+    // Return buffered data on first call
+    if (this.bufferedData) {
+      const data = this.bufferedData;
+      this.bufferedData = null;
+      return data;
+    }
+    return this.inner.receive();
+  }
+
+  async close(): Promise<void> {
+    return this.inner.close();
+  }
+
+  isOpen(): boolean {
+    return this.inner.isOpen();
+  }
+}
 
 const PEERS_STORAGE_KEY = "peervault-peers";
+const DISCOVERED_PEERS_STORAGE_KEY = "peervault-discovered-peers";
+const TOMBSTONES_STORAGE_KEY = "peervault-peer-tombstones";
+
+/** Stored format for discovered peers */
+interface StoredDiscoveredPeer {
+  peer: KnownPeerInfo;
+  discoveredAt: number;
+}
+
+/** Tombstone for removed peers - prevents re-discovery */
+interface PeerTombstone {
+  nodeId: string;
+  groupIds: string[];
+  removedAt: number;
+  reason: "removed" | "left";
+}
+
+/**
+ * Global cleanup coordination for PeerManager instances.
+ * When a PeerManager is shutting down, new instances must wait for it to complete.
+ * This prevents race conditions when plugins are rapidly disabled/enabled.
+ */
+let pendingPeerManagerCleanup: Promise<void> | null = null;
 
 /** Rate limiting config for pairing requests */
 const PAIRING_RATE_LIMIT = {
@@ -68,9 +138,11 @@ interface PeerManagerEvents extends Record<string, unknown> {
   "peer:pairing-request": PairingRequest;
   "peer:pairing-accepted": string;
   "peer:pairing-denied": string;
+  "peer:discovered": KnownPeerInfo; // Peer discovered via gossip
   "vault:adoption-request": VaultAdoptionRequest;
   "status:change": "idle" | "syncing" | "offline" | "error";
   "blob:received": string; // blob hash - used to retry binary file writes
+  "live:updates": void; // CRDT updates received during live mode
 }
 
 /**
@@ -89,6 +161,60 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   private pairingRequestHistory = new Map<string, number[]>();
   /** Denial tracking for exponential backoff: nodeId -> { count, lastDenied } */
   private pairingDenialHistory = new Map<string, { count: number; lastDenied: number }>();
+  /** Discovered peers from announcements - waiting for them to connect to us */
+  private discoveredPeers = new Map<string, { peer: KnownPeerInfo; discoveredAt: number }>();
+  /** Queue of discovered peers to connect to (rate-limited) */
+  private discoveryQueue: KnownPeerInfo[] = [];
+  /** Currently active discovery connection attempts */
+  private activeDiscoveryConnections = 0;
+  /** Max concurrent discovery connections to prevent storms */
+  private static readonly MAX_CONCURRENT_DISCOVERY = 3;
+  /** Base delay between discovery connection attempts (ms) */
+  private static readonly DISCOVERY_BASE_DELAY = 500;
+  /** Whether discovery queue is being processed */
+  private processingDiscoveryQueue = false;
+  /** Retry tracking for failed discovery connections */
+  private discoveryRetries = new Map<string, { count: number; lastAttempt: number; peer: KnownPeerInfo }>();
+  /** Max retry attempts for discovery connections */
+  private static readonly MAX_DISCOVERY_RETRIES = 3;
+  /** Base retry delay for discovery connections (ms) - doubles each attempt */
+  private static readonly DISCOVERY_RETRY_BASE_DELAY = 2000;
+  /** TTL for discovered peers waiting for incoming connections (ms) */
+  private static readonly DISCOVERED_PEER_TTL = 5 * 60 * 1000; // 5 minutes
+  /** Cleanup interval for stale discovered peers (ms) */
+  private static readonly DISCOVERY_CLEANUP_INTERVAL = 60 * 1000; // 1 minute
+  /** Timer for cleaning up stale discovered peers */
+  private discoveryCleanupTimer: ReturnType<typeof setInterval> | null = null;
+  /** Tombstones for removed peers - prevents re-discovery */
+  private peerTombstones = new Map<string, PeerTombstone>();
+  /** TTL for peer tombstones (ms) - after this, peer can be re-discovered */
+  private static readonly TOMBSTONE_TTL = 60 * 60 * 1000; // 1 hour
+  /** Timer for periodic re-announcements */
+  private reAnnouncementTimer: ReturnType<typeof setInterval> | null = null;
+  /** Interval for periodic re-announcements (ms) */
+  private static readonly RE_ANNOUNCEMENT_INTERVAL = 2 * 60 * 1000; // 2 minutes
+  /** Seen announcement hashes for deduplication */
+  private seenAnnouncements = new Set<string>();
+  /** TTL for seen announcements (ms) */
+  private static readonly SEEN_ANNOUNCEMENT_TTL = 5 * 60 * 1000; // 5 minutes
+  /** Timestamps for seen announcements (for cleanup) */
+  private seenAnnouncementTimestamps = new Map<string, number>();
+  /** Rate limiting for announcements: nodeId -> array of timestamps */
+  private announcementRateLimit = new Map<string, number[]>();
+  /** Max announcements per peer per window */
+  private static readonly MAX_ANNOUNCEMENTS_PER_PEER = 20;
+  /** Time window for announcement rate limiting (ms) */
+  private static readonly ANNOUNCEMENT_RATE_WINDOW = 60 * 1000; // 1 minute
+  /** Timer for peer list reconciliation */
+  private reconciliationTimer: ReturnType<typeof setInterval> | null = null;
+  /** Interval for peer list reconciliation (ms) */
+  private static readonly RECONCILIATION_INTERVAL = 5 * 60 * 1000; // 5 minutes
+  /** Timer for connection repair */
+  private connectionRepairTimer: ReturnType<typeof setInterval> | null = null;
+  /** Interval for connection repair (ms) */
+  private static readonly CONNECTION_REPAIR_INTERVAL = 30 * 1000; // 30 seconds
+  /** Minimum time since last seen before attempting repair (ms) */
+  private static readonly REPAIR_STALE_THRESHOLD = 60 * 1000; // 1 minute
   private config: Omit<Required<PeerManagerConfig>, "hostname" | "nickname"> & { hostname: string; nickname?: string };
   private autoSyncTimer: ReturnType<typeof setInterval> | null = null;
   private initialSyncTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -104,6 +230,8 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   private shuttingDown = false;
   /** Tickets currently being processed by addPeer to prevent duplicate calls */
   private pendingAddPeerTickets = new Set<string>();
+  /** Key exchange handler for vault key sharing during pairing */
+  private pairingKeyExchange: PairingKeyExchange | null = null;
 
   constructor(
     private transport: Transport,
@@ -125,10 +253,79 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   }
 
   /**
+   * Set the pairing key exchange handler.
+   * This should be called after the transport is initialized with the Iroh secret key.
+   */
+  setPairingKeyExchange(keyExchange: PairingKeyExchange): void {
+    this.pairingKeyExchange = keyExchange;
+    this.logger.debug("Pairing key exchange handler configured");
+  }
+
+  /**
+   * Get the pairing key exchange handler.
+   */
+  getPairingKeyExchange(): PairingKeyExchange | null {
+    return this.pairingKeyExchange;
+  }
+
+  /**
+   * Request vault key from a peer.
+   * Opens a new stream for key exchange and requests the vault key.
+   * Only called by initiator during first pairing.
+   */
+  async requestVaultKeyFromPeer(connection: PeerConnection, peer: PeerInfo): Promise<void> {
+    if (!this.pairingKeyExchange) {
+      this.logger.debug("No PairingKeyExchange configured, skipping key exchange");
+      return;
+    }
+
+    // Only request if we don't already have a vault key
+    const hasKey = await this.pairingKeyExchange.hasVaultKey();
+    if (hasKey) {
+      this.logger.debug("Already have vault key, skipping key exchange request");
+      return;
+    }
+
+    try {
+      this.logger.info(`Requesting vault key from peer ${peer.nodeId.slice(0, 8)}`);
+
+      // Open a new stream for key exchange
+      const stream = await Promise.race([
+        connection.openStream(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("Key exchange stream open timeout")), 30000)
+        ),
+      ]);
+
+      // Request vault key from peer
+      const result = await this.pairingKeyExchange.requestKeyFromPeer(stream);
+
+      if (result.success && result.vaultKey) {
+        this.logger.info(`Received vault key from peer ${peer.nodeId.slice(0, 8)}`);
+      } else {
+        this.logger.warn(`Key exchange failed: ${result.error}`);
+      }
+
+      // Close the key exchange stream
+      await stream.close().catch(() => {});
+    } catch (error) {
+      this.logger.warn("Failed to request vault key from peer:", error);
+    }
+  }
+
+  /**
    * Initialize the peer manager.
    * Loads stored peers and sets up connection handlers.
    */
   async initialize(): Promise<void> {
+    // Wait for any pending cleanup from a previous instance
+    // This prevents race conditions when plugins are rapidly disabled/enabled
+    if (pendingPeerManagerCleanup) {
+      this.logger.debug("Waiting for previous PeerManager cleanup to complete...");
+      await pendingPeerManagerCleanup;
+      this.logger.debug("Previous PeerManager cleanup complete");
+    }
+
     // Guard against multiple initialization or initialization during shutdown
     if (this.initialized) {
       this.logger.warn("PeerManager already initialized, skipping");
@@ -141,7 +338,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     this.initialized = true;
 
     // Clear any stale sessions from previous plugin instance
-    // (async cleanup from previous onunload may not have completed)
+    // (this is a safety net - normally pendingPeerManagerCleanup handles this)
     if (this.sessions.size > 0) {
       this.logger.warn(`Clearing ${this.sessions.size} stale sessions from previous instance`);
       for (const [nodeId, session] of this.sessions) {
@@ -163,6 +360,10 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     // Load stored peers
     await this.loadPeers();
 
+    // Load discovered peers and tombstones from storage
+    await this.loadDiscoveredPeers();
+    await this.loadTombstones();
+
     // Clean up stale peer IDs from groups
     const validPeerIds = new Set(this.peers.keys());
     const cleaned = this.groupManager.cleanupStalePeers(validPeerIds);
@@ -182,21 +383,80 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       this.startPeriodicSync();
     }
 
+    // Start cleanup timer for stale discovered peers
+    this.startDiscoveryCleanup();
+
+    // Start periodic re-announcements for mesh consistency
+    this.startReAnnouncements();
+
+    // Start periodic peer list reconciliation (anti-entropy)
+    this.startReconciliation();
+
+    // Start periodic connection repair for peers without live sessions
+    this.startConnectionRepair();
+
     this.logger.info("PeerManager initialized");
   }
 
   /**
    * Shut down the peer manager.
+   * Tracks cleanup globally so new instances wait for it to complete.
    */
   async shutdown(): Promise<void> {
     // Guard against concurrent shutdown or shutdown when not initialized
     if (this.shuttingDown) {
       this.logger.warn("PeerManager already shutting down, skipping");
+      // Return the existing cleanup promise so callers can await it
+      if (pendingPeerManagerCleanup) {
+        await pendingPeerManagerCleanup;
+      }
       return;
     }
     this.shuttingDown = true;
 
+    // Track this cleanup globally so new instances wait for it
+    const cleanupPromise = this.performShutdown();
+    pendingPeerManagerCleanup = cleanupPromise;
+
+    try {
+      await cleanupPromise;
+    } finally {
+      // Clear the global tracker when done
+      if (pendingPeerManagerCleanup === cleanupPromise) {
+        pendingPeerManagerCleanup = null;
+      }
+    }
+  }
+
+  /**
+   * Internal shutdown implementation.
+   */
+  private async performShutdown(): Promise<void> {
     this.stopAutoSync();
+
+    // Stop discovery cleanup timer
+    if (this.discoveryCleanupTimer) {
+      clearInterval(this.discoveryCleanupTimer);
+      this.discoveryCleanupTimer = null;
+    }
+
+    // Stop re-announcement timer
+    if (this.reAnnouncementTimer) {
+      clearInterval(this.reAnnouncementTimer);
+      this.reAnnouncementTimer = null;
+    }
+
+    // Stop reconciliation timer
+    if (this.reconciliationTimer) {
+      clearInterval(this.reconciliationTimer);
+      this.reconciliationTimer = null;
+    }
+
+    // Stop connection repair timer
+    if (this.connectionRepairTimer) {
+      clearInterval(this.connectionRepairTimer);
+      this.connectionRepairTimer = null;
+    }
 
     // Cancel all pending reconnect timers
     for (const timer of this.reconnectTimers.values()) {
@@ -219,6 +479,10 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     // Save peer state
     await this.savePeers();
 
+    // Save discovered peers and tombstones for persistence across restarts
+    await this.saveDiscoveredPeers();
+    await this.saveTombstones();
+
     // Clean up pending pairing request listeners before clearing
     for (const pending of this.pendingPairingRequests.values()) {
       pending.unsubscribeStateChange();
@@ -229,6 +493,13 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     this.pairingRequestHistory.clear();
     this.pairingDenialHistory.clear();
     this.pendingPairingRequests.clear();
+    this.discoveredPeers.clear();
+    this.discoveryQueue.length = 0;
+    this.discoveryRetries.clear();
+    this.peerTombstones.clear();
+    this.seenAnnouncements.clear();
+    this.seenAnnouncementTimestamps.clear();
+    this.announcementRateLimit.clear();
 
     // Remove all event listeners
     this.removeAllListeners();
@@ -244,14 +515,18 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
 
   /**
    * Add a new peer using their connection ticket.
+   * @param ticket - The connection ticket for the peer
+   * @param targetGroupId - Optional group ID to add the peer to (defaults to DEFAULT_GROUP_ID)
    */
-  async addPeer(ticket: string): Promise<PeerInfo> {
+  async addPeer(ticket: string, targetGroupId?: string): Promise<PeerInfo> {
     // Guard against duplicate concurrent calls with the same ticket
     if (this.pendingAddPeerTickets.has(ticket)) {
       this.logger.warn("addPeer already in progress for this ticket, ignoring duplicate call");
       throw PeerErrors.unknownPeer("Duplicate addPeer call");
     }
     this.pendingAddPeerTickets.add(ticket);
+
+    const groupId = targetGroupId || DEFAULT_GROUP_ID;
 
     try {
       this.setStatus("syncing");
@@ -260,12 +535,34 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       const connection = await this.transport.connectWithTicket(ticket);
       const nodeId = connection.peerId;
 
-      // Check if peer already exists
+      // Check for duplicate session - if we already have an active session, skip
+      const existingSession = this.sessions.get(nodeId);
+      if (existingSession) {
+        const state = existingSession.getState();
+        if (state === "live" || state === "syncing" || state === "exchanging_versions") {
+          this.logger.debug(`Already have active session with ${nodeId.slice(0, 8)} (state: ${state}), skipping addPeer`);
+          // Update peer's lastSeen but don't start another session
+          const peer = this.peers.get(nodeId);
+          if (peer) {
+            peer.lastSeen = Date.now();
+            await this.savePeers();
+            return peer;
+          }
+        }
+      }
+
+      // Check if peer already exists (for key exchange decision)
+      const existingPeerBefore = this.peers.has(nodeId);
       let peer = this.peers.get(nodeId);
       if (peer) {
         // Update existing peer
         peer.ticket = ticket;
         peer.lastSeen = Date.now();
+        // Add to target group if not already a member
+        if (!peer.groupIds?.includes(groupId)) {
+          peer.groupIds = [...(peer.groupIds || []), groupId];
+          this.groupManager.addPeerToGroup(groupId, nodeId);
+        }
       } else {
         // Create new peer (hostname/nickname will be received during sync)
         peer = {
@@ -275,19 +572,30 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
           firstSeen: Date.now(),
           lastSeen: Date.now(),
           trusted: true, // New peers are trusted by default
-          groupIds: [DEFAULT_GROUP_ID], // Add to default group
+          groupIds: [groupId], // Add to specified group
         };
         this.peers.set(nodeId, peer);
 
         // Also add to the group manager
-        this.groupManager.addPeerToGroup(DEFAULT_GROUP_ID, nodeId);
+        this.groupManager.addPeerToGroup(groupId, nodeId);
       }
 
       // Start sync session
       await this.startSyncSession(connection, peer);
 
+      // Request vault key from peer if this is a new peer (first pairing)
+      // and we don't already have a vault key
+      if (!existingPeerBefore) {
+        await this.requestVaultKeyFromPeer(connection, peer);
+      }
+
       await this.savePeers();
       this.emit("peer:connected", peer);
+
+      // Announce the new peer to other group members (for mesh discovery)
+      this.announcePeerToGroup(peer).catch(err => {
+        this.logger.warn("Failed to announce peer to group:", err);
+      });
 
       return peer;
     } catch (error) {
@@ -303,6 +611,9 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
    * Remove a peer and notify them.
    */
   async removePeer(nodeId: string): Promise<void> {
+    const peer = this.peers.get(nodeId);
+    const peerGroups = peer?.groupIds || [DEFAULT_GROUP_ID];
+
     const session = this.sessions.get(nodeId);
     if (session) {
       // Always remove from map first to prevent stale references
@@ -319,6 +630,14 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     this.peers.delete(nodeId);
     this.reconnectAttempts.delete(nodeId);
     this.groupManager.removePeerFromAllGroups(nodeId);
+
+    // Create tombstone to prevent re-discovery
+    this.createTombstone(nodeId, peerGroups, "removed");
+
+    // Announce the removal to other group members (mesh cleanup)
+    this.announcePeerLeft(nodeId, peerGroups, "removed").catch(err => {
+      this.logger.warn("Failed to announce peer removal:", err);
+    });
 
     await this.savePeers();
     this.emit("peer:disconnected", { nodeId, reason: "removed" });
@@ -370,6 +689,16 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   getPeerRtt(nodeId: string): number | undefined {
     const connection = this.transport.getConnection(nodeId);
     return connection?.getRttMs();
+  }
+
+  /**
+   * Get the connection type for a peer (direct, relay, mixed, or none).
+   * @param nodeId Peer's node ID
+   * @returns Connection type or undefined if not connected
+   */
+  getPeerConnectionType(nodeId: string): import("../transport/types").ConnectionType | undefined {
+    const connection = this.transport.getConnection(nodeId);
+    return connection?.getConnectionType();
   }
 
   /**
@@ -514,12 +843,17 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
 
   /**
    * Accept a pairing request from an unknown peer.
+   * @param nodeId - The peer's node ID
+   * @param nickname - Optional nickname for the peer
+   * @param targetGroupId - Optional group ID to add the peer to (defaults to DEFAULT_GROUP_ID)
    */
-  async acceptPairingRequest(nodeId: string, nickname?: string): Promise<PeerInfo> {
+  async acceptPairingRequest(nodeId: string, nickname?: string, targetGroupId?: string): Promise<PeerInfo> {
     const pending = this.pendingPairingRequests.get(nodeId);
     if (!pending) {
       throw PeerErrors.unknownPeer(nodeId);
     }
+
+    const groupId = targetGroupId || DEFAULT_GROUP_ID;
 
     const { connection, unsubscribeStateChange } = pending;
     unsubscribeStateChange(); // Clean up state change listener
@@ -534,10 +868,10 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       firstSeen: Date.now(),
       lastSeen: Date.now(),
       trusted: true,
-      groupIds: [DEFAULT_GROUP_ID],
+      groupIds: [groupId],
     };
     this.peers.set(nodeId, peer);
-    this.groupManager.addPeerToGroup(DEFAULT_GROUP_ID, nodeId);
+    this.groupManager.addPeerToGroup(groupId, nodeId);
 
     this.logger.info("Accepted pairing request from:", nodeId);
     this.emit("peer:pairing-accepted", nodeId);
@@ -580,6 +914,11 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       // Don't set error state - the initiator (peer) will retry and we'll accept then
       // Setting up the stream listener above ensures we can accept future streams
     }
+
+    // Announce the new peer to other group members (for mesh discovery)
+    this.announcePeerToGroup(peer).catch(err => {
+      this.logger.warn("Failed to announce peer to group:", err);
+    });
 
     return peer;
   }
@@ -737,6 +1076,567 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     };
   }
 
+  /**
+   * Clear all sessions in error state.
+   * Used for recovery after reconnection failures.
+   */
+  clearErrorSessions(): void {
+    const toDelete: string[] = [];
+
+    for (const [nodeId, session] of this.sessions) {
+      if (session.getState() === "error") {
+        toDelete.push(nodeId);
+      }
+    }
+
+    for (const nodeId of toDelete) {
+      this.logger.debug(`Clearing error session for ${nodeId.slice(0, 8)}`);
+      const session = this.sessions.get(nodeId);
+      if (session) {
+        try {
+          session.close();
+        } catch {
+          // Ignore close errors
+        }
+      }
+      this.sessions.delete(nodeId);
+    }
+
+    if (toDelete.length > 0) {
+      this.logger.info(`Cleared ${toDelete.length} error session(s)`);
+    }
+  }
+
+  // ===========================================================================
+  // Peer Discovery (Group-Based)
+  // ===========================================================================
+
+  /**
+   * Get all known peers as KnownPeerInfo for protocol discovery exchange.
+   * Only includes peers that are trusted and have tickets.
+   */
+  getKnownPeersInfo(): KnownPeerInfo[] {
+    const result: KnownPeerInfo[] = [];
+    const ourNodeId = this.transport.getNodeId();
+
+    for (const peer of this.peers.values()) {
+      // Skip self and untrusted peers
+      if (peer.nodeId === ourNodeId || !peer.trusted) {
+        continue;
+      }
+
+      // Only include peers with tickets (required for discovery)
+      if (!peer.ticket) {
+        continue;
+      }
+
+      result.push({
+        nodeId: peer.nodeId,
+        ticket: peer.ticket,
+        groupIds: peer.groupIds || [DEFAULT_GROUP_ID],
+        lastSeen: peer.lastSeen || Date.now(),
+      });
+    }
+
+    return result;
+  }
+
+  /**
+   * Handle peer discovery info received during VERSION_INFO exchange.
+   * This processes group IDs and known peers sent by the remote peer.
+   */
+  handlePeerDiscoveryInfo(
+    fromPeerId: string,
+    groupIds: string[],
+    knownPeers: KnownPeerInfo[]
+  ): void {
+    this.logger.info(
+      `Received discovery info from ${fromPeerId.slice(0, 8)}: ${groupIds.length} groups, ${knownPeers.length} peers`
+    );
+
+    // Update the sending peer's group membership
+    const peer = this.peers.get(fromPeerId);
+    if (peer && groupIds.length > 0) {
+      // Update peer's known groups
+      const newGroups = groupIds.filter(gid => !peer.groupIds?.includes(gid));
+      if (newGroups.length > 0) {
+        peer.groupIds = [...(peer.groupIds || []), ...newGroups];
+        for (const gid of newGroups) {
+          this.groupManager.addPeerToGroup(gid, fromPeerId);
+        }
+        this.savePeers().catch(err => this.logger.error("Failed to save peers:", err));
+      }
+    }
+
+    // Process discovered peers
+    for (const discovered of knownPeers) {
+      this.processDiscoveredPeer(discovered, fromPeerId);
+    }
+  }
+
+  /**
+   * Handle peer announcement received during live mode.
+   * This processes newly joined/discovered peers announced by group members.
+   */
+  handlePeerAnnouncement(
+    fromPeerId: string,
+    peers: KnownPeerInfo[],
+    reason: "joined" | "discovered" | "updated"
+  ): void {
+    // Rate limit announcements per peer
+    if (!this.checkAnnouncementRateLimit(fromPeerId)) {
+      this.logger.warn(
+        `Rate limiting announcements from ${fromPeerId.slice(0, 8)} - too many in short time`
+      );
+      return;
+    }
+
+    this.logger.info(
+      `Received peer announcement from ${fromPeerId.slice(0, 8)} (${reason}): ${peers.length} peer(s)`
+    );
+
+    for (const announced of peers) {
+      // Check for duplicate announcements
+      const announcementHash = this.computeAnnouncementHash(announced, fromPeerId);
+      if (this.isAnnouncementSeen(announcementHash)) {
+        this.logger.debug(
+          `Skipping duplicate announcement for ${announced.nodeId.slice(0, 8)} from ${fromPeerId.slice(0, 8)}`
+        );
+        continue;
+      }
+
+      // Mark as seen
+      this.markAnnouncementSeen(announcementHash);
+
+      // Process the peer
+      this.processDiscoveredPeer(announced, fromPeerId);
+    }
+  }
+
+  /**
+   * Compute a hash for announcement deduplication.
+   * Includes nodeId, groupIds, and source to identify unique announcements.
+   */
+  private computeAnnouncementHash(peer: KnownPeerInfo, sourceNodeId: string): string {
+    // Use nodeId + sorted groupIds + source as the hash key
+    const groupKey = peer.groupIds.slice().sort().join(",");
+    return `${peer.nodeId}:${groupKey}:${sourceNodeId}`;
+  }
+
+  /**
+   * Check if an announcement has been seen recently.
+   */
+  private isAnnouncementSeen(hash: string): boolean {
+    return this.seenAnnouncements.has(hash);
+  }
+
+  /**
+   * Mark an announcement as seen.
+   */
+  private markAnnouncementSeen(hash: string): void {
+    this.seenAnnouncements.add(hash);
+    this.seenAnnouncementTimestamps.set(hash, Date.now());
+  }
+
+  /**
+   * Check announcement rate limit for a peer.
+   * Returns true if allowed, false if rate limited.
+   */
+  private checkAnnouncementRateLimit(nodeId: string): boolean {
+    const now = Date.now();
+    const windowStart = now - PeerManager.ANNOUNCEMENT_RATE_WINDOW;
+
+    let history = this.announcementRateLimit.get(nodeId) ?? [];
+
+    // Remove old entries outside the window
+    history = history.filter(ts => ts > windowStart);
+
+    if (history.length >= PeerManager.MAX_ANNOUNCEMENTS_PER_PEER) {
+      return false;
+    }
+
+    // Record this announcement
+    history.push(now);
+    this.announcementRateLimit.set(nodeId, history);
+
+    return true;
+  }
+
+  /**
+   * Process a discovered peer and optionally connect to it.
+   */
+  private processDiscoveredPeer(discovered: KnownPeerInfo, sourceNodeId: string): void {
+    const ourNodeId = this.transport.getNodeId();
+
+    // Skip self
+    if (discovered.nodeId === ourNodeId) {
+      return;
+    }
+
+    // Skip tombstoned peers (recently removed)
+    const tombstone = this.peerTombstones.get(discovered.nodeId);
+    if (tombstone) {
+      const age = Date.now() - tombstone.removedAt;
+      if (age < PeerManager.TOMBSTONE_TTL) {
+        this.logger.debug(
+          `Ignoring tombstoned peer ${discovered.nodeId.slice(0, 8)} (removed ${Math.floor(age / 1000)}s ago)`
+        );
+        return;
+      }
+      // Tombstone expired, remove it
+      this.peerTombstones.delete(discovered.nodeId);
+    }
+
+    // Check if we already know this peer
+    const existingPeer = this.peers.get(discovered.nodeId);
+
+    if (existingPeer) {
+      // Update existing peer's ticket if we didn't have one
+      if (!existingPeer.ticket && discovered.ticket) {
+        existingPeer.ticket = discovered.ticket;
+        this.logger.debug(`Updated ticket for known peer ${discovered.nodeId.slice(0, 8)}`);
+      }
+
+      // Update group membership
+      const newGroups = discovered.groupIds.filter(gid => !existingPeer.groupIds?.includes(gid));
+      if (newGroups.length > 0) {
+        existingPeer.groupIds = [...(existingPeer.groupIds || []), ...newGroups];
+        for (const gid of newGroups) {
+          this.groupManager.addPeerToGroup(gid, discovered.nodeId);
+        }
+        this.savePeers().catch(err => this.logger.error("Failed to save peers:", err));
+      }
+      return;
+    }
+
+    // Check if we share any groups with this peer (only connect to group members)
+    const ourGroupIds = this.groupManager.getLocalGroupIds();
+    const sharedGroups = discovered.groupIds.filter(gid => ourGroupIds.includes(gid));
+
+    if (sharedGroups.length === 0) {
+      this.logger.debug(
+        `Ignoring discovered peer ${discovered.nodeId.slice(0, 8)} - no shared groups`
+      );
+      return;
+    }
+
+    // This is a new peer in our group - emit discovery event
+    this.logger.info(
+      `Discovered new peer ${discovered.nodeId.slice(0, 8)} via ${sourceNodeId.slice(0, 8)} (shared groups: ${sharedGroups.join(", ")})`
+    );
+    this.emit("peer:discovered", discovered);
+
+    // Auto-connect to discovered peer if we have their ticket
+    if (discovered.ticket) {
+      this.connectToDiscoveredPeer(discovered);
+    }
+  }
+
+  /**
+   * Queue a discovered peer for connection (rate-limited).
+   * Uses deterministic ordering to prevent dual-initiator deadlock.
+   */
+  private connectToDiscoveredPeer(discovered: KnownPeerInfo): void {
+    // Don't connect if already connecting or connected
+    if (this.peers.has(discovered.nodeId)) {
+      return;
+    }
+
+    // Don't connect during shutdown
+    if (this.shuttingDown) {
+      return;
+    }
+
+    // Check if already in queue
+    if (this.discoveryQueue.some(p => p.nodeId === discovered.nodeId)) {
+      return;
+    }
+
+    // Use deterministic ordering: only the device with smaller node ID initiates.
+    // This prevents both devices from trying to connect to each other simultaneously.
+    const ourNodeId = this.transport.getNodeId();
+    if (ourNodeId > discovered.nodeId) {
+      this.logger.debug(
+        `Not initiating connection to ${discovered.nodeId.slice(0, 8)} - waiting for them to connect (node ID ordering)`
+      );
+      // Store the discovered peer with timestamp so we auto-accept when they connect
+      this.discoveredPeers.set(discovered.nodeId, { peer: discovered, discoveredAt: Date.now() });
+      return;
+    }
+
+    // Add to discovery queue
+    this.discoveryQueue.push(discovered);
+    this.logger.debug(`Queued discovered peer ${discovered.nodeId.slice(0, 8)} for connection (queue size: ${this.discoveryQueue.length})`);
+
+    // Start processing queue if not already running
+    this.processDiscoveryQueueAsync();
+  }
+
+  /**
+   * Process the discovery queue with rate limiting.
+   * Connects to discovered peers with staggered delays to prevent connection storms.
+   */
+  private processDiscoveryQueueAsync(): void {
+    if (this.processingDiscoveryQueue) {
+      return;
+    }
+    this.processingDiscoveryQueue = true;
+
+    // Use setImmediate to not block the current call stack
+    setTimeout(() => this.processDiscoveryQueue(), 0);
+  }
+
+  /**
+   * Internal: Process discovery queue items with rate limiting.
+   */
+  private async processDiscoveryQueue(): Promise<void> {
+    while (this.discoveryQueue.length > 0 && !this.shuttingDown) {
+      // Wait if at max concurrent connections
+      while (this.activeDiscoveryConnections >= PeerManager.MAX_CONCURRENT_DISCOVERY && !this.shuttingDown) {
+        await new Promise(r => setTimeout(r, 100));
+      }
+
+      if (this.shuttingDown) break;
+
+      const discovered = this.discoveryQueue.shift();
+      if (!discovered) continue;
+
+      // Skip if already connected while waiting in queue
+      if (this.peers.has(discovered.nodeId)) {
+        continue;
+      }
+
+      // Add staggered delay based on node ID hash to spread out connection storms
+      // When multiple devices discover each other simultaneously, this helps prevent
+      // all connections from being attempted at the exact same moment
+      const staggerDelay = this.calculateStaggerDelay(discovered.nodeId);
+      if (staggerDelay > 0) {
+        await new Promise(r => setTimeout(r, staggerDelay));
+      }
+
+      // Check again after delay
+      if (this.peers.has(discovered.nodeId) || this.shuttingDown) {
+        continue;
+      }
+
+      this.activeDiscoveryConnections++;
+      const retryInfo = this.discoveryRetries.get(discovered.nodeId);
+      const attemptNum = (retryInfo?.count ?? 0) + 1;
+      this.logger.info(`Auto-connecting to discovered peer ${discovered.nodeId.slice(0, 8)} (attempt ${attemptNum}, active: ${this.activeDiscoveryConnections})`);
+
+      try {
+        // Use addPeer which handles all the connection logic
+        await this.addPeer(discovered.ticket!, discovered.groupIds[0]);
+        // Success - clear retry tracking
+        this.discoveryRetries.delete(discovered.nodeId);
+      } catch (error) {
+        // Don't propagate error - this is a background operation
+        this.logger.warn(`Failed to auto-connect to discovered peer:`, error);
+        // Track retry for exponential backoff
+        this.discoveryRetries.set(discovered.nodeId, {
+          count: attemptNum,
+          lastAttempt: Date.now(),
+          peer: discovered,
+        });
+      } finally {
+        this.activeDiscoveryConnections--;
+      }
+    }
+
+    this.processingDiscoveryQueue = false;
+  }
+
+  /**
+   * Calculate a stagger delay based on node IDs to spread out connection attempts.
+   * Uses XOR of our node ID and peer node ID to get deterministic but distributed delays.
+   */
+  private calculateStaggerDelay(peerNodeId: string): number {
+    const ourNodeId = this.transport.getNodeId();
+
+    // XOR first 4 bytes of each node ID to get a semi-random value
+    let xorValue = 0;
+    for (let i = 0; i < Math.min(8, ourNodeId.length, peerNodeId.length); i++) {
+      xorValue ^= ourNodeId.charCodeAt(i) ^ peerNodeId.charCodeAt(i);
+    }
+
+    // Convert to delay: 0-500ms based on XOR value
+    return (xorValue % 256) * (PeerManager.DISCOVERY_BASE_DELAY / 256);
+  }
+
+  /**
+   * Announce a peer to all connected group members.
+   * Called when a new peer successfully connects and syncs.
+   */
+  async announcePeerToGroup(peer: PeerInfo): Promise<void> {
+    if (!peer.ticket) {
+      this.logger.debug(`Cannot announce peer ${peer.nodeId.slice(0, 8)} - no ticket`);
+      return;
+    }
+
+    const peerGroups = peer.groupIds || [DEFAULT_GROUP_ID];
+    const announcement: KnownPeerInfo = {
+      nodeId: peer.nodeId,
+      ticket: peer.ticket,
+      groupIds: peerGroups,
+      lastSeen: peer.lastSeen || Date.now(),
+    };
+
+    // Collect existing group members to announce to the new peer
+    const existingMembersForNewPeer: KnownPeerInfo[] = [];
+
+    // Find all sessions for peers in the same groups
+    let announcedCount = 0;
+    for (const [sessionNodeId, session] of this.sessions) {
+      // Don't announce to the peer itself
+      if (sessionNodeId === peer.nodeId) {
+        continue;
+      }
+
+      // Only announce if session is live
+      if (session.getState() !== "live") {
+        continue;
+      }
+
+      // Check if this session's peer shares any groups with the new peer
+      const sessionPeer = this.peers.get(sessionNodeId);
+      if (!sessionPeer) {
+        continue;
+      }
+
+      const sharedGroups = (sessionPeer.groupIds || [DEFAULT_GROUP_ID]).filter(gid => peerGroups.includes(gid));
+      if (sharedGroups.length === 0) {
+        continue;
+      }
+
+      // Announce the new peer to this session
+      try {
+        await session.sendPeerAnnouncement([announcement], "joined");
+        announcedCount++;
+      } catch (err) {
+        this.logger.warn(`Failed to announce peer to ${sessionNodeId.slice(0, 8)}:`, err);
+      }
+
+      // Collect this existing member for announcement to the new peer
+      if (sessionPeer.ticket) {
+        existingMembersForNewPeer.push({
+          nodeId: sessionPeer.nodeId,
+          ticket: sessionPeer.ticket,
+          groupIds: sessionPeer.groupIds || [DEFAULT_GROUP_ID],
+          lastSeen: sessionPeer.lastSeen || Date.now(),
+        });
+      }
+    }
+
+    if (announcedCount > 0) {
+      this.logger.info(`Announced peer ${peer.nodeId.slice(0, 8)} to ${announcedCount} group member(s)`);
+    }
+
+    // Now announce existing group members to the new peer
+    if (existingMembersForNewPeer.length > 0) {
+      const newPeerSession = this.sessions.get(peer.nodeId);
+      if (newPeerSession && newPeerSession.getState() === "live") {
+        try {
+          await newPeerSession.sendPeerAnnouncement(existingMembersForNewPeer, "discovered");
+          this.logger.info(
+            `Announced ${existingMembersForNewPeer.length} existing member(s) to new peer ${peer.nodeId.slice(0, 8)}`
+          );
+        } catch (err) {
+          this.logger.warn(`Failed to announce existing members to new peer:`, err);
+        }
+      }
+    }
+  }
+
+  /**
+   * Announce that a peer has left to all other group members.
+   * Called when a peer is removed or disconnects.
+   */
+  async announcePeerLeft(
+    nodeId: string,
+    groupIds: string[],
+    reason: "removed" | "disconnected" | "left"
+  ): Promise<void> {
+    let announcedCount = 0;
+
+    for (const [sessionNodeId, session] of this.sessions) {
+      // Don't notify the peer that left
+      if (sessionNodeId === nodeId) {
+        continue;
+      }
+
+      // Only notify if session is live
+      if (session.getState() !== "live") {
+        continue;
+      }
+
+      // Check if this session's peer shares any groups with the leaving peer
+      const sessionPeer = this.peers.get(sessionNodeId);
+      if (!sessionPeer) {
+        continue;
+      }
+
+      const sharedGroups = (sessionPeer.groupIds || []).filter(gid => groupIds.includes(gid));
+      if (sharedGroups.length === 0) {
+        continue;
+      }
+
+      // Notify about the peer leaving
+      try {
+        await session.sendPeerLeft(nodeId, groupIds, reason);
+        announcedCount++;
+      } catch (err) {
+        this.logger.warn(`Failed to announce peer left to ${sessionNodeId.slice(0, 8)}:`, err);
+      }
+    }
+
+    if (announcedCount > 0) {
+      this.logger.info(`Announced peer ${nodeId.slice(0, 8)} left to ${announcedCount} group member(s)`);
+    }
+  }
+
+  /**
+   * Handle peer left notification from another group member.
+   * Used for mesh cleanup when a peer is removed elsewhere.
+   */
+  handlePeerLeft(
+    nodeId: string,
+    groupIds: string[],
+    reason: "removed" | "disconnected" | "left"
+  ): void {
+    // Remove from discovered peers (if waiting for them to connect)
+    this.discoveredPeers.delete(nodeId);
+
+    // Remove from discovery queue
+    const queueIndex = this.discoveryQueue.findIndex(p => p.nodeId === nodeId);
+    if (queueIndex !== -1) {
+      this.discoveryQueue.splice(queueIndex, 1);
+    }
+
+    // Create tombstone to prevent re-discovery (for "removed" and "left" reasons)
+    if (reason === "removed" || reason === "left") {
+      this.createTombstone(nodeId, groupIds, reason === "removed" ? "removed" : "left");
+    }
+
+    // If we're connected to this peer, we should also disconnect
+    const peer = this.peers.get(nodeId);
+    if (peer && reason === "removed") {
+      this.logger.info(`Peer ${nodeId.slice(0, 8)} was removed from group by another member`);
+      // Note: Don't cascade the removal announcement to avoid infinite loops
+      // Just close the session and clean up locally
+      const session = this.sessions.get(nodeId);
+      if (session) {
+        this.sessions.delete(nodeId);
+        session.close().catch(err => {
+          this.logger.warn("Error closing session after peer left:", err);
+        });
+      }
+      this.peers.delete(nodeId);
+      this.groupManager.removePeerFromAllGroups(nodeId);
+      this.savePeers().catch(err => this.logger.error("Failed to save peers:", err));
+      this.emit("peer:disconnected", { nodeId, reason: "removed" });
+    }
+  }
+
   // ===========================================================================
   // Manual Sync
   // ===========================================================================
@@ -745,6 +1645,9 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
    * Manually trigger sync with all connected peers.
    */
   async syncAll(): Promise<void> {
+    // Clear any stale error sessions before syncing
+    this.clearErrorSessions();
+
     this.setStatus("syncing");
 
     const syncTasks: Array<{ nodeId: string; promise: Promise<void> }> = [];
@@ -834,6 +1737,24 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       throw PeerErrors.notFound(nodeId);
     }
 
+    // Register persistent stream listener for this connection.
+    // This is critical for WebRTC upgrade - the peer may send signaling streams
+    // even when we're the sync initiator.
+    // NOTE: onStream is idempotent - it won't re-register if already registered.
+    const unsubscribeStream = connection.onStream((stream) => {
+      this.logger.debug(`[syncPeer] onStream callback fired for peer ${peer.nodeId.slice(0, 8)}, stream ${stream.id}`);
+      this.handleIncomingStream(stream, connection, peer).catch((err) => {
+        this.logger.error("Error handling incoming stream:", err);
+      });
+    });
+
+    // Clean up listener when connection closes
+    connection.onStateChange((state) => {
+      if (state === "disconnected" || state === "error") {
+        unsubscribeStream();
+      }
+    });
+
     // Check if peer has pending streams for us - if so, handle those first
     // This prevents the race condition where both sides try to initiate simultaneously
     const pendingCount = connection.getPendingStreamCount();
@@ -872,64 +1793,101 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     });
 
     // Check if peer is known
-    const peer = this.peers.get(nodeId);
+    let peer = this.peers.get(nodeId);
     if (!peer) {
-      // Unknown peer - check rate limits before accepting pairing request
-      const rateLimited = !this.checkPairingRateLimit(nodeId);
-      protocolTracer.trace("", nodeId, "peer", "pairing.creating", {
-        rateLimited,
-      });
+      // Check if this is a discovered peer from a group announcement
+      const discoveredEntry = this.discoveredPeers.get(nodeId);
+      if (discoveredEntry) {
+        this.logger.info(`Auto-accepting connection from discovered peer ${nodeId.slice(0, 8)}`);
+        this.discoveredPeers.delete(nodeId);
+        // Also clear any retry state
+        this.discoveryRetries.delete(nodeId);
 
-      if (rateLimited) {
-        this.logger.warn("Pairing request rate limited:", nodeId);
-        await connection.close();
+        const discoveredPeer = discoveredEntry.peer;
+
+        // Create peer info from discovered peer data
+        const now = Date.now();
+        peer = {
+          nodeId,
+          nickname: undefined,
+          trusted: true,
+          groupIds: discoveredPeer.groupIds,
+          ticket: discoveredPeer.ticket,
+          state: "connecting" as const,
+          firstSeen: now,
+          lastSeen: now,
+        };
+
+        this.peers.set(nodeId, peer);
+
+        // Add to group(s)
+        const groupId = discoveredPeer.groupIds[0] || DEFAULT_GROUP_ID;
+        this.groupManager.addPeerToGroup(groupId, nodeId);
+
+        await this.savePeers();
+        this.emit("peer:connected", peer);
+        // Continue to the normal sync flow below
+      } else {
+        // Unknown peer - check rate limits before accepting pairing request
+        const rateLimited = !this.checkPairingRateLimit(nodeId);
+        protocolTracer.trace("", nodeId, "peer", "pairing.creating", {
+          rateLimited,
+        });
+
+        if (rateLimited) {
+          this.logger.warn("Pairing request rate limited:", nodeId);
+          await connection.close();
+          return;
+        }
+
+        this.logger.info("Pairing request from unknown peer:", nodeId);
+
+        const request: PairingRequest = {
+          nodeId,
+          timestamp: Date.now(),
+        };
+
+        // Clean up pending request if connection disconnects before user responds
+        const unsubscribeStateChange = connection.onStateChange((state) => {
+          if (state === "disconnected" || state === "error") {
+            const pending = this.pendingPairingRequests.get(nodeId);
+            if (pending && pending.connection === connection) {
+              this.logger.debug("Pairing request connection lost:", nodeId);
+              pending.unsubscribeStateChange(); // Clean up the listener
+              this.pendingPairingRequests.delete(nodeId);
+            }
+          }
+        });
+
+        // Store the connection and unsubscribe so we can accept/deny later
+        this.pendingPairingRequests.set(nodeId, { request, connection, unsubscribeStateChange });
+
+        protocolTracer.trace("", nodeId, "peer", "pairing.stored", {
+          pendingCount: this.pendingPairingRequests.size,
+        });
+
+        // Emit event for UI to show the request
+        this.emit("peer:pairing-request", request);
         return;
       }
-
-      this.logger.info("Pairing request from unknown peer:", nodeId);
-
-      const request: PairingRequest = {
-        nodeId,
-        timestamp: Date.now(),
-      };
-
-      // Clean up pending request if connection disconnects before user responds
-      const unsubscribeStateChange = connection.onStateChange((state) => {
-        if (state === "disconnected" || state === "error") {
-          const pending = this.pendingPairingRequests.get(nodeId);
-          if (pending && pending.connection === connection) {
-            this.logger.debug("Pairing request connection lost:", nodeId);
-            pending.unsubscribeStateChange(); // Clean up the listener
-            this.pendingPairingRequests.delete(nodeId);
-          }
-        }
-      });
-
-      // Store the connection and unsubscribe so we can accept/deny later
-      this.pendingPairingRequests.set(nodeId, { request, connection, unsubscribeStateChange });
-
-      protocolTracer.trace("", nodeId, "peer", "pairing.stored", {
-        pendingCount: this.pendingPairingRequests.size,
-      });
-
-      // Emit event for UI to show the request
-      this.emit("peer:pairing-request", request);
-      return;
     }
 
+    // At this point, peer is guaranteed to be defined (either from peers map or discovered)
+    const knownPeer = peer!;
+
     // Verify peer is trusted before accepting sync
-    if (!peer.trusted) {
+    if (!knownPeer.trusted) {
       this.logger.warn("Rejected untrusted peer:", nodeId);
       await connection.close();
       return;
     }
 
-    peer.lastSeen = Date.now();
+    knownPeer.lastSeen = Date.now();
 
     // Register persistent stream listener for this connection.
     // This allows the peer to initiate new sync sessions at any time.
     const unsubscribe = connection.onStream((stream) => {
-      this.handleIncomingStream(stream, connection, peer).catch((err) => {
+      this.handleIncomingStream(stream, connection, knownPeer).catch((err) => {
         this.logger.error("Error handling incoming stream:", err);
       });
     });
@@ -943,7 +1901,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
 
     // Also process any streams that arrived before we registered the listener
     // (they're queued in pendingStreams)
-    this.processPendingStreams(connection, peer);
+    this.processPendingStreams(connection, knownPeer);
   }
 
   // ===========================================================================
@@ -965,6 +1923,15 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       this.logger.debug(`Sync session ${peer.nodeId} state:`, state);
       if (state === "live") {
         this.updatePeerState(peer.nodeId, "synced");
+        // Reset global status to idle when we have a live session
+        // This clears any transient "error" status from failed operations
+        if (this.status === "error" || this.status === "syncing") {
+          this.setStatus("idle");
+        }
+        // Announce the peer to other group members now that session is live
+        this.announcePeerToGroup(peer).catch(err => {
+          this.logger.warn("Failed to announce peer on live state:", err);
+        });
       } else if (state === "error") {
         this.updatePeerState(peer.nodeId, "error");
         this.handleSyncError(peer.nodeId);
@@ -1040,6 +2007,10 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     session.on("blob:received", (hash) => {
       this.emit("blob:received", hash);
     });
+
+    session.on("live:updates", () => {
+      this.emit("live:updates", undefined);
+    });
   }
 
   private async startSyncSession(
@@ -1068,6 +2039,9 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     // Generate our ticket for bidirectional reconnection
     const ourTicket = await this.transport.generateTicket();
 
+    // Get our groups for discovery
+    const ourGroupIds = this.groupManager.getLocalGroupIds();
+
     // Create new session with blob store for binary sync
     const session = new SyncSession(
       peer.nodeId,
@@ -1078,6 +2052,18 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
         ourTicket,
         ourHostname: this.config.hostname,
         ourNickname: this.config.nickname,
+        // Group-based peer discovery
+        ourGroupIds,
+        getKnownPeers: () => this.getKnownPeersInfo(),
+        onPeerDiscoveryInfo: (groupIds, knownPeers) => {
+          this.handlePeerDiscoveryInfo(peer.nodeId, groupIds, knownPeers);
+        },
+        onPeerAnnouncement: (peers, reason) => {
+          this.handlePeerAnnouncement(peer.nodeId, peers, reason);
+        },
+        onPeerLeft: (nodeId, groupIds, reason) => {
+          this.handlePeerLeft(nodeId, groupIds, reason);
+        },
       },
       this.blobStore,
     );
@@ -1127,6 +2113,9 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     // Generate our ticket for bidirectional reconnection
     const ourTicket = await this.transport.generateTicket();
 
+    // Get our groups for discovery
+    const ourGroupIds = this.groupManager.getLocalGroupIds();
+
     // Create vault adoption confirmation callback with timeout to prevent indefinite hanging
     const VAULT_ADOPTION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
     const onVaultAdoptionNeeded = async (peerVaultId: string, ourVaultId: string): Promise<boolean> => {
@@ -1172,6 +2161,18 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
         ourTicket,
         ourHostname: this.config.hostname,
         ourNickname: this.config.nickname,
+        // Group-based peer discovery
+        ourGroupIds,
+        getKnownPeers: () => this.getKnownPeersInfo(),
+        onPeerDiscoveryInfo: (groupIds, knownPeers) => {
+          this.handlePeerDiscoveryInfo(peer.nodeId, groupIds, knownPeers);
+        },
+        onPeerAnnouncement: (peers, reason) => {
+          this.handlePeerAnnouncement(peer.nodeId, peers, reason);
+        },
+        onPeerLeft: (nodeId, groupIds, reason) => {
+          this.handlePeerLeft(nodeId, groupIds, reason);
+        },
       },
       this.blobStore,
     );
@@ -1185,6 +2186,50 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     // Accept stream and handle incoming sync
     const stream = await connection.acceptStream();
     await session.handleIncomingSync(stream);
+  }
+
+  /**
+   * Handle a key exchange stream.
+   * Receives vault key request and responds with our vault key.
+   */
+  private async handleKeyExchangeStream(
+    stream: SyncStream,
+    firstMessage: Uint8Array,
+    peer: PeerInfo,
+  ): Promise<void> {
+    this.logger.info(`[handleKeyExchangeStream] Handling key exchange from peer ${peer.nodeId.slice(0, 8)}`);
+
+    if (!this.pairingKeyExchange) {
+      this.logger.warn("Key exchange stream received but no PairingKeyExchange configured");
+      return;
+    }
+
+    try {
+      // Parse the key exchange message
+      const message = parseKeyExchangeMessage(firstMessage);
+      if (!message) {
+        this.logger.warn("Failed to parse key exchange message");
+        return;
+      }
+
+      if (message.type === SyncMessageType.KEY_EXCHANGE_REQUEST) {
+        // We received a request - respond with our vault key
+        const result = await this.pairingKeyExchange.respondToKeyRequest(
+          stream,
+          message as KeyExchangeRequestMessage,
+        );
+
+        if (result.success) {
+          this.logger.info(`Key exchange completed - shared vault key with peer ${peer.nodeId.slice(0, 8)}`);
+        } else {
+          this.logger.warn(`Key exchange failed: ${result.error}`);
+        }
+      } else {
+        this.logger.warn(`Unexpected key exchange message type: ${message.type}`);
+      }
+    } catch (error) {
+      this.logger.error("Error handling key exchange stream:", error);
+    }
   }
 
   /**
@@ -1251,6 +2296,31 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       this.sessions.delete(peer.nodeId);
     }
 
+    // Read first message to detect stream type (key exchange vs sync)
+    let firstMessage: Uint8Array;
+    try {
+      firstMessage = await Promise.race([
+        stream.receive(),
+        new Promise<Uint8Array>((_, reject) =>
+          setTimeout(() => reject(new Error("Stream type detection timeout")), 10000)
+        ),
+      ]);
+    } catch (err) {
+      this.logger.warn(`Failed to read first message from stream ${stream.id}:`, err);
+      return;
+    }
+
+    // Check if this is a key exchange stream
+    if (isKeyExchangeMessage(firstMessage)) {
+      this.logger.debug(`Stream ${stream.id} is a key exchange stream`);
+      await this.handleKeyExchangeStream(stream, firstMessage, peer);
+      return;
+    }
+
+    // Not key exchange - proceed with sync protocol
+    // Wrap stream to return the first message on next receive()
+    const bufferedStream = new BufferedStream(stream, firstMessage);
+
     // Get effective sync policy for this peer
     const syncPolicy = this.groupManager.getEffectiveSyncPolicy(peer.nodeId);
 
@@ -1314,8 +2384,8 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     this.sessions.set(peer.nodeId, session);
     this.updatePeerState(peer.nodeId, "syncing");
 
-    // Handle the incoming sync with the provided stream
-    await session.handleIncomingSync(stream);
+    // Handle the incoming sync with the buffered stream (contains first message)
+    await session.handleIncomingSync(bufferedStream);
   }
 
   /**
@@ -1435,6 +2505,9 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
    */
   private startPeriodicSync(): void {
     this.autoSyncTimer = setInterval(() => {
+      // Clear any stale error sessions before syncing
+      this.clearErrorSessions();
+
       this.syncAll().catch((err) => {
         this.logger.error("Periodic sync failed:", err);
       });
@@ -1492,6 +2565,111 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     if (this.autoSyncTimer) {
       clearInterval(this.autoSyncTimer);
       this.autoSyncTimer = null;
+    }
+  }
+
+  /**
+   * Start cleanup timer for stale discovered peers.
+   * Removes discovered peers that haven't connected within the TTL.
+   */
+  private startDiscoveryCleanup(): void {
+    this.discoveryCleanupTimer = setInterval(() => {
+      this.cleanupStaleDiscoveredPeers();
+    }, PeerManager.DISCOVERY_CLEANUP_INTERVAL);
+  }
+
+  /**
+   * Clean up discovered peers that have exceeded their TTL.
+   * Also re-queues failed discoveries that are ready for retry.
+   * Also cleans up expired tombstones.
+   */
+  private cleanupStaleDiscoveredPeers(): void {
+    const now = Date.now();
+
+    // Clean up stale discovered peers
+    for (const [nodeId, entry] of this.discoveredPeers) {
+      const age = now - entry.discoveredAt;
+      if (age > PeerManager.DISCOVERED_PEER_TTL) {
+        this.logger.debug(
+          `Removing stale discovered peer ${nodeId.slice(0, 8)} (waited ${Math.floor(age / 1000)}s for incoming connection)`
+        );
+        this.discoveredPeers.delete(nodeId);
+      }
+    }
+
+    // Clean up expired tombstones
+    let expiredTombstones = 0;
+    for (const [nodeId, tombstone] of this.peerTombstones) {
+      if (now - tombstone.removedAt > PeerManager.TOMBSTONE_TTL) {
+        this.peerTombstones.delete(nodeId);
+        expiredTombstones++;
+      }
+    }
+    if (expiredTombstones > 0) {
+      this.logger.debug(`Cleaned up ${expiredTombstones} expired tombstone(s)`);
+      // Save updated tombstones
+      this.saveTombstones().catch(err => {
+        this.logger.warn("Failed to save tombstones after cleanup:", err);
+      });
+    }
+
+    // Clean up stale seen announcements
+    let expiredAnnouncements = 0;
+    for (const [hash, timestamp] of this.seenAnnouncementTimestamps) {
+      if (now - timestamp > PeerManager.SEEN_ANNOUNCEMENT_TTL) {
+        this.seenAnnouncements.delete(hash);
+        this.seenAnnouncementTimestamps.delete(hash);
+        expiredAnnouncements++;
+      }
+    }
+    if (expiredAnnouncements > 0) {
+      this.logger.debug(`Cleaned up ${expiredAnnouncements} stale seen announcement(s)`);
+    }
+
+    // Clean up stale announcement rate limit entries
+    for (const [nodeId, history] of this.announcementRateLimit) {
+      const windowStart = now - PeerManager.ANNOUNCEMENT_RATE_WINDOW;
+      const filtered = history.filter(ts => ts > windowStart);
+      if (filtered.length === 0) {
+        this.announcementRateLimit.delete(nodeId);
+      } else if (filtered.length !== history.length) {
+        this.announcementRateLimit.set(nodeId, filtered);
+      }
+    }
+
+    // Re-queue retries that are due
+    for (const [nodeId, retryInfo] of this.discoveryRetries) {
+      // Skip if already connected
+      if (this.peers.has(nodeId)) {
+        this.discoveryRetries.delete(nodeId);
+        continue;
+      }
+
+      // Skip if already in queue
+      if (this.discoveryQueue.some(p => p.nodeId === nodeId)) {
+        continue;
+      }
+
+      // Calculate retry delay (exponential backoff)
+      const retryDelay = PeerManager.DISCOVERY_RETRY_BASE_DELAY * Math.pow(2, retryInfo.count - 1);
+      const readyAt = retryInfo.lastAttempt + retryDelay;
+
+      if (now >= readyAt) {
+        if (retryInfo.count >= PeerManager.MAX_DISCOVERY_RETRIES) {
+          // Max retries reached, give up
+          this.logger.debug(
+            `Giving up on discovered peer ${nodeId.slice(0, 8)} after ${retryInfo.count} failed attempts`
+          );
+          this.discoveryRetries.delete(nodeId);
+        } else {
+          // Re-queue for retry
+          this.logger.debug(
+            `Re-queuing discovered peer ${nodeId.slice(0, 8)} for retry (attempt ${retryInfo.count + 1})`
+          );
+          this.discoveryQueue.push(retryInfo.peer);
+          this.processDiscoveryQueueAsync();
+        }
+      }
     }
   }
 
@@ -1646,5 +2824,368 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
 
     const data = new TextEncoder().encode(JSON.stringify(stored));
     await this.storage.write(PEERS_STORAGE_KEY, data);
+  }
+
+  /**
+   * Load discovered peers from storage.
+   * Filters out stale entries that have exceeded TTL.
+   */
+  private async loadDiscoveredPeers(): Promise<void> {
+    try {
+      const data = await this.storage.read(DISCOVERED_PEERS_STORAGE_KEY);
+      if (data) {
+        const stored = JSON.parse(new TextDecoder().decode(data)) as StoredDiscoveredPeer[];
+        const now = Date.now();
+        let loadedCount = 0;
+        let staleCount = 0;
+
+        for (const entry of stored) {
+          // Skip entries that have exceeded TTL
+          if (now - entry.discoveredAt > PeerManager.DISCOVERED_PEER_TTL) {
+            staleCount++;
+            continue;
+          }
+
+          // Skip if we already know this peer
+          if (this.peers.has(entry.peer.nodeId)) {
+            continue;
+          }
+
+          // Skip if tombstoned
+          if (this.peerTombstones.has(entry.peer.nodeId)) {
+            continue;
+          }
+
+          this.discoveredPeers.set(entry.peer.nodeId, entry);
+          loadedCount++;
+        }
+
+        if (loadedCount > 0 || staleCount > 0) {
+          this.logger.debug(`Loaded ${loadedCount} discovered peers (${staleCount} stale)`);
+        }
+      }
+    } catch (error) {
+      this.logger.warn("Failed to load discovered peers:", error);
+    }
+  }
+
+  /**
+   * Save discovered peers to storage.
+   */
+  private async saveDiscoveredPeers(): Promise<void> {
+    try {
+      const stored: StoredDiscoveredPeer[] = Array.from(this.discoveredPeers.values());
+      const data = new TextEncoder().encode(JSON.stringify(stored));
+      await this.storage.write(DISCOVERED_PEERS_STORAGE_KEY, data);
+    } catch (error) {
+      this.logger.warn("Failed to save discovered peers:", error);
+    }
+  }
+
+  /**
+   * Load tombstones from storage.
+   * Filters out expired tombstones.
+   */
+  private async loadTombstones(): Promise<void> {
+    try {
+      const data = await this.storage.read(TOMBSTONES_STORAGE_KEY);
+      if (data) {
+        const stored = JSON.parse(new TextDecoder().decode(data)) as PeerTombstone[];
+        const now = Date.now();
+        let loadedCount = 0;
+        let expiredCount = 0;
+
+        for (const tombstone of stored) {
+          // Skip expired tombstones
+          if (now - tombstone.removedAt > PeerManager.TOMBSTONE_TTL) {
+            expiredCount++;
+            continue;
+          }
+
+          this.peerTombstones.set(tombstone.nodeId, tombstone);
+          loadedCount++;
+        }
+
+        if (loadedCount > 0 || expiredCount > 0) {
+          this.logger.debug(`Loaded ${loadedCount} tombstones (${expiredCount} expired)`);
+        }
+      }
+    } catch (error) {
+      this.logger.warn("Failed to load tombstones:", error);
+    }
+  }
+
+  /**
+   * Save tombstones to storage.
+   */
+  private async saveTombstones(): Promise<void> {
+    try {
+      const stored: PeerTombstone[] = Array.from(this.peerTombstones.values());
+      const data = new TextEncoder().encode(JSON.stringify(stored));
+      await this.storage.write(TOMBSTONES_STORAGE_KEY, data);
+    } catch (error) {
+      this.logger.warn("Failed to save tombstones:", error);
+    }
+  }
+
+  /**
+   * Create a tombstone for a removed peer.
+   * Prevents the peer from being re-discovered for TOMBSTONE_TTL.
+   */
+  private createTombstone(nodeId: string, groupIds: string[], reason: "removed" | "left"): void {
+    const tombstone: PeerTombstone = {
+      nodeId,
+      groupIds,
+      removedAt: Date.now(),
+      reason,
+    };
+    this.peerTombstones.set(nodeId, tombstone);
+    this.logger.debug(`Created tombstone for peer ${nodeId.slice(0, 8)} (reason: ${reason})`);
+
+    // Save tombstones asynchronously
+    this.saveTombstones().catch(err => {
+      this.logger.warn("Failed to save tombstones:", err);
+    });
+  }
+
+  /**
+   * Start periodic re-announcements for mesh consistency.
+   */
+  private startReAnnouncements(): void {
+    this.reAnnouncementTimer = setInterval(() => {
+      this.reAnnounceAllPeers().catch(err => {
+        this.logger.warn("Failed to re-announce peers:", err);
+      });
+    }, PeerManager.RE_ANNOUNCEMENT_INTERVAL);
+  }
+
+  /**
+   * Re-announce all connected peers to ensure mesh consistency.
+   * This helps recover from missed gossip messages.
+   */
+  private async reAnnounceAllPeers(): Promise<void> {
+    // Collect all connected peers with tickets
+    const peersToAnnounce: KnownPeerInfo[] = [];
+
+    for (const peer of this.peers.values()) {
+      if (!peer.ticket || !peer.trusted) {
+        continue;
+      }
+
+      // Only announce peers with active sessions
+      const session = this.sessions.get(peer.nodeId);
+      if (!session || session.getState() !== "live") {
+        continue;
+      }
+
+      peersToAnnounce.push({
+        nodeId: peer.nodeId,
+        ticket: peer.ticket,
+        groupIds: peer.groupIds || [DEFAULT_GROUP_ID],
+        lastSeen: peer.lastSeen || Date.now(),
+      });
+    }
+
+    if (peersToAnnounce.length === 0) {
+      return;
+    }
+
+    // Announce to all live sessions
+    let announcedCount = 0;
+    for (const [sessionNodeId, session] of this.sessions) {
+      if (session.getState() !== "live") {
+        continue;
+      }
+
+      // Filter out the peer we're announcing to
+      const peersForSession = peersToAnnounce.filter(p => p.nodeId !== sessionNodeId);
+      if (peersForSession.length === 0) {
+        continue;
+      }
+
+      try {
+        await session.sendPeerAnnouncement(peersForSession, "discovered");
+        announcedCount++;
+      } catch (err) {
+        this.logger.debug(`Failed to re-announce to ${sessionNodeId.slice(0, 8)}:`, err);
+      }
+    }
+
+    if (announcedCount > 0) {
+      this.logger.debug(`Re-announced ${peersToAnnounce.length} peer(s) to ${announcedCount} session(s)`);
+    }
+  }
+
+  /**
+   * Start periodic peer list reconciliation (anti-entropy).
+   * This ensures peer lists eventually converge even if announcements are missed.
+   */
+  private startReconciliation(): void {
+    this.reconciliationTimer = setInterval(() => {
+      this.reconcilePeerLists().catch(err => {
+        this.logger.warn("Failed to reconcile peer lists:", err);
+      });
+    }, PeerManager.RECONCILIATION_INTERVAL);
+  }
+
+  /**
+   * Reconcile peer lists with all connected peers.
+   * Sends our full known peer list and processes any new peers discovered.
+   * This is more thorough than re-announcements as it includes ALL known peers.
+   */
+  private async reconcilePeerLists(): Promise<void> {
+    // Get ALL known peers (not just those with active sessions)
+    const allKnownPeers = this.getKnownPeersInfo();
+
+    if (allKnownPeers.length === 0) {
+      return;
+    }
+
+    // Send full peer list to all live sessions
+    let reconcileCount = 0;
+    for (const [sessionNodeId, session] of this.sessions) {
+      if (session.getState() !== "live") {
+        continue;
+      }
+
+      // Filter out the peer we're sending to
+      const peersForSession = allKnownPeers.filter(p => p.nodeId !== sessionNodeId);
+      if (peersForSession.length === 0) {
+        continue;
+      }
+
+      try {
+        // Use "updated" reason to indicate this is a reconciliation
+        await session.sendPeerAnnouncement(peersForSession, "updated");
+        reconcileCount++;
+      } catch (err) {
+        this.logger.debug(`Failed to reconcile with ${sessionNodeId.slice(0, 8)}:`, err);
+      }
+    }
+
+    if (reconcileCount > 0) {
+      this.logger.debug(`Reconciled peer list (${allKnownPeers.length} peers) with ${reconcileCount} session(s)`);
+    }
+  }
+
+  /**
+   * Request peer list from a specific peer for reconciliation.
+   * Used when we suspect our peer list is out of sync.
+   */
+  async requestPeerListReconciliation(nodeId: string): Promise<void> {
+    const session = this.sessions.get(nodeId);
+    if (!session || session.getState() !== "live") {
+      this.logger.debug(`Cannot request reconciliation from ${nodeId.slice(0, 8)} - no live session`);
+      return;
+    }
+
+    // Send our peer list to trigger a response
+    const allKnownPeers = this.getKnownPeersInfo().filter(p => p.nodeId !== nodeId);
+    if (allKnownPeers.length > 0) {
+      try {
+        await session.sendPeerAnnouncement(allKnownPeers, "updated");
+        this.logger.debug(`Sent peer list reconciliation request to ${nodeId.slice(0, 8)}`);
+      } catch (err) {
+        this.logger.warn(`Failed to send reconciliation request to ${nodeId.slice(0, 8)}:`, err);
+      }
+    }
+  }
+
+  /**
+   * Start periodic connection repair.
+   * Detects peers without live sessions and attempts to reconnect.
+   */
+  private startConnectionRepair(): void {
+    this.connectionRepairTimer = setInterval(() => {
+      this.repairConnections().catch(err => {
+        this.logger.warn("Failed to repair connections:", err);
+      });
+    }, PeerManager.CONNECTION_REPAIR_INTERVAL);
+  }
+
+  /**
+   * Repair connections to peers that don't have live sessions.
+   * This handles cases where:
+   * - Discovery race conditions left peers without sessions
+   * - Sessions died but weren't properly restarted
+   * - Network issues caused temporary disconnections
+   */
+  private async repairConnections(): Promise<void> {
+    const now = Date.now();
+    const peersToRepair: PeerInfo[] = [];
+
+    for (const peer of this.peers.values()) {
+      // Skip untrusted peers
+      if (!peer.trusted) {
+        continue;
+      }
+
+      // Skip peers without tickets (can't reconnect)
+      if (!peer.ticket) {
+        continue;
+      }
+
+      // Check if peer has a live session
+      const session = this.sessions.get(peer.nodeId);
+      const hasLiveSession = session && session.getState() === "live";
+
+      if (hasLiveSession) {
+        continue;
+      }
+
+      // Check if peer is stale (hasn't been seen recently)
+      const timeSinceLastSeen = now - (peer.lastSeen || 0);
+      if (timeSinceLastSeen < PeerManager.REPAIR_STALE_THRESHOLD) {
+        // Recently active, might be in the middle of connecting
+        continue;
+      }
+
+      // Check if already being reconnected
+      if (this.reconnectTimers.has(peer.nodeId)) {
+        continue;
+      }
+
+      // Check if in discovery queue
+      if (this.discoveryQueue.some(p => p.nodeId === peer.nodeId)) {
+        continue;
+      }
+
+      peersToRepair.push(peer);
+    }
+
+    if (peersToRepair.length === 0) {
+      return;
+    }
+
+    this.logger.info(`Connection repair: found ${peersToRepair.length} peer(s) without live sessions`);
+
+    // Attempt to repair each peer
+    for (const peer of peersToRepair) {
+      // Use deterministic ordering - only initiate if we have lower node ID
+      const ourNodeId = this.transport.getNodeId();
+      if (ourNodeId > peer.nodeId) {
+        // Wait for them to connect to us
+        this.logger.debug(
+          `Repair: waiting for ${peer.nodeId.slice(0, 8)} to connect (node ID ordering)`
+        );
+        // Update peer state to show we're aware it's disconnected
+        if (peer.state !== "offline" && peer.state !== "error") {
+          this.updatePeerState(peer.nodeId, "offline");
+        }
+        continue;
+      }
+
+      // We initiate - attempt reconnection
+      this.logger.debug(`Repair: initiating reconnection to ${peer.nodeId.slice(0, 8)}`);
+
+      // Update state
+      this.updatePeerState(peer.nodeId, "syncing");
+
+      // Attempt to sync with this peer
+      this.syncPeer(peer.nodeId).catch(err => {
+        this.logger.debug(`Repair: failed to reconnect to ${peer.nodeId.slice(0, 8)}:`, err);
+        // handleSyncError will schedule a retry with backoff
+      });
+    }
   }
 }

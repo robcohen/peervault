@@ -190,6 +190,55 @@ export class DocumentManager {
   }
 
   /**
+   * Get cloud sync configuration from CRDT metadata.
+   * Returns the encrypted config blob, or null if not set.
+   * The config is encrypted with the vault key before storage.
+   */
+  getCloudConfig(): Uint8Array | null {
+    const configBase64 = this.meta.get("cloudConfig") as string | undefined;
+    if (!configBase64) return null;
+    try {
+      // Decode base64 to Uint8Array
+      const binary = atob(configBase64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return bytes;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Set cloud sync configuration in CRDT metadata.
+   * The config should be encrypted with the vault key before calling this.
+   * @param encryptedConfig Encrypted config blob, or null to clear
+   */
+  setCloudConfig(encryptedConfig: Uint8Array | null): void {
+    if (encryptedConfig === null) {
+      this.meta.delete("cloudConfig");
+      this.meta.delete("cloudConfigUpdatedAt");
+    } else {
+      // Encode Uint8Array to base64 for storage in LoroMap
+      const binary = String.fromCharCode(...encryptedConfig);
+      const configBase64 = btoa(binary);
+      this.meta.set("cloudConfig", configBase64);
+      this.meta.set("cloudConfigUpdatedAt", Date.now());
+    }
+    this.doc.commit();
+    this.logger.debug("Cloud config updated in CRDT metadata");
+  }
+
+  /**
+   * Get the timestamp when cloud config was last updated.
+   */
+  getCloudConfigUpdatedAt(): number | null {
+    const timestamp = this.meta.get("cloudConfigUpdatedAt") as number | undefined;
+    return timestamp ?? null;
+  }
+
+  /**
    * Rebuild path cache from the document tree.
    * Also rebuilds node cache for O(1) node lookups.
    */
@@ -242,15 +291,20 @@ export class DocumentManager {
     const mtime = (meta?.get("mtime") as number) || 0;
 
     // Handle duplicate paths: keep the node with the most recent mtime
+    // If mtimes are equal, use nodeId as deterministic tiebreaker for consistency
     const existingNodeId = this.pathCache.get(path);
     if (existingNodeId) {
       const existingNode = this.getNodeById(existingNodeId);
       const existingMtime = (existingNode?.data?.get("mtime") as number) || 0;
-      if (existingMtime >= mtime) {
-        // Existing node is newer or same age, skip this one
+      if (existingMtime > mtime) {
+        // Existing node is strictly newer, skip this one
         return;
       }
-      // This node is newer, remove old mapping
+      if (existingMtime === mtime && existingNodeId < nodeId) {
+        // Same mtime, use nodeId as tiebreaker (lower nodeId wins)
+        return;
+      }
+      // This node wins (newer mtime, or same mtime with lower nodeId)
       this.nodePathCache.delete(existingNodeId);
     }
 
@@ -364,10 +418,20 @@ export class DocumentManager {
    * Import updates from a peer.
    */
   importUpdates(updates: Uint8Array): void {
+    protocolTracer.trace("", "", "crdt", "importUpdates.start", {
+      bytes: updates.length,
+      pathCountBefore: this.pathCache.size,
+    });
+
     // Capture state before import to detect changes
-    const pathsBefore = new Set(this.pathCache.keys());
+    // Use nodeId -> path mapping to detect renames (same node, different path)
+    const nodeToPathBefore = new Map<string, string>();
+    const pathToNodeBefore = new Map<string, string>();
     const contentHashesBefore = new Map<string, string>();
-    for (const path of pathsBefore) {
+
+    for (const [path, nodeId] of this.pathCache) {
+      nodeToPathBefore.set(nodeId, path);
+      pathToNodeBefore.set(path, nodeId);
       const content = this.getTextContent(path);
       if (content) {
         contentHashesBefore.set(path, content);
@@ -378,26 +442,68 @@ export class DocumentManager {
     this.doc.import(updates);
     this.rebuildPathCache();
 
-    // Detect changes and emit events
-    const pathsAfter = new Set(this.pathCache.keys());
+    protocolTracer.trace("", "", "crdt", "importUpdates.imported", {
+      pathCountAfter: this.pathCache.size,
+      newNodes: this.pathCache.size - nodeToPathBefore.size,
+    });
 
-    // Check for new files
-    for (const path of pathsAfter) {
-      if (!pathsBefore.has(path)) {
+    // Capture state after import
+    const nodeToPathAfter = new Map<string, string>();
+    const pathToNodeAfter = new Map<string, string>();
+
+    for (const [path, nodeId] of this.pathCache) {
+      nodeToPathAfter.set(nodeId, path);
+      pathToNodeAfter.set(path, nodeId);
+    }
+
+    // Detect renames first (same nodeId, different path)
+    const renamedNodes = new Set<string>();
+    for (const [nodeId, pathAfter] of nodeToPathAfter) {
+      const pathBefore = nodeToPathBefore.get(nodeId);
+      if (pathBefore && pathBefore !== pathAfter) {
+        // This node was renamed
+        renamedNodes.add(nodeId);
+        this.emitFileChange({
+          type: "rename",
+          path: pathAfter,
+          oldPath: pathBefore,
+          origin: "remote",
+        });
+      }
+    }
+
+    // Check for new files (nodeId not in before, and not a renamed node)
+    let createdCount = 0;
+    for (const [path, nodeId] of this.pathCache) {
+      if (!nodeToPathBefore.has(nodeId) && !renamedNodes.has(nodeId)) {
+        protocolTracer.trace("", "", "crdt", "importUpdates.emitCreate", { path });
         this.emitFileChange({ type: "create", path, origin: "remote" });
+        createdCount++;
+      }
+    }
+    if (createdCount > 0) {
+      protocolTracer.trace("", "", "crdt", "importUpdates.createdFiles", { count: createdCount });
+    }
+
+    // Check for deleted files (nodeId not in after)
+    // IMPORTANT: Don't emit delete if another node now owns that path
+    // (this happens with concurrent creates of the same filename)
+    for (const [nodeId, pathBefore] of nodeToPathBefore) {
+      if (!nodeToPathAfter.has(nodeId)) {
+        // Only emit delete if no other node owns this path
+        if (!pathToNodeAfter.has(pathBefore)) {
+          this.emitFileChange({ type: "delete", path: pathBefore, origin: "remote" });
+        } else {
+          this.logger.debug(`Skipping delete for ${pathBefore} - path now owned by different node`);
+        }
       }
     }
 
-    // Check for deleted files
-    for (const path of pathsBefore) {
-      if (!pathsAfter.has(path)) {
-        this.emitFileChange({ type: "delete", path, origin: "remote" });
-      }
-    }
-
-    // Check for modified files
-    for (const path of pathsAfter) {
-      if (pathsBefore.has(path)) {
+    // Check for modified files (same path, different content)
+    for (const [path, nodeId] of this.pathCache) {
+      const pathBefore = nodeToPathBefore.get(nodeId);
+      // Only check modification if path didn't change (not a rename)
+      if (pathBefore === path) {
         const contentBefore = contentHashesBefore.get(path);
         const contentAfter = this.getTextContent(path);
         if (contentBefore !== contentAfter) {
@@ -427,8 +533,11 @@ export class DocumentManager {
 
   /**
    * Handle a file creation event from the vault.
+   * @param path The file/folder path
+   * @param isFolder Whether this is a folder (not a file)
+   * @param skipCommit If true, don't commit yet (caller will commit after setting content)
    */
-  async handleFileCreate(path: string): Promise<void> {
+  async handleFileCreate(path: string, isFolder = false, skipCommit = false): Promise<void> {
     if (this.pathCache.has(path)) {
       // File already exists in document
       return;
@@ -450,12 +559,17 @@ export class DocumentManager {
     const nodeMeta = node.data;
     const now = Date.now();
 
-    // Determine if binary based on extension
-    const isBinary = isBinaryFile(fileName);
+    // Determine node type
+    let nodeType: "file" | "folder" | "binary";
+    if (isFolder) {
+      nodeType = "folder";
+    } else {
+      nodeType = isBinaryFile(fileName) ? "binary" : "file";
+    }
 
     nodeMeta.set("name", fileName);
-    nodeMeta.set("type", isBinary ? "binary" : "file"); // 'file' | 'folder' | 'binary'
-    nodeMeta.set("mimeType", this.getMimeType(fileName));
+    nodeMeta.set("type", nodeType);
+    nodeMeta.set("mimeType", isFolder ? undefined : this.getMimeType(fileName));
     nodeMeta.set("mtime", now);
     nodeMeta.set("ctime", now);
     nodeMeta.set("deleted", false);
@@ -464,8 +578,10 @@ export class DocumentManager {
     this.pathCache.set(path, nodeId);
     this.nodePathCache.set(nodeId, path);
 
-    this.doc.commit();
-    this.logger.debug("Created file node:", path);
+    if (!skipCommit) {
+      this.doc.commit();
+    }
+    this.logger.debug(`Created ${nodeType} node:`, path);
   }
 
   /**
@@ -491,58 +607,140 @@ export class DocumentManager {
 
   /**
    * Handle a file deletion event from the vault.
+   *
+   * IMPORTANT: This deletes ALL nodes that have the target path, not just the
+   * one in pathCache. This handles the case where concurrent creates on different
+   * vaults result in multiple nodes with the same path - we need to delete all
+   * of them to prevent "ghost" nodes from resurrecting the file.
    */
   async handleFileDelete(path: string): Promise<void> {
-    const nodeId = this.pathCache.get(path);
-    if (!nodeId) {
+    // Find ALL nodes that have this path (not just the one in pathCache)
+    const nodesToDelete = this.findAllNodesWithPath(path);
+
+    if (nodesToDelete.length === 0) {
       protocolTracer.trace("", "", "crdt", "handleFileDelete.nodeNotFound", { path });
       return;
     }
 
-    const node = this.getNodeById(nodeId);
-    if (!node) {
-      protocolTracer.trace("", "", "crdt", "handleFileDelete.nodeNotFound", { path, nodeId });
-      return;
-    }
-
-    protocolTracer.trace("", "", "crdt", "handleFileDelete.deleting", { path, nodeId });
-
-    // Use Loro's native tree deletion - this properly marks the node as deleted
-    // and ensures it won't appear in tree.roots() or node.children()
-    try {
-      this.tree.delete(nodeId);
-      protocolTracer.trace("", "", "crdt", "handleFileDelete.treeDeleteOk", { path, nodeId });
-    } catch (err) {
-      // If tree.delete fails, fall back to soft delete via metadata
-      this.logger.warn("tree.delete() failed, using soft delete:", err);
-      protocolTracer.trace("", "", "crdt", "handleFileDelete.treeDeleteFailed", {
-        path,
-        nodeId,
-        error: String(err),
-      });
-      const meta = node.data;
-      meta.set("deleted", true);
-      meta.set("deletedAt", Date.now());
-    }
-
-    // Verify deletion worked
-    const nodeAfter = this.getNodeById(nodeId);
-    const isDeleted = nodeAfter?.isDeleted() ?? true;
-    protocolTracer.trace("", "", "crdt", "handleFileDelete.verified", {
+    protocolTracer.trace("", "", "crdt", "handleFileDelete.deleting", {
       path,
-      nodeId,
-      isDeleted,
-      nodeFound: !!nodeAfter,
+      nodeCount: nodesToDelete.length,
+      nodeIds: nodesToDelete.map((n) => n.nodeId),
     });
 
-    // Remove from cache
+    // Delete all nodes with this path
+    for (const { nodeId, node } of nodesToDelete) {
+      try {
+        this.tree.delete(nodeId);
+        protocolTracer.trace("", "", "crdt", "handleFileDelete.treeDeleteOk", { path, nodeId });
+      } catch (err) {
+        // If tree.delete fails, fall back to soft delete via metadata
+        this.logger.warn("tree.delete() failed, using soft delete:", err);
+        protocolTracer.trace("", "", "crdt", "handleFileDelete.treeDeleteFailed", {
+          path,
+          nodeId,
+          error: String(err),
+        });
+        const meta = node.data;
+        meta.set("deleted", true);
+        meta.set("deletedAt", Date.now());
+      }
+
+      // Remove from caches
+      this.nodePathCache.delete(nodeId);
+    }
+
+    // Remove path from cache
     this.pathCache.delete(path);
-    this.nodePathCache.delete(nodeId);
 
     this.doc.commit();
 
-    protocolTracer.trace("", "", "crdt", "handleFileDelete.committed", { path, nodeId });
-    this.logger.debug("Deleted file node:", path);
+    protocolTracer.trace("", "", "crdt", "handleFileDelete.committed", {
+      path,
+      deletedCount: nodesToDelete.length,
+    });
+    this.logger.debug(`Deleted ${nodesToDelete.length} file node(s):`, path);
+  }
+
+  /**
+   * Find all nodes that have a given path (handles concurrent create conflicts).
+   * This scans all nodes in the tree, not just the pathCache.
+   *
+   * Also checks pathCache as a fallback because when a parent folder is deleted
+   * first, children nodes can't be found by path traversal anymore.
+   */
+  private findAllNodesWithPath(targetPath: string): Array<{ nodeId: TreeID; node: LoroTreeNode }> {
+    const results: Array<{ nodeId: TreeID; node: LoroTreeNode }> = [];
+    const foundNodeIds = new Set<string>();
+
+    // First, check the pathCache - this handles the case where the parent
+    // folder was deleted first, making path traversal impossible
+    const cachedNodeId = this.pathCache.get(targetPath);
+    if (cachedNodeId) {
+      const cachedNode = this.getNodeById(cachedNodeId);
+      if (cachedNode && !cachedNode.isDeleted()) {
+        results.push({ nodeId: cachedNodeId, node: cachedNode });
+        foundNodeIds.add(cachedNodeId);
+      }
+    }
+
+    // Also scan all non-deleted nodes to find any additional nodes with this path
+    // (handles concurrent create conflicts where multiple nodes have the same path)
+    const allNodes = this.tree.getNodes({ withDeleted: false });
+
+    for (const node of allNodes) {
+      const nodeId = this.getNodeId(node);
+
+      // Skip if we already found this node via pathCache
+      if (foundNodeIds.has(nodeId)) continue;
+
+      const nodePath = this.getNodePath(node);
+
+      if (nodePath === targetPath) {
+        results.push({ nodeId, node });
+        foundNodeIds.add(nodeId);
+      }
+    }
+
+    return results;
+  }
+
+  /**
+   * Get the full path for a node by traversing up to the root.
+   */
+  private getNodePath(node: LoroTreeNode): string | null {
+    if (node.isDeleted()) return null;
+
+    const meta = node.data;
+    const name = meta?.get("name") as string | undefined;
+    if (!name) return null;
+
+    // Check legacy deletion flag
+    const deleted = meta?.get("deleted") as boolean | undefined;
+    if (deleted) return null;
+
+    // Build path by traversing up
+    const parts: string[] = [name];
+    let parent = node.parent();
+
+    while (parent) {
+      const parentMeta = parent.data;
+      const parentName = parentMeta?.get("name") as string | undefined;
+
+      // Skip deleted parents - they shouldn't contribute to the path
+      const parentDeleted = parent.isDeleted() || parentMeta?.get("deleted") === true;
+      if (parentDeleted) {
+        // Parent is deleted, this node's path is incomplete
+        return null;
+      }
+
+      if (parentName) {
+        parts.unshift(parentName);
+      }
+      parent = parent.parent();
+    }
+
+    return parts.join("/");
   }
 
   /**
@@ -954,12 +1152,23 @@ export class DocumentManager {
     // Get current content and compute minimal edits
     const currentContent = textContainer.toString();
 
-    // Fast path: no changes
+    // Fast path: no changes (but still commit if we created a new container)
     if (currentContent === content) {
-      protocolTracer.trace("", "", "crdt", "setTextContent.noChange", {
-        path,
-        contentLength: content.length,
-      });
+      if (!hadExistingContainer) {
+        // Even for empty files, we need to commit the container creation
+        nodeMeta.set("mtime", Date.now());
+        this.doc.commit();
+        protocolTracer.trace("", "", "crdt", "setTextContent.newEmptyContainer", {
+          path,
+          contentLength: content.length,
+        });
+        this.logger.debug("Created empty content container for:", path);
+      } else {
+        protocolTracer.trace("", "", "crdt", "setTextContent.noChange", {
+          path,
+          contentLength: content.length,
+        });
+      }
       return;
     }
 
@@ -1027,7 +1236,9 @@ export class DocumentManager {
     if (!node) return undefined;
 
     const textContainer = node.data.get("content") as LoroText | undefined;
-    if (!textContainer) return undefined;
+    if (!textContainer) {
+      return undefined;
+    }
 
     // Handle both LoroText and legacy string content
     if (typeof textContainer === "string") {
@@ -1106,10 +1317,13 @@ export class DocumentManager {
       };
     }
 
-    // Default to text (type === "file")
+    // Default: text file ("file" type)
+    // Treat undefined content (no content container yet) as empty string
+    // This handles empty files and files where content hasn't synced yet
+    const text = this.getTextContent(path);
     return {
       type: "text",
-      text: this.getTextContent(path),
+      text: text ?? "", // Treat undefined as empty string for file nodes
     };
   }
 

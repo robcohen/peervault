@@ -11,6 +11,7 @@ import type {
   SyncStream,
   TransportConfig,
   ConnectionState,
+  ConnectionType,
 } from "./types";
 import { TransportErrors } from "../errors";
 import { protocolTracer } from "../utils/protocol-tracer";
@@ -50,6 +51,7 @@ interface WasmConnection {
   isConnected(): boolean;
   getRttMs(): number;
   getStats(): string;
+  getConnectionType(): string;
   close(): Promise<void>;
   free(): void;
 }
@@ -773,6 +775,19 @@ class IrohPeerConnection implements PeerConnection {
 
   getPendingStreamCount(): number {
     return this.pendingStreams.length;
+  }
+
+  getConnectionType(): ConnectionType {
+    try {
+      const connType = this.wasmConn.getConnectionType();
+      // Validate it's one of the expected values
+      if (connType === "direct" || connType === "relay" || connType === "mixed" || connType === "none") {
+        return connType;
+      }
+      return "none";
+    } catch {
+      return "none";
+    }
   }
 
   onStateChange(callback: (state: ConnectionState) => void): () => void {

@@ -7,7 +7,7 @@
 import { Plugin, Notice } from "obsidian";
 import { getDeviceHostname, nodeIdToWords } from "./utils/device";
 import type { PeerVaultSettings, SyncStatus, PeerInfo } from "./types";
-import { DEFAULT_SETTINGS, UI_LIMITS } from "./types";
+import { DEFAULT_SETTINGS, UI_LIMITS, migrateSettings } from "./types";
 import { DocumentManager, waitForLoroWasm } from "./core/document-manager";
 import { ObsidianStorageAdapter } from "./core/storage-adapter";
 import { BlobStore } from "./core/blob-store";
@@ -35,6 +35,7 @@ import { formatUserError } from "./utils/validation";
 import {
   IrohTransport,
   HybridTransport,
+  MockTransport,
   initIrohWasm,
   type Transport,
   type TransportStorage,
@@ -44,6 +45,8 @@ import { MigrationRunner, MIGRATIONS } from "./core/migration";
 import { GarbageCollector } from "./core/gc";
 import { ConfigErrors } from "./errors";
 import { protocolTracer } from "./utils/protocol-tracer";
+import { VaultKeyManager, deriveDeviceSecret, PairingKeyExchange } from "./crypto";
+import { CloudSync, createCloudSync } from "./cloud";
 
 export default class PeerVaultPlugin extends Plugin {
   settings!: PeerVaultSettings;
@@ -56,6 +59,9 @@ export default class PeerVaultPlugin extends Plugin {
   gc!: GarbageCollector;
   events = new EventEmitter();
   logger!: Logger;
+  private vaultKeyManager: VaultKeyManager | null = null;
+  private pairingKeyExchange: PairingKeyExchange | null = null;
+  private cloudSync: CloudSync | null = null;
 
   private connectionStatus: ConnectionStatusManager | null = null;
   private syncStatus: SyncStatus = "idle";
@@ -164,21 +170,30 @@ export default class PeerVaultPlugin extends Plugin {
           : undefined,
     };
 
-    // Initialize Iroh WASM module (bundled inline)
-    await initIrohWasm();
-
     // Create transport based on settings
-    if (this.settings.transportType === "hybrid") {
-      this.logger.info("Initializing Hybrid transport (Iroh + WebRTC)...");
-      this.transport = new HybridTransport({
+    if (this.settings.transportType === "mock") {
+      // Mock transport for testing - no WASM needed
+      this.logger.info("Initializing Mock transport (for testing)...");
+      this.transport = new MockTransport({
         ...transportConfig,
-        enableWebRTC: this.settings.enableWebRTC,
-        autoUpgradeToWebRTC: this.settings.autoWebRTCUpgrade,
-        webrtcUpgradeTimeout: this.settings.webrtcUpgradeTimeout,
+        crossWindow: true, // Enable cross-window registry for E2E tests
       });
     } else {
-      this.logger.info("Initializing Iroh transport...");
-      this.transport = new IrohTransport(transportConfig);
+      // Initialize Iroh WASM module (bundled inline) - only needed for real transports
+      await initIrohWasm();
+
+      if (this.settings.transportType === "hybrid") {
+        this.logger.info("Initializing Hybrid transport (Iroh + WebRTC)...");
+        this.transport = new HybridTransport({
+          ...transportConfig,
+          enableWebRTC: this.settings.enableWebRTC,
+          autoUpgradeToWebRTC: this.settings.autoWebRTCUpgrade,
+          webrtcUpgradeTimeout: this.settings.webrtcUpgradeTimeout,
+        });
+      } else {
+        this.logger.info("Initializing Iroh transport...");
+        this.transport = new IrohTransport(transportConfig);
+      }
     }
     this.logger.info("Transport initialized successfully");
 
@@ -197,6 +212,27 @@ export default class PeerVaultPlugin extends Plugin {
         this.logger.error("WASM memory exhausted - restart Obsidian to free memory:", err);
       }
       throw err;
+    }
+
+    // Initialize vault key manager and pairing key exchange for encryption
+    // Uses the Iroh secret key to derive a device-specific secret
+    const transportSecretKey = await this.getTransportSecretKey();
+    if (transportSecretKey) {
+      const deviceSecret = deriveDeviceSecret(transportSecretKey);
+      this.vaultKeyManager = new VaultKeyManager(this.storage, deviceSecret);
+      // Try to load the vault key into cache
+      const existingKey = await this.vaultKeyManager.getKey();
+      if (existingKey) {
+        this.logger.debug("Vault key loaded from storage");
+      } else {
+        this.logger.debug("No existing vault key found");
+      }
+
+      // Create pairing key exchange handler for vault key sharing during pairing
+      this.pairingKeyExchange = new PairingKeyExchange(this.storage, transportSecretKey);
+      this.logger.debug("Pairing key exchange handler initialized");
+    } else {
+      this.logger.warn("Could not get transport secret key - vault key manager not initialized");
     }
 
     // Initialize peer manager with blob store for binary sync
@@ -222,6 +258,41 @@ export default class PeerVaultPlugin extends Plugin {
     );
 
     await this.peerManager.initialize();
+
+    // Set up pairing key exchange on peer manager for vault key sharing
+    if (this.pairingKeyExchange) {
+      this.peerManager.setPairingKeyExchange(this.pairingKeyExchange);
+    }
+
+    // Initialize cloud sync
+    this.cloudSync = createCloudSync(this.documentManager, this.storage, this.logger);
+    this.cloudSync.setBlobStore(this.blobStore);
+    await this.cloudSync.initialize();
+
+    // Set vault key for cloud encryption if available
+    const vaultKey = await this.vaultKeyManager?.getKey();
+    if (vaultKey) {
+      this.cloudSync.setVaultKey(vaultKey);
+    }
+
+    // Start auto-sync if enabled
+    if (this.settings.cloudAutoSync && this.cloudSync.isConfigured()) {
+      const intervalMs = (this.settings.cloudAutoSyncInterval ?? 5) * 60 * 1000;
+      this.cloudSync.startAutoSync(intervalMs);
+    }
+
+    // Listen for cloud config updates from peers
+    this.cloudSync.on("config:updated", ({ source }) => {
+      if (source === "peer") {
+        new Notice("Cloud sync configured from another device");
+        this.logger.info("Cloud sync auto-configured from peer");
+        // Start auto-sync if enabled in settings
+        if (this.settings.cloudAutoSync && this.cloudSync?.isConfigured()) {
+          const intervalMs = (this.settings.cloudAutoSyncInterval ?? 5) * 60 * 1000;
+          this.cloudSync.startAutoSync(intervalMs);
+        }
+      }
+    });
 
     // Connect peer manager events to plugin status
     // Store unsubscribe functions for cleanup on plugin unload
@@ -298,6 +369,13 @@ export default class PeerVaultPlugin extends Plugin {
       this.documentManager.save().catch((err) => {
         this.logger.error("Failed to save after sync:", err);
       });
+
+      // Check if cloud config was received from peer
+      if (this.cloudSync) {
+        this.cloudSync.checkForConfigUpdate().catch((err) => {
+          this.logger.debug("Failed to check cloud config update:", err);
+        });
+      }
     }),
     );
 
@@ -334,6 +412,17 @@ export default class PeerVaultPlugin extends Plugin {
         } catch (err) {
           this.logger.error("Failed to sync after blob received:", err);
         }
+      }),
+    );
+
+    // Handle live updates - track when updates are received for convergence detection
+    // Note: We don't auto-reconcile here because syncFromDocument() can interfere
+    // with incremental updates. Reconciliation happens on peer:synced (initial sync)
+    // and when explicitly triggered by the user or tests.
+    this.peerManagerUnsubscribes.push(
+      this.peerManager.on("live:updates", () => {
+        // Just log for debugging - reconciliation is handled by the event-based system
+        this.logger.debug("Live updates received from peer");
       }),
     );
 
@@ -413,6 +502,11 @@ Only accept if you trust this peer and want to sync with them.`,
     }
     this.peerManagerUnsubscribes = [];
 
+    // Stop cloud sync auto-sync (synchronous)
+    if (this.cloudSync) {
+      this.cloudSync.stopAutoSync();
+    }
+
     // Stop vault sync (synchronous)
     if (this.vaultSync) {
       this.vaultSync.stop();
@@ -455,7 +549,15 @@ Only accept if you trust this peer and want to sync with them.`,
   // ===========================================================================
 
   async loadSettings(): Promise<void> {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const savedData = await this.loadData();
+    const { settings, migrated } = migrateSettings(savedData || {});
+    this.settings = settings;
+
+    // Save migrated settings if migration occurred
+    if (migrated) {
+      this.logger?.info("Settings migrated to new version");
+      await this.saveSettings();
+    }
   }
 
   async saveSettings(): Promise<void> {
@@ -705,6 +807,85 @@ Only accept if you trust this peer and want to sync with them.`,
   }
 
   /**
+   * Get the transport's secret key.
+   * Used to derive the device secret for vault key encryption.
+   */
+  private async getTransportSecretKey(): Promise<Uint8Array | null> {
+    try {
+      const key = await this.storage.read("peervault-transport-key");
+      return key;
+    } catch {
+      return null;
+    }
+  }
+
+  // ============================================================================
+  // Vault Key Management
+  // ============================================================================
+
+  /**
+   * Check if we have a vault encryption key.
+   */
+  hasVaultKey(): boolean {
+    if (!this.vaultKeyManager) {
+      return false;
+    }
+    // Note: This is a sync check that returns cached state
+    // The actual async check happens during initialization
+    return (this.vaultKeyManager as unknown as { cachedKey: Uint8Array | null }).cachedKey !== null;
+  }
+
+  /**
+   * Get the vault encryption key.
+   */
+  async getVaultKey(): Promise<Uint8Array | null> {
+    if (!this.vaultKeyManager) {
+      return null;
+    }
+    return this.vaultKeyManager.getKey();
+  }
+
+  /**
+   * Create a new vault encryption key.
+   */
+  async createVaultKey(): Promise<Uint8Array> {
+    if (!this.vaultKeyManager) {
+      throw new Error("Vault key manager not initialized");
+    }
+    return this.vaultKeyManager.generateAndStoreKey();
+  }
+
+  /**
+   * Import a vault encryption key (e.g., from a passphrase backup).
+   */
+  async importVaultKey(key: Uint8Array): Promise<void> {
+    if (!this.vaultKeyManager) {
+      throw new Error("Vault key manager not initialized");
+    }
+    // Clear existing key first if present
+    if (await this.vaultKeyManager.hasKey()) {
+      await this.vaultKeyManager.clearKey();
+    }
+    await this.vaultKeyManager.storeKey(key);
+  }
+
+  /**
+   * Get the VaultKeyManager instance.
+   * Used by PairingKeyExchange for key sharing during pairing.
+   */
+  getVaultKeyManager(): VaultKeyManager | null {
+    return this.vaultKeyManager;
+  }
+
+  /**
+   * Get the CloudSync instance.
+   * Used by settings UI for cloud storage configuration.
+   */
+  getCloudSync(): CloudSync | null {
+    return this.cloudSync;
+  }
+
+  /**
    * Update vault sync with peer group exclusions.
    * Called when peer connections change or group policies are updated.
    */
@@ -755,5 +936,103 @@ Only accept if you trust this peer and want to sync with them.`,
    */
   isWebRTCAvailable(): boolean {
     return typeof RTCPeerConnection !== "undefined";
+  }
+
+  /**
+   * Get recent plugin logs (for debugging).
+   * Filters to only include WebRTC/Hybrid related logs.
+   */
+  getRecentLogs(count: number = 50): string[] {
+    // Import dynamically to avoid circular deps
+    const { getLogsAsJson } = require("./utils/logger");
+    const logs = getLogsAsJson(count * 2) as Array<{
+      timestamp: string;
+      level: string;
+      prefix: string;
+      message: string;
+    }>;
+
+    return logs
+      .filter((log) => {
+        const fullMsg = `${log.prefix} ${log.message}`;
+        return (
+          fullMsg.includes("Hybrid") ||
+          fullMsg.includes("WebRTC") ||
+          fullMsg.includes("webrtc") ||
+          fullMsg.includes("upgrade")
+        );
+      })
+      .slice(-count)
+      .map((log) => `[${log.level}] ${log.prefix} ${log.message}`);
+  }
+
+  /**
+   * Force attempt WebRTC upgrade for a peer.
+   * Returns debug info about the attempt.
+   */
+  async forceWebRTCUpgrade(peerId: string): Promise<{
+    attempted: boolean;
+    success: boolean;
+    error?: string;
+    debugInfo: string[];
+  }> {
+    const debugInfo: string[] = [];
+
+    if (!this.transport) {
+      return { attempted: false, success: false, error: "No transport", debugInfo };
+    }
+
+    const conn = this.transport.getConnection(peerId);
+    if (!conn) {
+      return { attempted: false, success: false, error: "No connection for peer", debugInfo };
+    }
+
+    // Check if this is a HybridConnection
+    const hybridConn = conn as {
+      isWebRTCActive?: () => boolean;
+      attemptWebRTCUpgrade?: (isInitiator: boolean) => Promise<boolean>;
+    };
+
+    if (!hybridConn.attemptWebRTCUpgrade) {
+      return { attempted: false, success: false, error: "Not a hybrid connection", debugInfo };
+    }
+
+    if (hybridConn.isWebRTCActive?.()) {
+      debugInfo.push("WebRTC already active");
+      return { attempted: false, success: true, debugInfo };
+    }
+
+    // Determine if we should be initiator
+    const myNodeId = this.transport.getNodeId();
+    const shouldInitiate = myNodeId < peerId;
+    debugInfo.push(`myNodeId: ${myNodeId.slice(0, 8)}, peerId: ${peerId.slice(0, 8)}`);
+    debugInfo.push(`shouldInitiate: ${shouldInitiate}`);
+
+    try {
+      debugInfo.push("Attempting WebRTC upgrade...");
+      debugInfo.push(`WebRTC enabled in conn: ${(hybridConn as any).webrtcEnabled}`);
+      debugInfo.push(`Iroh connected: ${(hybridConn as any).irohConn?.isConnected?.()}`);
+      const success = await hybridConn.attemptWebRTCUpgrade(shouldInitiate);
+      debugInfo.push(`Result: ${success}`);
+
+      // Get internal debug info from the connection
+      const connDebug = (hybridConn as any).lastAttemptDebug as string[] | undefined;
+      if (connDebug) {
+        debugInfo.push("--- Connection internal debug ---");
+        for (const line of connDebug) {
+          debugInfo.push(`  ${line}`);
+        }
+      }
+
+      // After attempt, check connection state
+      const isActive = hybridConn.isWebRTCActive?.() ?? false;
+      debugInfo.push(`WebRTC active after attempt: ${isActive}`);
+
+      return { attempted: true, success, debugInfo };
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      debugInfo.push(`Error: ${errMsg}`);
+      return { attempted: true, success: false, error: errMsg, debugInfo };
+    }
   }
 }

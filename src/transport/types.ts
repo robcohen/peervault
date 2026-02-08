@@ -14,6 +14,9 @@ export type ConnectionState =
   | "disconnected"
   | "error";
 
+/** Connection type (how we're connected to the peer) */
+export type ConnectionType = "direct" | "relay" | "mixed" | "none";
+
 /** Transport events */
 export interface TransportEvents {
   "connection:incoming": { connection: PeerConnection };
@@ -128,6 +131,15 @@ export interface PeerConnection {
    * Use this to check if there are streams to process before calling acceptStream().
    */
   getPendingStreamCount(): number;
+
+  /**
+   * Get the connection type (direct, relay, mixed, or none).
+   * - "direct": Direct peer-to-peer connection (local network or holepunched)
+   * - "relay": Connection through Iroh relay server
+   * - "mixed": Using both direct and relay paths
+   * - "none": No active connection path
+   */
+  getConnectionType(): ConnectionType;
 }
 
 /**

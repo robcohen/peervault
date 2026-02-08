@@ -8,6 +8,7 @@
 import type {
   PeerConnection,
   ConnectionState,
+  ConnectionType,
   SyncStream,
   TransportLogger,
 } from "../types";
@@ -422,6 +423,18 @@ export class WebRTCPeerConnection implements PeerConnection {
    */
   getPendingStreamCount(): number {
     return this.pendingStreams.length;
+  }
+
+  /**
+   * Get connection type.
+   * - "direct" if using host candidates (true P2P)
+   * - "mixed" if using TURN/relay
+   */
+  getConnectionType(): ConnectionType {
+    if (!this.isConnected()) {
+      return "none";
+    }
+    return this.metrics.isDirect ? "direct" : "mixed";
   }
 
   /**
