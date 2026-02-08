@@ -127,6 +127,7 @@ export function validateRelayUrl(url: string): { valid: boolean; value: string; 
 
 /**
  * Validate an Iroh connection ticket.
+ * Supports both base32 format (endpoint...) and JSON format.
  */
 export function validateTicket(ticket: string): { valid: boolean; value: string; error?: string } {
   const trimmed = ticket.trim();
@@ -135,16 +136,36 @@ export function validateTicket(ticket: string): { valid: boolean; value: string;
     return { valid: false, value: "", error: "Ticket cannot be empty" };
   }
 
-  if (!trimmed.startsWith("iroh://")) {
-    return { valid: false, value: trimmed, error: "Ticket must start with iroh://" };
+  // Check for base32 format (standard Iroh ticket starting with "endpoint")
+  if (trimmed.startsWith("endpoint")) {
+    // Base32 tickets are alphanumeric lowercase, typically 100+ chars
+    if (!/^endpoint[a-z0-9]+$/.test(trimmed)) {
+      return { valid: false, value: trimmed, error: "Invalid base32 ticket format" };
+    }
+    if (trimmed.length < 50) {
+      return { valid: false, value: trimmed, error: "Ticket appears to be truncated" };
+    }
+    return { valid: true, value: trimmed };
   }
 
-  // Basic length check (tickets are typically 100+ characters)
-  if (trimmed.length < 50) {
-    return { valid: false, value: trimmed, error: "Ticket appears to be truncated" };
+  // Check for JSON format (legacy)
+  if (trimmed.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      // Must have id (node ID) and addrs array
+      if (typeof parsed.id !== "string" || parsed.id.length === 0) {
+        return { valid: false, value: trimmed, error: "JSON ticket missing 'id' field" };
+      }
+      if (!Array.isArray(parsed.addrs)) {
+        return { valid: false, value: trimmed, error: "JSON ticket missing 'addrs' array" };
+      }
+      return { valid: true, value: trimmed };
+    } catch {
+      return { valid: false, value: trimmed, error: "Invalid JSON format" };
+    }
   }
 
-  return { valid: true, value: trimmed };
+  return { valid: false, value: trimmed, error: "Unrecognized ticket format (expected base32 or JSON)" };
 }
 
 /**

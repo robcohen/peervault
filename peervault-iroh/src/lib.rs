@@ -4,6 +4,7 @@
 //! Exposes Iroh's Endpoint, Connection, and Stream to JavaScript.
 
 use iroh::{Endpoint, EndpointAddr, RelayMap, RelayMode, RelayUrl, SecretKey};
+use iroh_tickets::{endpoint::EndpointTicket, Ticket};
 use js_sys::{Array, Promise, Uint8Array};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -114,28 +115,44 @@ impl WasmEndpoint {
         Uint8Array::from(self.secret_key.to_bytes().as_slice())
     }
 
-    /// Generate a connection ticket for pairing.
+    /// Generate a connection ticket for pairing (base32 format).
     /// The ticket contains the node address info needed to connect.
     /// This waits for the relay connection to be established.
+    /// Returns the standard Iroh base32 ticket format (e.g., "endpoint1...").
     #[wasm_bindgen(js_name = generateTicket)]
     pub async fn generate_ticket(&self) -> Result<String, JsValue> {
+        // Wait for endpoint to be online (connected to relay)
+        self.endpoint.online().await;
+
+        // Get endpoint address and wrap in EndpointTicket for base32 serialization
+        let endpoint_addr = self.endpoint.addr();
+        let ticket = EndpointTicket::new(endpoint_addr);
+
+        // Serialize to base32 string (standard Iroh format)
+        Ok(ticket.serialize())
+    }
+
+    /// Generate a connection ticket in JSON format (legacy/debug).
+    /// Returns JSON with "id" and "addrs" fields.
+    #[wasm_bindgen(js_name = generateTicketJson)]
+    pub async fn generate_ticket_json(&self) -> Result<String, JsValue> {
         // Wait for endpoint to be online (connected to relay)
         self.endpoint.online().await;
 
         // Get endpoint address
         let endpoint_addr = self.endpoint.addr();
 
-        // Serialize to JSON for sharing
+        // Serialize to JSON for debugging/legacy compatibility
         serde_json::to_string(&endpoint_addr)
             .map_err(|e| JsValue::from_str(&format!("Failed to serialize ticket: {}", e)))
     }
 
     /// Connect to a peer using their ticket.
+    /// Accepts both base32 format (e.g., "endpoint1...") and JSON format.
     #[wasm_bindgen(js_name = connectWithTicket)]
     pub async fn connect_with_ticket(&self, ticket: String) -> Result<WasmConnection, JsValue> {
-        // Parse ticket (JSON) to get EndpointAddr
-        let endpoint_addr: EndpointAddr = serde_json::from_str(&ticket)
-            .map_err(|e| JsValue::from_str(&format!("Invalid ticket: {}", e)))?;
+        // Try to parse as base32 first (standard Iroh format), then fall back to JSON
+        let endpoint_addr = Self::parse_ticket(&ticket)?;
 
         let remote_endpoint_id = endpoint_addr.id.to_string();
 
@@ -149,6 +166,32 @@ impl WasmEndpoint {
             connection,
             remote_node_id: remote_endpoint_id,
         })
+    }
+
+    /// Parse a ticket string, supporting both base32 and JSON formats.
+    fn parse_ticket(ticket: &str) -> Result<EndpointAddr, JsValue> {
+        let ticket = ticket.trim();
+
+        // Try base32 format first (starts with "endpoint" prefix)
+        if ticket.starts_with("endpoint") {
+            return EndpointTicket::deserialize(ticket)
+                .map(|t| t.endpoint_addr().clone())
+                .map_err(|e| JsValue::from_str(&format!("Invalid base32 ticket: {}", e)));
+        }
+
+        // Try JSON format (starts with '{')
+        if ticket.starts_with('{') {
+            return serde_json::from_str(ticket)
+                .map_err(|e| JsValue::from_str(&format!("Invalid JSON ticket: {}", e)));
+        }
+
+        // Unknown format - try both and give best error
+        if let Ok(t) = EndpointTicket::deserialize(ticket) {
+            return Ok(t.endpoint_addr().clone());
+        }
+
+        serde_json::from_str(ticket)
+            .map_err(|_| JsValue::from_str("Invalid ticket format: expected base32 (endpoint...) or JSON ({...})"))
     }
 
     /// Accept an incoming connection.

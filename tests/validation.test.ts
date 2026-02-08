@@ -253,40 +253,77 @@ describe("validateRelayUrl", () => {
 // ============================================================================
 
 describe("validateTicket", () => {
-  it("should accept valid tickets", () => {
-    const ticket = "iroh://" + "a".repeat(100);
+  // Base32 format tests
+  it("should accept valid base32 tickets", () => {
+    const ticket = "endpoint1" + "a".repeat(100);
     const result = validateTicket(ticket);
     expect(result.valid).toBe(true);
     expect(result.value).toBe(ticket);
   });
 
+  it("should reject base32 tickets with invalid characters", () => {
+    const ticket = "endpoint1ABC123"; // uppercase not allowed
+    const result = validateTicket(ticket);
+    expect(result.valid).toBe(false);
+    expect(result.error).toBe("Invalid base32 ticket format");
+  });
+
+  it("should reject truncated base32 tickets", () => {
+    const result = validateTicket("endpoint1short");
+    expect(result.valid).toBe(false);
+    expect(result.error).toBe("Ticket appears to be truncated");
+  });
+
+  // JSON format tests
+  it("should accept valid JSON tickets", () => {
+    const ticket = JSON.stringify({ id: "abc123", addrs: [{ Relay: "https://example.com" }] });
+    const result = validateTicket(ticket);
+    expect(result.valid).toBe(true);
+    expect(result.value).toBe(ticket);
+  });
+
+  it("should reject JSON tickets missing id", () => {
+    const ticket = JSON.stringify({ addrs: [] });
+    const result = validateTicket(ticket);
+    expect(result.valid).toBe(false);
+    expect(result.error).toBe("JSON ticket missing 'id' field");
+  });
+
+  it("should reject JSON tickets missing addrs", () => {
+    const ticket = JSON.stringify({ id: "abc123" });
+    const result = validateTicket(ticket);
+    expect(result.valid).toBe(false);
+    expect(result.error).toBe("JSON ticket missing 'addrs' array");
+  });
+
+  it("should reject invalid JSON", () => {
+    const result = validateTicket("{invalid json");
+    expect(result.valid).toBe(false);
+    expect(result.error).toBe("Invalid JSON format");
+  });
+
+  // General tests
   it("should reject empty tickets", () => {
     const result = validateTicket("");
     expect(result.valid).toBe(false);
     expect(result.error).toBe("Ticket cannot be empty");
   });
 
-  it("should reject tickets without iroh:// prefix", () => {
+  it("should reject unrecognized formats", () => {
     const result = validateTicket("abc123");
     expect(result.valid).toBe(false);
-    expect(result.error).toBe("Ticket must start with iroh://");
-  });
-
-  it("should reject truncated tickets", () => {
-    const result = validateTicket("iroh://short");
-    expect(result.valid).toBe(false);
-    expect(result.error).toBe("Ticket appears to be truncated");
+    expect(result.error).toBe("Unrecognized ticket format (expected base32 or JSON)");
   });
 
   it("should trim whitespace", () => {
-    const ticket = "iroh://" + "a".repeat(100);
+    const ticket = "endpoint1" + "a".repeat(100);
     const result = validateTicket("  " + ticket + "  ");
     expect(result.valid).toBe(true);
     expect(result.value).toBe(ticket);
   });
 
-  it("should accept ticket at minimum valid length", () => {
-    const ticket = "iroh://" + "a".repeat(43); // 7 + 43 = 50 chars total
+  it("should accept base32 ticket at minimum valid length", () => {
+    const ticket = "endpoint1" + "a".repeat(41); // 9 + 41 = 50 chars total
     const result = validateTicket(ticket);
     expect(result.valid).toBe(true);
   });

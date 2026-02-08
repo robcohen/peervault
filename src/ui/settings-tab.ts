@@ -21,6 +21,8 @@ import {
   resetStatusSectionState,
   renderSyncSection,
   renderStorageSection,
+  renderSecuritySection,
+  renderCloudSection,
   renderAdvancedSection,
   renderDangerZone,
   type SectionContext,
@@ -83,6 +85,12 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
 
     // Storage & Maintenance Section
     renderStorageSection(containerEl, ctx);
+
+    // Security Section
+    renderSecuritySection(containerEl, ctx);
+
+    // Cloud Sync Section
+    renderCloudSection(containerEl, ctx);
 
     // Advanced Section
     renderAdvancedSection(containerEl, ctx);
@@ -550,22 +558,41 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
         this.plugin.logger.debug("Ticket validation failed: too short or empty");
         return false;
       }
-      try {
-        const parsed = JSON.parse(ticket);
-        // Must have id (node ID) and addrs array
-        const valid = typeof parsed.id === "string" && parsed.id.length > 0 && Array.isArray(parsed.addrs);
-        if (!valid) {
-          this.plugin.logger.debug("Ticket validation failed: missing id or addrs", {
-            hasId: typeof parsed.id === "string",
-            idLength: parsed.id?.length ?? 0,
-            hasAddrs: Array.isArray(parsed.addrs),
-          });
+
+      const trimmed = ticket.trim();
+
+      // Check for base32 format (standard Iroh ticket starting with "endpoint")
+      if (trimmed.startsWith("endpoint")) {
+        // Base32 tickets are alphanumeric lowercase, typically 100+ chars
+        const isValidBase32 = /^endpoint[a-z0-9]+$/.test(trimmed) && trimmed.length >= 50;
+        if (!isValidBase32) {
+          this.plugin.logger.debug("Ticket validation failed: invalid base32 format");
         }
-        return valid;
-      } catch (err) {
-        this.plugin.logger.debug("Ticket validation failed: JSON parse error", err);
-        return false;
+        return isValidBase32;
       }
+
+      // Check for JSON format (legacy)
+      if (trimmed.startsWith("{")) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          // Must have id (node ID) and addrs array
+          const valid = typeof parsed.id === "string" && parsed.id.length > 0 && Array.isArray(parsed.addrs);
+          if (!valid) {
+            this.plugin.logger.debug("Ticket validation failed: missing id or addrs", {
+              hasId: typeof parsed.id === "string",
+              idLength: parsed.id?.length ?? 0,
+              hasAddrs: Array.isArray(parsed.addrs),
+            });
+          }
+          return valid;
+        } catch (err) {
+          this.plugin.logger.debug("Ticket validation failed: JSON parse error", err);
+          return false;
+        }
+      }
+
+      this.plugin.logger.debug("Ticket validation failed: unrecognized format (expected base32 or JSON)");
+      return false;
     };
 
     // Ticket input with validation

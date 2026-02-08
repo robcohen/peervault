@@ -258,10 +258,11 @@ export class PairingModal extends Modal {
         return;
       }
 
-      // Fallback: check for text ticket
+      // Fallback: check for text ticket (base32 or JSON format)
       const text = await navigator.clipboard.readText();
-      if (text.startsWith("iroh://")) {
-        this.ticketInput = text.trim();
+      const trimmed = text.trim();
+      if (trimmed.startsWith("endpoint") || trimmed.startsWith("{")) {
+        this.ticketInput = trimmed;
         new Notice("Ticket detected from clipboard!");
         await this.handleConnect();
         return;
@@ -288,7 +289,7 @@ export class PairingModal extends Modal {
       .setName("Connection Ticket")
       .setDesc("Paste the ticket here")
       .addTextArea((text) =>
-        text.setPlaceholder("iroh://...").onChange((value) => {
+        text.setPlaceholder("endpoint1...").onChange((value) => {
           this.ticketInput = value.trim();
         }),
       );

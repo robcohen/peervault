@@ -1,0 +1,19 @@
+{
+  "vaults": {
+    "test1": {
+      "path": "/vaults/TEST",
+      "ts": 1700000000000
+    },
+    "test2": {
+      "path": "/vaults/TEST2",
+      "ts": 1700000001000
+    },
+    "test3": {
+      "path": "/vaults/TEST3",
+      "ts": 1700000002000
+    }
+  },
+  "updateDisabled": true,
+  "frame": "native",
+  "theme": "moonstone"
+}
