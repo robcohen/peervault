@@ -24,7 +24,6 @@ import type {
 } from "./types";
 import type { KnownPeerInfo, KeyExchangeRequestMessage } from "../sync/types";
 import { SyncMessageType } from "../sync/types";
-import { PeerGroupManager, DEFAULT_GROUP_ID } from "./groups";
 import { PeerErrors } from "../errors";
 import {
   PairingKeyExchange,
@@ -85,7 +84,6 @@ interface StoredDiscoveredPeer {
 /** Tombstone for removed peers - prevents re-discovery */
 interface PeerTombstone {
   nodeId: string;
-  groupIds: string[];
   removedAt: number;
   reason: "removed" | "left";
 }
@@ -140,6 +138,7 @@ interface PeerManagerEvents extends Record<string, unknown> {
   "peer:pairing-denied": string;
   "peer:discovered": KnownPeerInfo; // Peer discovered via gossip
   "vault:adoption-request": VaultAdoptionRequest;
+  "vault:key-received": Uint8Array; // Vault key received from peer during pairing
   "status:change": "idle" | "syncing" | "offline" | "error";
   "blob:received": string; // blob hash - used to retry binary file writes
   "live:updates": void; // CRDT updates received during live mode
@@ -221,7 +220,6 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   /** Pending reconnect timers by nodeId - tracked so they can be cancelled on shutdown */
   private reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private status: "idle" | "syncing" | "offline" | "error" = "idle";
-  private groupManager!: PeerGroupManager;
   /** Unsubscribe from incoming connection events */
   private unsubscribeIncoming: (() => void) | null = null;
   /** Whether initialize() has been called */
@@ -243,13 +241,6 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   ) {
     super();
     this.config = { ...DEFAULT_CONFIG, ...config };
-  }
-
-  /**
-   * Get the peer group manager.
-   */
-  getGroupManager(): PeerGroupManager {
-    return this.groupManager;
   }
 
   /**
@@ -302,6 +293,8 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
 
       if (result.success && result.vaultKey) {
         this.logger.info(`Received vault key from peer ${peer.nodeId.slice(0, 8)}`);
+        // Notify listeners (e.g., main.ts) so CloudSync can be updated
+        this.emit("vault:key-received", result.vaultKey);
       } else {
         this.logger.warn(`Key exchange failed: ${result.error}`);
       }
@@ -351,25 +344,12 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       this.sessions.clear();
     }
 
-    // Initialize group manager
-    this.groupManager = new PeerGroupManager(
-      this.documentManager.getLoro(),
-      this.logger,
-    );
-
     // Load stored peers
     await this.loadPeers();
 
     // Load discovered peers and tombstones from storage
     await this.loadDiscoveredPeers();
     await this.loadTombstones();
-
-    // Clean up stale peer IDs from groups
-    const validPeerIds = new Set(this.peers.keys());
-    const cleaned = this.groupManager.cleanupStalePeers(validPeerIds);
-    if (cleaned > 0) {
-      this.logger.info(`Cleaned up ${cleaned} stale peer(s) from groups`);
-    }
 
     // Handle incoming connections (store unsubscribe for cleanup)
     this.unsubscribeIncoming = this.transport.onIncomingConnection(async (conn) => {
@@ -516,17 +496,14 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   /**
    * Add a new peer using their connection ticket.
    * @param ticket - The connection ticket for the peer
-   * @param targetGroupId - Optional group ID to add the peer to (defaults to DEFAULT_GROUP_ID)
    */
-  async addPeer(ticket: string, targetGroupId?: string): Promise<PeerInfo> {
+  async addPeer(ticket: string): Promise<PeerInfo> {
     // Guard against duplicate concurrent calls with the same ticket
     if (this.pendingAddPeerTickets.has(ticket)) {
       this.logger.warn("addPeer already in progress for this ticket, ignoring duplicate call");
       throw PeerErrors.unknownPeer("Duplicate addPeer call");
     }
     this.pendingAddPeerTickets.add(ticket);
-
-    const groupId = targetGroupId || DEFAULT_GROUP_ID;
 
     try {
       this.setStatus("syncing");
@@ -558,11 +535,6 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
         // Update existing peer
         peer.ticket = ticket;
         peer.lastSeen = Date.now();
-        // Add to target group if not already a member
-        if (!peer.groupIds?.includes(groupId)) {
-          peer.groupIds = [...(peer.groupIds || []), groupId];
-          this.groupManager.addPeerToGroup(groupId, nodeId);
-        }
       } else {
         // Create new peer (hostname/nickname will be received during sync)
         peer = {
@@ -572,12 +544,8 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
           firstSeen: Date.now(),
           lastSeen: Date.now(),
           trusted: true, // New peers are trusted by default
-          groupIds: [groupId], // Add to specified group
         };
         this.peers.set(nodeId, peer);
-
-        // Also add to the group manager
-        this.groupManager.addPeerToGroup(groupId, nodeId);
       }
 
       // Start sync session
@@ -592,9 +560,9 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       await this.savePeers();
       this.emit("peer:connected", peer);
 
-      // Announce the new peer to other group members (for mesh discovery)
-      this.announcePeerToGroup(peer).catch(err => {
-        this.logger.warn("Failed to announce peer to group:", err);
+      // Announce the new peer to other peers (for mesh discovery)
+      this.announcePeerToAll(peer).catch(err => {
+        this.logger.warn("Failed to announce peer:", err);
       });
 
       return peer;
@@ -611,9 +579,6 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
    * Remove a peer and notify them.
    */
   async removePeer(nodeId: string): Promise<void> {
-    const peer = this.peers.get(nodeId);
-    const peerGroups = peer?.groupIds || [DEFAULT_GROUP_ID];
-
     const session = this.sessions.get(nodeId);
     if (session) {
       // Always remove from map first to prevent stale references
@@ -629,13 +594,12 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
 
     this.peers.delete(nodeId);
     this.reconnectAttempts.delete(nodeId);
-    this.groupManager.removePeerFromAllGroups(nodeId);
 
     // Create tombstone to prevent re-discovery
-    this.createTombstone(nodeId, peerGroups, "removed");
+    this.createTombstone(nodeId, "removed");
 
-    // Announce the removal to other group members (mesh cleanup)
-    this.announcePeerLeft(nodeId, peerGroups, "removed").catch(err => {
+    // Announce the removal to other peers (mesh cleanup)
+    this.announcePeerLeft(nodeId, "removed").catch(err => {
       this.logger.warn("Failed to announce peer removal:", err);
     });
 
@@ -662,7 +626,6 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
 
     this.peers.delete(nodeId);
     this.reconnectAttempts.delete(nodeId);
-    this.groupManager.removePeerFromAllGroups(nodeId);
 
     await this.savePeers();
     this.emit("peer:disconnected", { nodeId, reason: "removed by peer" });
@@ -845,15 +808,12 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
    * Accept a pairing request from an unknown peer.
    * @param nodeId - The peer's node ID
    * @param nickname - Optional nickname for the peer
-   * @param targetGroupId - Optional group ID to add the peer to (defaults to DEFAULT_GROUP_ID)
    */
-  async acceptPairingRequest(nodeId: string, nickname?: string, targetGroupId?: string): Promise<PeerInfo> {
+  async acceptPairingRequest(nodeId: string, nickname?: string): Promise<PeerInfo> {
     const pending = this.pendingPairingRequests.get(nodeId);
     if (!pending) {
       throw PeerErrors.unknownPeer(nodeId);
     }
-
-    const groupId = targetGroupId || DEFAULT_GROUP_ID;
 
     const { connection, unsubscribeStateChange } = pending;
     unsubscribeStateChange(); // Clean up state change listener
@@ -868,10 +828,8 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       firstSeen: Date.now(),
       lastSeen: Date.now(),
       trusted: true,
-      groupIds: [groupId],
     };
     this.peers.set(nodeId, peer);
-    this.groupManager.addPeerToGroup(groupId, nodeId);
 
     this.logger.info("Accepted pairing request from:", nodeId);
     this.emit("peer:pairing-accepted", nodeId);
@@ -885,7 +843,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     this.logger.info(`[acceptPairingRequest] Registering onStream callback for peer ${peer.nodeId.slice(0, 8)}`);
     const unsubscribeStream = connection.onStream((stream) => {
       this.logger.info(`[acceptPairingRequest] onStream callback fired for peer ${peer.nodeId.slice(0, 8)}, stream ${stream.id}`);
-      this.handleIncomingStream(stream, connection, peer).catch((err) => {
+      this.handleIncomingStream(stream, connection, peer).catch((err: Error) => {
         this.logger.error("Error handling incoming stream:", err);
       });
     });
@@ -915,9 +873,9 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       // Setting up the stream listener above ensures we can accept future streams
     }
 
-    // Announce the new peer to other group members (for mesh discovery)
-    this.announcePeerToGroup(peer).catch(err => {
-      this.logger.warn("Failed to announce peer to group:", err);
+    // Announce the new peer to all other peers (for mesh discovery)
+    this.announcePeerToAll(peer).catch((err: Error) => {
+      this.logger.warn("Failed to announce peer:", err);
     });
 
     return peer;
@@ -973,28 +931,6 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       lastSyncTime: peer.lastSynced ?? peer.firstSeen,
       isConnected: peer.state === "synced" || peer.state === "syncing",
     }));
-  }
-
-  /**
-   * Get the union of excluded folders from all connected peers' group policies.
-   * Used to filter which remote files should be written to the local vault.
-   */
-  getConnectedPeersExcludedFolders(): string[] {
-    const excludedFolders = new Set<string>();
-
-    for (const peer of this.peers.values()) {
-      // Only consider connected/synced peers
-      if (peer.state !== "synced" && peer.state !== "syncing") {
-        continue;
-      }
-
-      const policy = this.groupManager.getEffectiveSyncPolicy(peer.nodeId);
-      for (const folder of policy.excludedFolders) {
-        excludedFolders.add(folder);
-      }
-    }
-
-    return Array.from(excludedFolders);
   }
 
   /**
@@ -1133,7 +1069,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       result.push({
         nodeId: peer.nodeId,
         ticket: peer.ticket,
-        groupIds: peer.groupIds || [DEFAULT_GROUP_ID],
+        groupIds: [], // Groups removed - all peers share the vault
         lastSeen: peer.lastSeen || Date.now(),
       });
     }
@@ -1143,30 +1079,16 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
 
   /**
    * Handle peer discovery info received during VERSION_INFO exchange.
-   * This processes group IDs and known peers sent by the remote peer.
+   * This processes known peers sent by the remote peer.
    */
   handlePeerDiscoveryInfo(
     fromPeerId: string,
-    groupIds: string[],
+    _groupIds: string[], // Ignored - groups removed
     knownPeers: KnownPeerInfo[]
   ): void {
     this.logger.info(
-      `Received discovery info from ${fromPeerId.slice(0, 8)}: ${groupIds.length} groups, ${knownPeers.length} peers`
+      `Received discovery info from ${fromPeerId.slice(0, 8)}: ${knownPeers.length} peers`
     );
-
-    // Update the sending peer's group membership
-    const peer = this.peers.get(fromPeerId);
-    if (peer && groupIds.length > 0) {
-      // Update peer's known groups
-      const newGroups = groupIds.filter(gid => !peer.groupIds?.includes(gid));
-      if (newGroups.length > 0) {
-        peer.groupIds = [...(peer.groupIds || []), ...newGroups];
-        for (const gid of newGroups) {
-          this.groupManager.addPeerToGroup(gid, fromPeerId);
-        }
-        this.savePeers().catch(err => this.logger.error("Failed to save peers:", err));
-      }
-    }
 
     // Process discovered peers
     for (const discovered of knownPeers) {
@@ -1215,12 +1137,10 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
 
   /**
    * Compute a hash for announcement deduplication.
-   * Includes nodeId, groupIds, and source to identify unique announcements.
+   * Uses nodeId and source to identify unique announcements.
    */
   private computeAnnouncementHash(peer: KnownPeerInfo, sourceNodeId: string): string {
-    // Use nodeId + sorted groupIds + source as the hash key
-    const groupKey = peer.groupIds.slice().sort().join(",");
-    return `${peer.nodeId}:${groupKey}:${sourceNodeId}`;
+    return `${peer.nodeId}:${sourceNodeId}`;
   }
 
   /**
@@ -1295,34 +1215,14 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       if (!existingPeer.ticket && discovered.ticket) {
         existingPeer.ticket = discovered.ticket;
         this.logger.debug(`Updated ticket for known peer ${discovered.nodeId.slice(0, 8)}`);
-      }
-
-      // Update group membership
-      const newGroups = discovered.groupIds.filter(gid => !existingPeer.groupIds?.includes(gid));
-      if (newGroups.length > 0) {
-        existingPeer.groupIds = [...(existingPeer.groupIds || []), ...newGroups];
-        for (const gid of newGroups) {
-          this.groupManager.addPeerToGroup(gid, discovered.nodeId);
-        }
         this.savePeers().catch(err => this.logger.error("Failed to save peers:", err));
       }
       return;
     }
 
-    // Check if we share any groups with this peer (only connect to group members)
-    const ourGroupIds = this.groupManager.getLocalGroupIds();
-    const sharedGroups = discovered.groupIds.filter(gid => ourGroupIds.includes(gid));
-
-    if (sharedGroups.length === 0) {
-      this.logger.debug(
-        `Ignoring discovered peer ${discovered.nodeId.slice(0, 8)} - no shared groups`
-      );
-      return;
-    }
-
-    // This is a new peer in our group - emit discovery event
+    // This is a new peer sharing the vault - emit discovery event
     this.logger.info(
-      `Discovered new peer ${discovered.nodeId.slice(0, 8)} via ${sourceNodeId.slice(0, 8)} (shared groups: ${sharedGroups.join(", ")})`
+      `Discovered new peer ${discovered.nodeId.slice(0, 8)} via ${sourceNodeId.slice(0, 8)}`
     );
     this.emit("peer:discovered", discovered);
 
@@ -1426,7 +1326,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
 
       try {
         // Use addPeer which handles all the connection logic
-        await this.addPeer(discovered.ticket!, discovered.groupIds[0]);
+        await this.addPeer(discovered.ticket!);
         // Success - clear retry tracking
         this.discoveryRetries.delete(discovered.nodeId);
       } catch (error) {
@@ -1464,27 +1364,26 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   }
 
   /**
-   * Announce a peer to all connected group members.
+   * Announce a peer to all connected peers.
    * Called when a new peer successfully connects and syncs.
    */
-  async announcePeerToGroup(peer: PeerInfo): Promise<void> {
+  async announcePeerToAll(peer: PeerInfo): Promise<void> {
     if (!peer.ticket) {
       this.logger.debug(`Cannot announce peer ${peer.nodeId.slice(0, 8)} - no ticket`);
       return;
     }
 
-    const peerGroups = peer.groupIds || [DEFAULT_GROUP_ID];
     const announcement: KnownPeerInfo = {
       nodeId: peer.nodeId,
       ticket: peer.ticket,
-      groupIds: peerGroups,
+      groupIds: [], // Groups removed - all peers share the vault
       lastSeen: peer.lastSeen || Date.now(),
     };
 
-    // Collect existing group members to announce to the new peer
-    const existingMembersForNewPeer: KnownPeerInfo[] = [];
+    // Collect existing peers to announce to the new peer
+    const existingPeersForNewPeer: KnownPeerInfo[] = [];
 
-    // Find all sessions for peers in the same groups
+    // Find all live sessions
     let announcedCount = 0;
     for (const [sessionNodeId, session] of this.sessions) {
       // Don't announce to the peer itself
@@ -1497,14 +1396,8 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
         continue;
       }
 
-      // Check if this session's peer shares any groups with the new peer
       const sessionPeer = this.peers.get(sessionNodeId);
       if (!sessionPeer) {
-        continue;
-      }
-
-      const sharedGroups = (sessionPeer.groupIds || [DEFAULT_GROUP_ID]).filter(gid => peerGroups.includes(gid));
-      if (sharedGroups.length === 0) {
         continue;
       }
 
@@ -1516,44 +1409,43 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
         this.logger.warn(`Failed to announce peer to ${sessionNodeId.slice(0, 8)}:`, err);
       }
 
-      // Collect this existing member for announcement to the new peer
+      // Collect this existing peer for announcement to the new peer
       if (sessionPeer.ticket) {
-        existingMembersForNewPeer.push({
+        existingPeersForNewPeer.push({
           nodeId: sessionPeer.nodeId,
           ticket: sessionPeer.ticket,
-          groupIds: sessionPeer.groupIds || [DEFAULT_GROUP_ID],
+          groupIds: [], // Groups removed
           lastSeen: sessionPeer.lastSeen || Date.now(),
         });
       }
     }
 
     if (announcedCount > 0) {
-      this.logger.info(`Announced peer ${peer.nodeId.slice(0, 8)} to ${announcedCount} group member(s)`);
+      this.logger.info(`Announced peer ${peer.nodeId.slice(0, 8)} to ${announcedCount} peer(s)`);
     }
 
-    // Now announce existing group members to the new peer
-    if (existingMembersForNewPeer.length > 0) {
+    // Now announce existing peers to the new peer
+    if (existingPeersForNewPeer.length > 0) {
       const newPeerSession = this.sessions.get(peer.nodeId);
       if (newPeerSession && newPeerSession.getState() === "live") {
         try {
-          await newPeerSession.sendPeerAnnouncement(existingMembersForNewPeer, "discovered");
+          await newPeerSession.sendPeerAnnouncement(existingPeersForNewPeer, "discovered");
           this.logger.info(
-            `Announced ${existingMembersForNewPeer.length} existing member(s) to new peer ${peer.nodeId.slice(0, 8)}`
+            `Announced ${existingPeersForNewPeer.length} existing peer(s) to new peer ${peer.nodeId.slice(0, 8)}`
           );
         } catch (err) {
-          this.logger.warn(`Failed to announce existing members to new peer:`, err);
+          this.logger.warn(`Failed to announce existing peers to new peer:`, err);
         }
       }
     }
   }
 
   /**
-   * Announce that a peer has left to all other group members.
+   * Announce that a peer has left to all other peers.
    * Called when a peer is removed or disconnects.
    */
   async announcePeerLeft(
     nodeId: string,
-    groupIds: string[],
     reason: "removed" | "disconnected" | "left"
   ): Promise<void> {
     let announcedCount = 0;
@@ -1569,20 +1461,9 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
         continue;
       }
 
-      // Check if this session's peer shares any groups with the leaving peer
-      const sessionPeer = this.peers.get(sessionNodeId);
-      if (!sessionPeer) {
-        continue;
-      }
-
-      const sharedGroups = (sessionPeer.groupIds || []).filter(gid => groupIds.includes(gid));
-      if (sharedGroups.length === 0) {
-        continue;
-      }
-
       // Notify about the peer leaving
       try {
-        await session.sendPeerLeft(nodeId, groupIds, reason);
+        await session.sendPeerLeft(nodeId, [], reason);
         announcedCount++;
       } catch (err) {
         this.logger.warn(`Failed to announce peer left to ${sessionNodeId.slice(0, 8)}:`, err);
@@ -1590,17 +1471,17 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     }
 
     if (announcedCount > 0) {
-      this.logger.info(`Announced peer ${nodeId.slice(0, 8)} left to ${announcedCount} group member(s)`);
+      this.logger.info(`Announced peer ${nodeId.slice(0, 8)} left to ${announcedCount} peer(s)`);
     }
   }
 
   /**
-   * Handle peer left notification from another group member.
+   * Handle peer left notification from another peer.
    * Used for mesh cleanup when a peer is removed elsewhere.
    */
   handlePeerLeft(
     nodeId: string,
-    groupIds: string[],
+    _groupIds: string[], // Ignored - groups removed
     reason: "removed" | "disconnected" | "left"
   ): void {
     // Remove from discovered peers (if waiting for them to connect)
@@ -1614,13 +1495,13 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
 
     // Create tombstone to prevent re-discovery (for "removed" and "left" reasons)
     if (reason === "removed" || reason === "left") {
-      this.createTombstone(nodeId, groupIds, reason === "removed" ? "removed" : "left");
+      this.createTombstone(nodeId, reason === "removed" ? "removed" : "left");
     }
 
     // If we're connected to this peer, we should also disconnect
     const peer = this.peers.get(nodeId);
     if (peer && reason === "removed") {
-      this.logger.info(`Peer ${nodeId.slice(0, 8)} was removed from group by another member`);
+      this.logger.info(`Peer ${nodeId.slice(0, 8)} was removed by another peer`);
       // Note: Don't cascade the removal announcement to avoid infinite loops
       // Just close the session and clean up locally
       const session = this.sessions.get(nodeId);
@@ -1631,7 +1512,6 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
         });
       }
       this.peers.delete(nodeId);
-      this.groupManager.removePeerFromAllGroups(nodeId);
       this.savePeers().catch(err => this.logger.error("Failed to save peers:", err));
       this.emit("peer:disconnected", { nodeId, reason: "removed" });
     }
@@ -1811,7 +1691,6 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
           nodeId,
           nickname: undefined,
           trusted: true,
-          groupIds: discoveredPeer.groupIds,
           ticket: discoveredPeer.ticket,
           state: "connecting" as const,
           firstSeen: now,
@@ -1819,11 +1698,6 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
         };
 
         this.peers.set(nodeId, peer);
-
-        // Add to group(s)
-        const groupId = discoveredPeer.groupIds[0] || DEFAULT_GROUP_ID;
-        this.groupManager.addPeerToGroup(groupId, nodeId);
-
         await this.savePeers();
         this.emit("peer:connected", peer);
         // Continue to the normal sync flow below
@@ -1928,8 +1802,8 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
         if (this.status === "error" || this.status === "syncing") {
           this.setStatus("idle");
         }
-        // Announce the peer to other group members now that session is live
-        this.announcePeerToGroup(peer).catch(err => {
+        // Announce the peer to other peers now that session is live
+        this.announcePeerToAll(peer).catch((err: Error) => {
           this.logger.warn("Failed to announce peer on live state:", err);
         });
       } else if (state === "error") {
@@ -2033,28 +1907,23 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       this.sessions.delete(peer.nodeId);
     }
 
-    // Get effective sync policy for this peer
-    const syncPolicy = this.groupManager.getEffectiveSyncPolicy(peer.nodeId);
-
     // Generate our ticket for bidirectional reconnection
     const ourTicket = await this.transport.generateTicket();
 
-    // Get our groups for discovery
-    const ourGroupIds = this.groupManager.getLocalGroupIds();
-
     // Create new session with blob store for binary sync
+    // All peers have the default sync policy: not read-only, can sync everything
     const session = new SyncSession(
       peer.nodeId,
       this.documentManager,
       this.logger,
       {
-        peerIsReadOnly: syncPolicy.readOnly,
+        peerIsReadOnly: false, // Groups removed - all peers can sync
         ourTicket,
         ourHostname: this.config.hostname,
         ourNickname: this.config.nickname,
         ourPluginVersion: this.config.pluginVersion,
-        // Group-based peer discovery
-        ourGroupIds,
+        // Peer discovery (groups removed - empty array)
+        ourGroupIds: [],
         getKnownPeers: () => this.getKnownPeersInfo(),
         onPeerDiscoveryInfo: (groupIds, knownPeers) => {
           this.handlePeerDiscoveryInfo(peer.nodeId, groupIds, knownPeers);
@@ -2105,17 +1974,11 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       this.sessions.delete(peer.nodeId);
     }
 
-    // Get effective sync policy for this peer
-    const syncPolicy = this.groupManager.getEffectiveSyncPolicy(peer.nodeId);
-
     // Allow vault adoption on first sync (peer has never synced before)
     const isFirstSync = peer.lastSynced === undefined;
 
     // Generate our ticket for bidirectional reconnection
     const ourTicket = await this.transport.generateTicket();
-
-    // Get our groups for discovery
-    const ourGroupIds = this.groupManager.getLocalGroupIds();
 
     // Create vault adoption confirmation callback with timeout to prevent indefinite hanging
     const VAULT_ADOPTION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
@@ -2151,20 +2014,21 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     };
 
     // Create new session with blob store for binary sync
+    // All peers have the default sync policy: not read-only, can sync everything
     const session = new SyncSession(
       peer.nodeId,
       this.documentManager,
       this.logger,
       {
-        peerIsReadOnly: syncPolicy.readOnly,
+        peerIsReadOnly: false, // Groups removed - all peers can sync
         allowVaultAdoption: isFirstSync,
         onVaultAdoptionNeeded: isFirstSync ? onVaultAdoptionNeeded : undefined,
         ourTicket,
         ourHostname: this.config.hostname,
         ourNickname: this.config.nickname,
         ourPluginVersion: this.config.pluginVersion,
-        // Group-based peer discovery
-        ourGroupIds,
+        // Peer discovery (groups removed - empty array)
+        ourGroupIds: [],
         getKnownPeers: () => this.getKnownPeersInfo(),
         onPeerDiscoveryInfo: (groupIds, knownPeers) => {
           this.handlePeerDiscoveryInfo(peer.nodeId, groupIds, knownPeers);
@@ -2323,9 +2187,6 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     // Wrap stream to return the first message on next receive()
     const bufferedStream = new BufferedStream(stream, firstMessage);
 
-    // Get effective sync policy for this peer
-    const syncPolicy = this.groupManager.getEffectiveSyncPolicy(peer.nodeId);
-
     // Allow vault adoption on first sync (peer has never synced before)
     const isFirstSync = peer.lastSynced === undefined;
 
@@ -2370,7 +2231,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       this.documentManager,
       this.logger,
       {
-        peerIsReadOnly: syncPolicy.readOnly,
+        peerIsReadOnly: false, // Groups removed - all peers can read/write
         allowVaultAdoption: isFirstSync,
         onVaultAdoptionNeeded: isFirstSync ? onVaultAdoptionNeeded : undefined,
         ourTicket,
@@ -2798,7 +2659,6 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
             lastSynced: sp.lastSynced,
             lastSeen: sp.lastSeen,
             trusted: sp.trusted,
-            groupIds: sp.groupIds,
             bandwidth: sp.bandwidth,
           });
         }
@@ -2820,7 +2680,6 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
         lastSynced: p.lastSynced,
         lastSeen: p.lastSeen,
         trusted: p.trusted,
-        groupIds: p.groupIds,
         bandwidth: p.bandwidth,
       }),
     );
@@ -2935,10 +2794,9 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
    * Create a tombstone for a removed peer.
    * Prevents the peer from being re-discovered for TOMBSTONE_TTL.
    */
-  private createTombstone(nodeId: string, groupIds: string[], reason: "removed" | "left"): void {
+  private createTombstone(nodeId: string, reason: "removed" | "left"): void {
     const tombstone: PeerTombstone = {
       nodeId,
-      groupIds,
       removedAt: Date.now(),
       reason,
     };
@@ -2984,7 +2842,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       peersToAnnounce.push({
         nodeId: peer.nodeId,
         ticket: peer.ticket,
-        groupIds: peer.groupIds || [DEFAULT_GROUP_ID],
+        groupIds: [], // Groups removed
         lastSeen: peer.lastSeen || Date.now(),
       });
     }

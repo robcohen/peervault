@@ -22,7 +22,5 @@ export {
   type SyncError,
 } from "./connection-status";
 export { FileHistoryModal, type FileVersion } from "./file-history-modal";
-export { SelectiveSyncModal } from "./selective-sync-modal";
 export { ConflictModal } from "./conflict-modal";
-export { GroupModal } from "./group-modal";
 export { STATUS_ICONS, getPeerStateIcon, getStatusLabel } from "./status-icons";

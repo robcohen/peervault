@@ -221,10 +221,6 @@ describe("PeerManager", () => {
     it("should return transport node ID", () => {
       expect(peerManager.getNodeId()).toBe(transport.getNodeId());
     });
-
-    it("should have a group manager", () => {
-      expect(peerManager.getGroupManager()).toBeDefined();
-    });
   });
 
   describe("Ticket Generation", () => {

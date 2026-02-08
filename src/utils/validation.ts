@@ -8,7 +8,6 @@
  * Maximum lengths for user inputs.
  */
 export const INPUT_LIMITS = {
-  groupName: 50,
   nickname: 30,
   folderPath: 500,
   relayUrl: 200,
@@ -23,23 +22,6 @@ export function sanitizeString(input: string, maxLength: number): string {
   const cleaned = input.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
   // Trim and limit length
   return cleaned.trim().slice(0, maxLength);
-}
-
-/**
- * Validate and sanitize a group name.
- */
-export function validateGroupName(name: string): { valid: boolean; value: string; error?: string } {
-  const sanitized = sanitizeString(name, INPUT_LIMITS.groupName);
-
-  if (sanitized.length === 0) {
-    return { valid: false, value: "", error: "Group name cannot be empty" };
-  }
-
-  if (sanitized.length < 2) {
-    return { valid: false, value: sanitized, error: "Group name must be at least 2 characters" };
-  }
-
-  return { valid: true, value: sanitized };
 }
 
 /**
@@ -166,34 +148,6 @@ export function validateTicket(ticket: string): { valid: boolean; value: string;
   }
 
   return { valid: false, value: trimmed, error: "Unrecognized ticket format (expected base32 or JSON)" };
-}
-
-/**
- * Check if a path matches or is inside an excluded folder.
- * Used for selective sync exclusion logic.
- *
- * @param path - The path to check
- * @param excludedFolder - The excluded folder path
- * @returns true if the path should be excluded
- */
-export function isPathExcluded(path: string, excludedFolder: string): boolean {
-  return path === excludedFolder || path.startsWith(excludedFolder + "/");
-}
-
-/**
- * Check if a path matches any of the excluded folders.
- *
- * @param path - The path to check
- * @param excludedFolders - Array of excluded folder paths
- * @returns true if the path should be excluded
- */
-export function isPathInExcludedFolders(path: string, excludedFolders: string[]): boolean {
-  for (const excluded of excludedFolders) {
-    if (isPathExcluded(path, excluded)) {
-      return true;
-    }
-  }
-  return false;
 }
 
 /**

@@ -23,7 +23,6 @@ import {
   recordSyncError,
   updateSyncProgress,
   FileHistoryModal,
-  SelectiveSyncModal,
   ConflictModal,
   showConfirm,
 } from "./ui";
@@ -143,7 +142,6 @@ export default class PeerVaultPlugin extends Plugin {
       this.blobStore,
       this.logger,
       {
-        excludedFolders: this.settings.excludedFolders,
         maxFileSize: 100 * 1024 * 1024, // 100 MB
         debounceMs: 500,
       },
@@ -316,9 +314,6 @@ export default class PeerVaultPlugin extends Plugin {
       this.logger.info("Synced with peer:", nodeId);
       updateSyncProgress(null); // Clear progress
 
-      // Update vault sync with peer exclusions
-      this.updateVaultSyncPeerExclusions();
-
       // Get peer info for notification
       const peer = this.peerManager.getPeers().find((p) => p.nodeId === nodeId);
       const peerName = peer?.hostname
@@ -384,8 +379,6 @@ export default class PeerVaultPlugin extends Plugin {
     this.peerManagerUnsubscribes.push(
       this.peerManager.on("peer:disconnected", ({ nodeId }) => {
         this.logger.info("Peer disconnected:", nodeId);
-        // Update vault sync exclusions when a peer disconnects
-        this.updateVaultSyncPeerExclusions();
       }),
     );
 
@@ -406,6 +399,20 @@ export default class PeerVaultPlugin extends Plugin {
           timestamp: Date.now(),
           retryable: !errorMsg.includes("protocol v"), // Version mismatch is not retryable
         });
+      }),
+    );
+
+    // Handle vault key received from peer (during pairing)
+    this.peerManagerUnsubscribes.push(
+      this.peerManager.on("vault:key-received", (vaultKey) => {
+        this.logger.info("Vault key received from peer, updating CloudSync");
+        if (this.cloudSync) {
+          this.cloudSync.setVaultKey(vaultKey);
+          // Check if cloud config was synced from peer
+          this.cloudSync.checkForConfigUpdate().catch((err) => {
+            this.logger.debug("Failed to check cloud config after key received:", err);
+          });
+        }
       }),
     );
 
@@ -638,14 +645,6 @@ Only accept if you trust this peer and want to sync with them.`,
       },
     });
 
-    // Selective sync command
-    this.addCommand({
-      id: "selective-sync",
-      name: "Configure selective sync",
-      callback: () => {
-        new SelectiveSyncModal(this.app, this).open();
-      },
-    });
 
     // View conflicts command
     this.addCommand({
@@ -891,19 +890,6 @@ Only accept if you trust this peer and want to sync with them.`,
    */
   getCloudSync(): CloudSync | null {
     return this.cloudSync;
-  }
-
-  /**
-   * Update vault sync with peer group exclusions.
-   * Called when peer connections change or group policies are updated.
-   */
-  private updateVaultSyncPeerExclusions(): void {
-    if (!this.peerManager || !this.vaultSync) {
-      return;
-    }
-
-    const excludedFolders = this.peerManager.getConnectedPeersExcludedFolders();
-    this.vaultSync.updatePeerExcludedFolders(excludedFolders);
   }
 
   /**

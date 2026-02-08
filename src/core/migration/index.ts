@@ -20,6 +20,9 @@ import { migration002AddPeerGroups } from "./migrations/002-add-peer-groups";
 /**
  * All migrations in order.
  * Add new migrations here as the schema evolves.
+ *
+ * Note: migration002 originally added peer groups, but the feature was removed.
+ * The migration now strips legacy groupIds from stored peers.
  */
 export const MIGRATIONS: import("./types").Migration[] = [
   migration001InitializeSchema,

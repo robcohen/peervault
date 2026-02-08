@@ -77,9 +77,6 @@ export interface PeerInfo {
   /** Whether this peer is trusted (can write) */
   trusted: boolean;
 
-  /** Groups this peer belongs to */
-  groupIds?: string[];
-
   /** Bandwidth usage statistics */
   bandwidth?: PeerBandwidthStats;
 
@@ -97,7 +94,6 @@ export interface StoredPeerInfo {
   lastSynced?: number;
   lastSeen?: number;
   trusted: boolean;
-  groupIds?: string[];
   /** Bandwidth usage statistics (persisted for cumulative totals) */
   bandwidth?: PeerBandwidthStats;
 }

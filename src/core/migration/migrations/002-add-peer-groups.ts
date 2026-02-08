@@ -1,20 +1,18 @@
 /**
- * Migration 002: Add Peer Groups
+ * Migration 002: Add Peer Groups (REMOVED)
  *
- * Adds the peer groups structure to the Loro document
- * and updates stored peers to include groupIds.
+ * This migration was for peer groups which have been removed.
+ * Now it strips any legacy groupIds from stored peers.
  */
 
 import type { Migration } from "../types";
-import { DEFAULT_GROUP_ID } from "../../../peer/groups";
-import { ConfigErrors } from "../../../errors";
 
 const PEERS_STORAGE_KEY = "peervault-peers";
 
 /**
- * Interface for stored peer info (pre-migration).
+ * Interface for stored peer info.
  */
-interface LegacyStoredPeerInfo {
+interface StoredPeerInfo {
   nodeId: string;
   name?: string;
   ticket?: string;
@@ -22,29 +20,17 @@ interface LegacyStoredPeerInfo {
   lastSynced?: number;
   lastSeen?: number;
   trusted: boolean;
+  groupIds?: string[]; // Legacy field - will be stripped
 }
 
 /**
- * Interface for stored peer info (post-migration).
- */
-interface UpdatedStoredPeerInfo extends LegacyStoredPeerInfo {
-  groupIds?: string[];
-}
-
-/**
- * Add peer groups support to the schema.
- *
- * This migration:
- * 1. Updates stored peers to include groupIds (defaulting to 'default' group)
- *
- * Note: The Loro document 'groups' map is created automatically by
- * PeerGroupManager when it initializes, so we only need to update
- * the peer storage here.
+ * Migration that strips legacy groupIds from stored peers.
+ * Groups feature was removed - all peers now sync with the entire vault.
  */
 export const migration002AddPeerGroups: Migration = {
   fromVersion: 1,
   toVersion: 2,
-  description: "Add peer groups support",
+  description: "Remove peer groups (feature removed)",
 
   async migrate(ctx) {
     ctx.onProgress(0, "Reading stored peers...");
@@ -61,17 +47,17 @@ export const migration002AddPeerGroups: Migration = {
     ctx.onProgress(25, "Parsing peer data...");
 
     try {
-      const peers: LegacyStoredPeerInfo[] = JSON.parse(
+      const peers: StoredPeerInfo[] = JSON.parse(
         new TextDecoder().decode(peersData),
       );
 
-      ctx.onProgress(50, `Updating ${peers.length} peers...`);
+      ctx.onProgress(50, `Cleaning up ${peers.length} peers...`);
 
-      // Add groupIds to each peer
-      const updatedPeers: UpdatedStoredPeerInfo[] = peers.map((peer) => ({
-        ...peer,
-        groupIds: [DEFAULT_GROUP_ID], // Add to default group
-      }));
+      // Strip groupIds from each peer (legacy field)
+      const updatedPeers = peers.map((peer) => {
+        const { groupIds: _removed, ...rest } = peer;
+        return rest;
+      });
 
       ctx.onProgress(75, "Saving updated peers...");
 
@@ -82,12 +68,13 @@ export const migration002AddPeerGroups: Migration = {
       await ctx.storage.write(PEERS_STORAGE_KEY, updatedData);
 
       ctx.logger.info(
-        `Migration 002: Updated ${peers.length} peers with group IDs`,
+        `Migration 002: Cleaned up ${peers.length} peers (removed groupIds)`,
       );
-      ctx.onProgress(100, "Peer groups migration complete");
+      ctx.onProgress(100, "Migration complete");
     } catch (error) {
-      ctx.logger.error("Migration 002: Failed to parse/update peers", error);
-      throw ConfigErrors.migrationFailed(1, 2, `Failed to migrate peers: ${error}`);
+      // Non-fatal - just log and continue
+      ctx.logger.warn("Migration 002: Failed to clean up peers", error);
+      ctx.onProgress(100, "Migration complete (with warnings)");
     }
   },
 };

@@ -8,7 +8,6 @@ import { describe, it, expect } from "bun:test";
 import {
   INPUT_LIMITS,
   sanitizeString,
-  validateGroupName,
   validateNickname,
   validateFolderPath,
   validateRelayUrl,
@@ -51,49 +50,6 @@ describe("sanitizeString", () => {
 
   it("should handle unicode characters", () => {
     expect(sanitizeString("héllo wörld 🎉", 100)).toBe("héllo wörld 🎉");
-  });
-});
-
-// ============================================================================
-// validateGroupName Tests
-// ============================================================================
-
-describe("validateGroupName", () => {
-  it("should accept valid group names", () => {
-    const result = validateGroupName("Work");
-    expect(result.valid).toBe(true);
-    expect(result.value).toBe("Work");
-    expect(result.error).toBeUndefined();
-  });
-
-  it("should reject empty names", () => {
-    const result = validateGroupName("");
-    expect(result.valid).toBe(false);
-    expect(result.error).toBe("Group name cannot be empty");
-  });
-
-  it("should reject single character names", () => {
-    const result = validateGroupName("A");
-    expect(result.valid).toBe(false);
-    expect(result.error).toBe("Group name must be at least 2 characters");
-  });
-
-  it("should accept two character names", () => {
-    const result = validateGroupName("AB");
-    expect(result.valid).toBe(true);
-  });
-
-  it("should trim and sanitize", () => {
-    const result = validateGroupName("  My Group  ");
-    expect(result.valid).toBe(true);
-    expect(result.value).toBe("My Group");
-  });
-
-  it("should truncate to max length", () => {
-    const longName = "A".repeat(100);
-    const result = validateGroupName(longName);
-    expect(result.valid).toBe(true);
-    expect(result.value.length).toBe(INPUT_LIMITS.groupName);
   });
 });
 
@@ -335,7 +291,6 @@ describe("validateTicket", () => {
 
 describe("INPUT_LIMITS", () => {
   it("should have expected limits", () => {
-    expect(INPUT_LIMITS.groupName).toBe(50);
     expect(INPUT_LIMITS.nickname).toBe(30);
     expect(INPUT_LIMITS.folderPath).toBe(500);
     expect(INPUT_LIMITS.relayUrl).toBe(200);
