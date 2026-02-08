@@ -144,4 +144,7 @@ export interface PeerManagerConfig {
 
   /** Our device nickname (optional, user-defined) */
   nickname?: string;
+
+  /** Our plugin version (e.g., "0.2.53") - peers must match to sync */
+  pluginVersion?: string;
 }

@@ -113,7 +113,7 @@ const PAIRING_RATE_LIMIT = {
   maxTrackedPeers: 100,
 };
 
-const DEFAULT_CONFIG: Omit<Required<PeerManagerConfig>, "hostname" | "nickname"> = {
+const DEFAULT_CONFIG: Omit<Required<PeerManagerConfig>, "hostname" | "nickname" | "pluginVersion"> = {
   autoSyncInterval: 30000, // Reduced from 60s for more frequent sync checks
   autoReconnect: true,
   maxReconnectAttempts: 10,
@@ -215,7 +215,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   private static readonly CONNECTION_REPAIR_INTERVAL = 30 * 1000; // 30 seconds
   /** Minimum time since last seen before attempting repair (ms) */
   private static readonly REPAIR_STALE_THRESHOLD = 60 * 1000; // 1 minute
-  private config: Omit<Required<PeerManagerConfig>, "hostname" | "nickname"> & { hostname: string; nickname?: string };
+  private config: Omit<Required<PeerManagerConfig>, "hostname" | "nickname" | "pluginVersion"> & { hostname: string; nickname?: string; pluginVersion?: string };
   private autoSyncTimer: ReturnType<typeof setInterval> | null = null;
   private initialSyncTimeout: ReturnType<typeof setTimeout> | null = null;
   /** Pending reconnect timers by nodeId - tracked so they can be cancelled on shutdown */
@@ -2052,6 +2052,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
         ourTicket,
         ourHostname: this.config.hostname,
         ourNickname: this.config.nickname,
+        ourPluginVersion: this.config.pluginVersion,
         // Group-based peer discovery
         ourGroupIds,
         getKnownPeers: () => this.getKnownPeersInfo(),
@@ -2161,6 +2162,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
         ourTicket,
         ourHostname: this.config.hostname,
         ourNickname: this.config.nickname,
+        ourPluginVersion: this.config.pluginVersion,
         // Group-based peer discovery
         ourGroupIds,
         getKnownPeers: () => this.getKnownPeersInfo(),
@@ -2374,6 +2376,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
         ourTicket,
         ourHostname: this.config.hostname,
         ourNickname: this.config.nickname,
+        ourPluginVersion: this.config.pluginVersion,
       },
       this.blobStore,
     );

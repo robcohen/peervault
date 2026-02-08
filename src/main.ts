@@ -253,6 +253,7 @@ export default class PeerVaultPlugin extends Plugin {
         autoReconnect: true,
         hostname,
         nickname,
+        pluginVersion: this.manifest.version,
       },
       this.blobStore,
     );
@@ -392,11 +393,18 @@ export default class PeerVaultPlugin extends Plugin {
     this.peerManagerUnsubscribes.push(
       this.peerManager.on("peer:error", ({ nodeId, error }) => {
         this.logger.error("Peer error:", nodeId, error);
+        const errorMsg = error.message || String(error);
+
+        // Show user-friendly notification for version mismatch
+        if (errorMsg.includes("protocol v") || errorMsg.includes("upgrade")) {
+          new Notice(errorMsg, 10000); // Show for 10 seconds
+        }
+
         recordSyncError({
-          message: error.message || String(error),
+          message: errorMsg,
           peerId: nodeId,
           timestamp: Date.now(),
-          retryable: true,
+          retryable: !errorMsg.includes("protocol v"), // Version mismatch is not retryable
         });
       }),
     );

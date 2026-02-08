@@ -51,6 +51,22 @@ export enum SyncMessageType {
   // Peer management messages (0x20 range)
   /** Notification that peer has been removed */
   PEER_REMOVED = 0x20,
+
+  /** Announce discovered peers to group members */
+  PEER_ANNOUNCEMENT = 0x21,
+
+  /** Request peers for specific groups */
+  PEER_REQUEST = 0x22,
+
+  /** Announce that a peer has left a group (for mesh cleanup) */
+  PEER_LEFT = 0x23,
+
+  // Key exchange messages (0x30 range)
+  /** Request vault key from peer (includes our public key) */
+  KEY_EXCHANGE_REQUEST = 0x30,
+
+  /** Response with encrypted vault key */
+  KEY_EXCHANGE_RESPONSE = 0x31,
 }
 
 /** Base sync message structure */
@@ -58,6 +74,24 @@ export interface SyncMessage {
   type: SyncMessageType;
   timestamp: number;
 }
+
+/** Known peer info for peer discovery */
+export interface KnownPeerInfo {
+  /** Peer's node ID */
+  nodeId: string;
+  /** Connection ticket (if available) */
+  ticket?: string;
+  /** Groups this peer belongs to */
+  groupIds: string[];
+  /** Timestamp when last seen/connected */
+  lastSeen: number;
+}
+
+/**
+ * Current protocol version.
+ * Used for protocol-level feature negotiation.
+ */
+export const SYNC_PROTOCOL_VERSION = 2;
 
 /** Version info message - sent at start of sync */
 export interface VersionInfoMessage extends SyncMessage {
@@ -72,6 +106,14 @@ export interface VersionInfoMessage extends SyncMessage {
   hostname: string;
   /** Device nickname (optional, user-defined) */
   nickname?: string;
+  /** Groups this peer belongs to (protocol v2+) */
+  groupIds?: string[];
+  /** Known peers for discovery (protocol v2+) */
+  knownPeers?: KnownPeerInfo[];
+  /** Protocol version for backwards compatibility (default: 1) */
+  protocolVersion?: number;
+  /** Plugin version (e.g., "0.2.53") - must match exactly to sync */
+  pluginVersion?: string;
 }
 
 /** Snapshot request message - for new peers requesting full document */
@@ -173,6 +215,51 @@ export interface PeerRemovedMessage extends SyncMessage {
   reason?: string;
 }
 
+/** Peer announcement message - gossip discovered peers to group members */
+export interface PeerAnnouncementMessage extends SyncMessage {
+  type: SyncMessageType.PEER_ANNOUNCEMENT;
+  /** Peers being announced */
+  peers: KnownPeerInfo[];
+  /** Reason for announcement */
+  reason: "joined" | "discovered" | "updated";
+}
+
+/** Peer request message - request peers for specific groups */
+export interface PeerRequestMessage extends SyncMessage {
+  type: SyncMessageType.PEER_REQUEST;
+  /** Groups to request peers for */
+  groupIds: string[];
+}
+
+/** Peer left message - announce that a peer has left the group */
+export interface PeerLeftMessage extends SyncMessage {
+  type: SyncMessageType.PEER_LEFT;
+  /** Node ID of the peer that left */
+  nodeId: string;
+  /** Groups the peer left (empty = all groups) */
+  groupIds: string[];
+  /** Reason for leaving */
+  reason: "removed" | "disconnected" | "left";
+}
+
+/** Key exchange request - sent by new peer to request vault key */
+export interface KeyExchangeRequestMessage extends SyncMessage {
+  type: SyncMessageType.KEY_EXCHANGE_REQUEST;
+  /** Our Curve25519 public key for the key exchange */
+  publicKey: Uint8Array;
+  /** Whether we already have a vault key (existing device joining) */
+  hasExistingKey: boolean;
+}
+
+/** Key exchange response - contains encrypted vault key */
+export interface KeyExchangeResponseMessage extends SyncMessage {
+  type: SyncMessageType.KEY_EXCHANGE_RESPONSE;
+  /** Encrypted vault key bundle (serialized EncryptedKeyBundle) */
+  encryptedKey: Uint8Array;
+  /** Whether this is a new key (first device) or existing key */
+  isNewKey: boolean;
+}
+
 /** Sync error codes */
 export enum SyncErrorCode {
   UNKNOWN = 0,
@@ -197,7 +284,12 @@ export type AnySyncMessage =
   | BlobRequestMessage
   | BlobDataMessage
   | BlobSyncCompleteMessage
-  | PeerRemovedMessage;
+  | PeerRemovedMessage
+  | PeerAnnouncementMessage
+  | PeerRequestMessage
+  | PeerLeftMessage
+  | KeyExchangeRequestMessage
+  | KeyExchangeResponseMessage;
 
 /** Sync session state */
 export type SyncSessionState =

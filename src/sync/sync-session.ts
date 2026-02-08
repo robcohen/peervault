@@ -13,6 +13,7 @@ import { protocolTracer } from "../utils/protocol-tracer";
 import {
   SyncMessageType,
   SyncErrorCode,
+  SYNC_PROTOCOL_VERSION,
   type SyncSessionState,
   type AnySyncMessage,
   type VersionInfoMessage,
@@ -21,6 +22,10 @@ import {
   type BlobRequestMessage,
   type BlobDataMessage,
   type PeerRemovedMessage,
+  type PeerAnnouncementMessage,
+  type PeerRequestMessage,
+  type PeerLeftMessage,
+  type KnownPeerInfo,
 } from "./types";
 import {
   serializeMessage,
@@ -36,6 +41,9 @@ import {
   createBlobDataMessage,
   createBlobSyncCompleteMessage,
   createPeerRemovedMessage,
+  createPeerAnnouncementMessage,
+  createPeerRequestMessage,
+  createPeerLeftMessage,
 } from "./messages";
 import { EventEmitter } from "../utils/events";
 
@@ -100,9 +108,39 @@ export interface SyncSessionConfig {
 
   /** Our nickname to send to peer (optional, user-defined) */
   ourNickname?: string;
+
+  /** Our plugin version (e.g., "0.2.53") - must match peer's version to sync */
+  ourPluginVersion?: string;
+
+  /** Groups this peer belongs to (for peer discovery) */
+  ourGroupIds?: string[];
+
+  /** Callback to get known peers for discovery */
+  getKnownPeers?: () => KnownPeerInfo[];
+
+  /** Callback when peer discovery info is received */
+  onPeerDiscoveryInfo?: (groupIds: string[], knownPeers: KnownPeerInfo[]) => void;
+
+  /** Callback when peer announcement is received during live mode */
+  onPeerAnnouncement?: (peers: KnownPeerInfo[], reason: "joined" | "discovered" | "updated") => void;
+
+  /** Callback when a peer left notification is received */
+  onPeerLeft?: (nodeId: string, groupIds: string[], reason: "removed" | "disconnected" | "left") => void;
 }
 
-const DEFAULT_CONFIG: Omit<Required<SyncSessionConfig>, "ourTicket" | "ourHostname" | "ourNickname" | "onVaultAdoptionNeeded"> & {
+const DEFAULT_CONFIG: Omit<
+  Required<SyncSessionConfig>,
+  | "ourTicket"
+  | "ourHostname"
+  | "ourNickname"
+  | "ourPluginVersion"
+  | "onVaultAdoptionNeeded"
+  | "ourGroupIds"
+  | "getKnownPeers"
+  | "onPeerDiscoveryInfo"
+  | "onPeerAnnouncement"
+  | "onPeerLeft"
+> & {
   peerIsReadOnly: boolean;
   allowVaultAdoption: boolean;
 } = {
@@ -141,6 +179,7 @@ interface SyncSessionEvents extends Record<string, unknown> {
   "peer:info": { hostname: string; nickname?: string };
   "peer:removed": string | undefined; // reason
   "blob:received": string; // blob hash
+  "live:updates": void; // CRDT updates imported during live mode
   error: Error;
 }
 
@@ -152,11 +191,29 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
   private stream: SyncStream | null = null;
   private pingSeq = 0;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
-  private config: Omit<Required<SyncSessionConfig>, "ourTicket" | "ourHostname" | "ourNickname" | "onVaultAdoptionNeeded"> & {
+  private config: Omit<
+    Required<SyncSessionConfig>,
+    | "ourTicket"
+    | "ourHostname"
+    | "ourNickname"
+    | "ourPluginVersion"
+    | "onVaultAdoptionNeeded"
+    | "ourGroupIds"
+    | "getKnownPeers"
+    | "onPeerDiscoveryInfo"
+    | "onPeerAnnouncement"
+    | "onPeerLeft"
+  > & {
     ourTicket: string;
     ourHostname: string;
     ourNickname?: string;
+    ourPluginVersion?: string;
     onVaultAdoptionNeeded?: (peerVaultId: string, ourVaultId: string) => Promise<boolean>;
+    ourGroupIds?: string[];
+    getKnownPeers?: () => KnownPeerInfo[];
+    onPeerDiscoveryInfo?: (groupIds: string[], knownPeers: KnownPeerInfo[]) => void;
+    onPeerAnnouncement?: (peers: KnownPeerInfo[], reason: "joined" | "discovered" | "updated") => void;
+    onPeerLeft?: (nodeId: string, groupIds: string[], reason: "removed" | "disconnected" | "left") => void;
   };
   private aborted = false;
   private unsubscribeLocalUpdates: (() => void) | null = null;
@@ -347,6 +404,17 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
 
       const peerVersionInfo = peerMessage as VersionInfoMessage;
 
+      // Validate plugin version first - must be exact match
+      const ourVersion = this.config.ourPluginVersion;
+      const peerVersion = peerVersionInfo.pluginVersion;
+      if (ourVersion && peerVersion && ourVersion !== peerVersion) {
+        const errorMsg = `Version mismatch: you have v${ourVersion}, peer has v${peerVersion}. All devices must use the same PeerVault version.`;
+        await this.sendMessage(
+          createErrorMessage(SyncErrorCode.VERSION_MISMATCH, errorMsg),
+        );
+        throw SyncErrors.protocolError(errorMsg);
+      }
+
       // Emit peer's ticket (for bidirectional reconnection)
       this.emit("ticket:received", peerVersionInfo.ticket);
 
@@ -391,7 +459,19 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
         }
       }
 
-      // Send our version info
+      // Handle peer discovery info (protocol v2+)
+      if (peerVersionInfo.protocolVersion && peerVersionInfo.protocolVersion >= 2) {
+        const peerGroupIds = peerVersionInfo.groupIds || [];
+        const peerKnownPeers = peerVersionInfo.knownPeers || [];
+        if (this.config.onPeerDiscoveryInfo && (peerGroupIds.length > 0 || peerKnownPeers.length > 0)) {
+          this.config.onPeerDiscoveryInfo(peerGroupIds, peerKnownPeers);
+        }
+      }
+
+      // Get known peers for discovery (if callback provided)
+      const knownPeers = this.config.getKnownPeers?.() || [];
+
+      // Send our version info with group discovery data
       await this.sendMessage(
         createVersionInfoMessage(
           ourVaultId,
@@ -399,6 +479,10 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
           this.config.ourTicket,
           this.config.ourHostname,
           this.config.ourNickname,
+          this.config.ourGroupIds,
+          knownPeers,
+          SYNC_PROTOCOL_VERSION,
+          this.config.ourPluginVersion,
         ),
       );
 
@@ -526,6 +610,74 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
   }
 
   /**
+   * Announce peers to this session's peer (for peer discovery/gossip).
+   * Used to propagate newly connected peers to all group members.
+   */
+  async sendPeerAnnouncement(
+    peers: KnownPeerInfo[],
+    reason: "joined" | "discovered" | "updated" = "joined"
+  ): Promise<void> {
+    if (!this.stream || this.state !== "live") {
+      this.logger.debug("Cannot send peer announcement: session not in live mode");
+      return;
+    }
+
+    if (peers.length === 0) {
+      return;
+    }
+
+    try {
+      this.logger.info(`Announcing ${peers.length} peer(s) to ${this.peerId} (${reason})`);
+      await this.sendMessage(createPeerAnnouncementMessage(peers, reason));
+    } catch (error) {
+      this.logger.error("Failed to send peer announcement:", error);
+    }
+  }
+
+  /**
+   * Request peers for specific groups from this session's peer.
+   */
+  async sendPeerRequest(groupIds: string[]): Promise<void> {
+    if (!this.stream || this.state !== "live") {
+      this.logger.debug("Cannot send peer request: session not in live mode");
+      return;
+    }
+
+    if (groupIds.length === 0) {
+      return;
+    }
+
+    try {
+      this.logger.debug(`Requesting peers for groups: ${groupIds.join(", ")}`);
+      await this.sendMessage(createPeerRequestMessage(groupIds));
+    } catch (error) {
+      this.logger.error("Failed to send peer request:", error);
+    }
+  }
+
+  /**
+   * Notify this session's peer that another peer has left.
+   * Used for mesh cleanup when a peer is removed or disconnects.
+   */
+  async sendPeerLeft(
+    nodeId: string,
+    groupIds: string[],
+    reason: "removed" | "disconnected" | "left"
+  ): Promise<void> {
+    if (!this.stream || this.state !== "live") {
+      this.logger.debug("Cannot send peer left: session not in live mode");
+      return;
+    }
+
+    try {
+      this.logger.info(`Notifying ${this.peerId.slice(0, 8)} that peer ${nodeId.slice(0, 8)} left (${reason})`);
+      await this.sendMessage(createPeerLeftMessage(nodeId, groupIds, reason));
+    } catch (error) {
+      this.logger.error("Failed to send peer left notification:", error);
+    }
+  }
+
+  /**
    * Close the sync session.
    */
   async close(): Promise<void> {
@@ -604,7 +756,10 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     const vaultId = this.documentManager.getVaultId();
     const versionBytes = this.documentManager.getVersionBytes();
 
-    // Send our version info
+    // Get known peers for discovery (if callback provided)
+    const knownPeers = this.config.getKnownPeers?.() || [];
+
+    // Send our version info with group discovery data
     await this.sendMessage(
       createVersionInfoMessage(
         vaultId,
@@ -612,6 +767,10 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
         this.config.ourTicket,
         this.config.ourHostname,
         this.config.ourNickname,
+        this.config.ourGroupIds,
+        knownPeers,
+        SYNC_PROTOCOL_VERSION,
+        this.config.ourPluginVersion,
       ),
     );
 
@@ -632,6 +791,17 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       throw SyncErrors.vaultMismatch(vaultId, peerVersionInfo.vaultId);
     }
 
+    // Validate plugin version - must be exact match
+    const ourVersion = this.config.ourPluginVersion;
+    const peerVersion = peerVersionInfo.pluginVersion;
+    if (ourVersion && peerVersion && ourVersion !== peerVersion) {
+      const errorMsg = `Version mismatch: you have v${ourVersion}, peer has v${peerVersion}. All devices must use the same PeerVault version.`;
+      await this.sendMessage(
+        createErrorMessage(SyncErrorCode.VERSION_MISMATCH, errorMsg),
+      );
+      throw SyncErrors.protocolError(errorMsg);
+    }
+
     // Emit peer's ticket (for bidirectional reconnection)
     this.emit("ticket:received", peerVersionInfo.ticket);
 
@@ -640,6 +810,15 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       hostname: sanitizePeerString(peerVersionInfo.hostname ?? "") ?? "",
       nickname: sanitizePeerString(peerVersionInfo.nickname ?? ""),
     });
+
+    // Handle peer discovery info (protocol v2+)
+    if (peerVersionInfo.protocolVersion && peerVersionInfo.protocolVersion >= 2) {
+      const peerGroupIds = peerVersionInfo.groupIds || [];
+      const peerKnownPeers = peerVersionInfo.knownPeers || [];
+      if (this.config.onPeerDiscoveryInfo && (peerGroupIds.length > 0 || peerKnownPeers.length > 0)) {
+        this.config.onPeerDiscoveryInfo(peerGroupIds, peerKnownPeers);
+      }
+    }
 
     this.logger.debug("Version exchange complete");
   }
@@ -1110,6 +1289,8 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
               } else {
                 this.documentManager.importUpdates(updatesMsg.updates);
                 this.logger.debug("Imported live update from peer");
+                // Emit event so VaultSync can reconcile after CRDT merge
+                this.emit("live:updates", undefined);
                 // Check for missing blobs and request them
                 await this.requestMissingBlobsLive();
               }
@@ -1169,6 +1350,49 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
             this.emit("peer:removed", removedMsg.reason);
             this.setState("closed");
             return;
+          }
+
+          case SyncMessageType.PEER_ANNOUNCEMENT: {
+            const announcementMsg = message as PeerAnnouncementMessage;
+            this.logger.info(
+              `Received peer announcement (${announcementMsg.reason}):`,
+              announcementMsg.peers.length,
+              "peers"
+            );
+            if (this.config.onPeerAnnouncement) {
+              this.config.onPeerAnnouncement(announcementMsg.peers, announcementMsg.reason);
+            }
+            break;
+          }
+
+          case SyncMessageType.PEER_REQUEST: {
+            const requestMsg = message as PeerRequestMessage;
+            this.logger.debug("Received peer request for groups:", requestMsg.groupIds);
+            // Respond with known peers for the requested groups
+            if (this.config.getKnownPeers) {
+              const allKnownPeers = this.config.getKnownPeers();
+              // Filter to peers that share at least one requested group
+              const relevantPeers = allKnownPeers.filter(peer =>
+                peer.groupIds.some(gid => requestMsg.groupIds.includes(gid))
+              );
+              if (relevantPeers.length > 0) {
+                this.logger.debug("Responding with", relevantPeers.length, "known peers");
+                await this.sendMessage(createPeerAnnouncementMessage(relevantPeers, "discovered"));
+              }
+            }
+            break;
+          }
+
+          case SyncMessageType.PEER_LEFT: {
+            const leftMsg = message as PeerLeftMessage;
+            this.logger.info(
+              `Peer left notification: ${leftMsg.nodeId.slice(0, 8)} (${leftMsg.reason})`,
+              leftMsg.groupIds.length > 0 ? `groups: ${leftMsg.groupIds.join(", ")}` : "all groups"
+            );
+            if (this.config.onPeerLeft) {
+              this.config.onPeerLeft(leftMsg.nodeId, leftMsg.groupIds, leftMsg.reason);
+            }
+            break;
           }
 
           default:
