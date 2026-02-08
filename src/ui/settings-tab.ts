@@ -4,7 +4,7 @@
  * Plugin settings UI for PeerVault configuration.
  */
 
-import { App, Platform, PluginSettingTab, Setting, Notice, Modal } from "obsidian";
+import { App, PluginSettingTab, Setting, Notice } from "obsidian";
 import type PeerVaultPlugin from "../main";
 import { nodeIdToWords } from "../utils/device";
 import { GroupModal } from "./group-modal";
@@ -12,10 +12,6 @@ import { showConfirm } from "./confirm-modal";
 import { STATUS_ICONS } from "./status-icons";
 import { DEFAULT_GROUP_ID, type PeerGroup } from "../peer/groups";
 import { formatUserError } from "../utils/validation";
-import {
-  generateQRCode,
-  openQRFilePicker,
-} from "./utils/qr-utils";
 import {
   renderStatusSection,
   resetStatusSectionState,
@@ -34,7 +30,7 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
   private refreshTimeout?: number;
 
   // Pairing state
-  private showMyQR = false;
+  private showTicket = false;
   private showAddDevice = false;
   private myTicket = "";
   private ticketInput = "";
@@ -508,40 +504,40 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
   private renderAddDeviceSection(container: HTMLElement): void {
     const section = container.createDiv({ cls: "peervault-add-device-section" });
 
-    // --- Show My Invite (for others to scan) ---
-    const myInviteHeader = new Setting(section)
-      .setName("My Invite Code")
-      .setDesc(this.showMyQR ? "Others scan this to connect" : "Show QR code for other devices")
+    // --- Show My Invite Ticket ---
+    new Setting(section)
+      .setName("My Invite Ticket")
+      .setDesc(this.showTicket ? "Share this with another device" : "Show your invite ticket for other devices")
       .addExtraButton((btn) =>
         btn
-          .setIcon(this.showMyQR ? "chevron-up" : "qr-code")
-          .setTooltip(this.showMyQR ? "Hide" : "Show QR")
+          .setIcon(this.showTicket ? "chevron-up" : "ticket")
+          .setTooltip(this.showTicket ? "Hide" : "Show Ticket")
           .onClick(async () => {
-            this.showMyQR = !this.showMyQR;
-            if (this.showMyQR && !this.myTicket) {
+            this.showTicket = !this.showTicket;
+            if (this.showTicket && !this.myTicket) {
               try {
                 this.myTicket = await this.plugin.generateInvite();
               } catch (error) {
                 new Notice(`Failed to generate invite: ${formatUserError(error)}`);
-                this.showMyQR = false;
+                this.showTicket = false;
               }
             }
             this.display();
           }),
       );
 
-    if (this.showMyQR && this.myTicket) {
-      const qrSection = section.createDiv({ cls: "peervault-qr-section" });
+    if (this.showTicket && this.myTicket) {
+      const ticketSection = section.createDiv({ cls: "peervault-ticket-section" });
 
-      // QR Code
-      const qrContainer = qrSection.createDiv({ cls: "peervault-qr-container-small" });
-      generateQRCode(qrContainer, this.myTicket, {
-        width: 160,
-        canvasClass: "peervault-qr-canvas-small",
+      // Ticket display
+      const ticketEl = ticketSection.createEl("textarea", {
+        cls: "peervault-ticket-display",
+        attr: { readonly: "true", rows: "3", spellcheck: "false" },
       });
+      ticketEl.value = this.myTicket;
 
       // Copy ticket button
-      new Setting(qrSection)
+      new Setting(ticketSection)
         .addButton((btn) =>
           btn.setButtonText("Copy Ticket").onClick(() => {
             navigator.clipboard.writeText(this.myTicket);
@@ -661,49 +657,6 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
           });
       });
 
-    // Scan QR option
-    section.createEl("div", { cls: "peervault-section-divider" });
-
-    const scanSetting = new Setting(section)
-      .setName("Scan QR Code")
-      .setDesc(Platform.isDesktop ? "Use camera or upload an image" : "Upload an image containing a QR code");
-
-    // Camera button (desktop only)
-    if (Platform.isDesktop) {
-      scanSetting.addButton((btn) =>
-        btn.setButtonText("Use Camera").onClick(() => {
-          this.openCameraScanner();
-        }),
-      );
-    }
-
-    // File picker button (all platforms)
-    scanSetting.addButton((btn) =>
-      btn.setButtonText("Choose Image").onClick(() => {
-        this.openQRScanner();
-      }),
-    );
-  }
-
-  private async openQRScanner(): Promise<void> {
-    const result = await openQRFilePicker();
-    if (result) {
-      this.ticketInput = result;
-      this.showAddDevice = true;
-      new Notice("QR code detected!");
-      this.display();
-    } else {
-      new Notice("No QR code found in image");
-    }
-  }
-
-  private openCameraScanner(): void {
-    const modal = new CameraScannerModal(this.app, (ticket) => {
-      this.ticketInput = ticket;
-      this.showAddDevice = true;
-      this.display();
-    });
-    modal.open();
   }
 
   private getStateIcon(state: string): string {
@@ -724,130 +677,3 @@ export class PeerVaultSettingsTab extends PluginSettingTab {
   }
 }
 
-/**
- * Modal for scanning QR codes using the device camera (desktop only).
- */
-class CameraScannerModal extends Modal {
-  private stream: MediaStream | null = null;
-  private video: HTMLVideoElement | null = null;
-  private canvas: HTMLCanvasElement | null = null;
-  private scanInterval: ReturnType<typeof setInterval> | null = null;
-
-  constructor(
-    app: App,
-    private onScan: (ticket: string) => void,
-  ) {
-    super(app);
-  }
-
-  override async onOpen(): Promise<void> {
-    const { contentEl } = this;
-    contentEl.addClass("peervault-camera-modal");
-
-    contentEl.createEl("h2", { text: "Scan QR Code" });
-    contentEl.createEl("p", {
-      text: "Point your camera at a PeerVault QR code",
-      cls: "peervault-camera-instructions",
-    });
-
-    // Video container
-    const videoContainer = contentEl.createDiv({ cls: "peervault-camera-container" });
-
-    // Create video element
-    this.video = videoContainer.createEl("video", {
-      cls: "peervault-camera-video",
-      attr: { autoplay: "", playsinline: "" },
-    });
-
-    // Hidden canvas for frame capture
-    this.canvas = document.createElement("canvas");
-
-    // Status text
-    const statusEl = contentEl.createEl("p", {
-      text: "Starting camera...",
-      cls: "peervault-camera-status",
-    });
-
-    // Close button
-    new Setting(contentEl).addButton((btn) =>
-      btn.setButtonText("Cancel").onClick(() => this.close()),
-    );
-
-    // Start camera
-    try {
-      this.stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
-      });
-      this.video.srcObject = this.stream;
-      await this.video.play();
-      statusEl.setText("Scanning for QR code...");
-
-      // Start scanning
-      this.startScanning();
-    } catch (error) {
-      // Clean up any partially initialized resources
-      this.stopScanning();
-      this.stopCamera();
-      statusEl.setText(`Camera error: ${formatUserError(error)}`);
-      statusEl.addClass("peervault-error-text");
-    }
-  }
-
-  override onClose(): void {
-    this.stopScanning();
-    this.stopCamera();
-    this.contentEl.empty();
-  }
-
-  private startScanning(): void {
-    if (!this.video || !this.canvas) return;
-
-    const ctx = this.canvas.getContext("2d");
-    if (!ctx) return;
-
-    this.scanInterval = setInterval(async () => {
-      if (!this.video || this.video.readyState !== this.video.HAVE_ENOUGH_DATA) {
-        return;
-      }
-
-      // Set canvas size to video size
-      this.canvas!.width = this.video.videoWidth;
-      this.canvas!.height = this.video.videoHeight;
-
-      // Draw video frame to canvas
-      ctx.drawImage(this.video, 0, 0);
-
-      // Get image data and scan for QR
-      const imageData = ctx.getImageData(0, 0, this.canvas!.width, this.canvas!.height);
-
-      try {
-        const jsQR = (await import("jsqr")).default;
-        const code = jsQR(imageData.data, imageData.width, imageData.height);
-
-        if (code && code.data) {
-          new Notice("QR code detected!");
-          this.onScan(code.data);
-          this.close();
-        }
-      } catch {
-        // jsQR import failed, ignore
-      }
-    }, 200); // Scan every 200ms
-  }
-
-  private stopScanning(): void {
-    if (this.scanInterval) {
-      clearInterval(this.scanInterval);
-      this.scanInterval = null;
-    }
-  }
-
-  private stopCamera(): void {
-    if (this.stream) {
-      for (const track of this.stream.getTracks()) {
-        track.stop();
-      }
-      this.stream = null;
-    }
-  }
-}

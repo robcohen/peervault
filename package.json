@@ -1,6 +1,6 @@
 {
   "name": "peervault",
-  "version": "0.2.40",
+  "version": "0.2.52",
   "description": "P2P sync for Obsidian using Loro CRDT and Iroh transport",
   "type": "module",
   "private": true,
@@ -11,6 +11,7 @@
     "check": "tsc --noEmit",
     "test": "bun test",
     "test:e2e": "bun run e2e/runner.ts",
+    "test:e2e:scaled": "bun run e2e/scaled-runner.ts",
     "lint": "eslint src/",
     "format": "prettier --write src/",
     "package": "bun run build && cd dist && tar -czvf ../peervault-release.tar.gz main.js manifest.json styles.css peervault_iroh.js peervault_iroh_bg.wasm"
@@ -18,15 +19,12 @@
   "devDependencies": {
     "@types/bun": "latest",
     "@types/node": "^25.0.0",
-    "@types/qrcode": "^1.5.6",
     "esbuild": "^0.27.2",
     "obsidian": "^1.11.4",
     "typescript": "^5.9.3"
   },
   "dependencies": {
-    "jsqr": "^1.4.0",
     "loro-crdt": "^1.10.5",
-    "qrcode": "^1.5.4",
     "tweetnacl": "^1.0.3",
     "tweetnacl-util": "^0.15.1"
   }
