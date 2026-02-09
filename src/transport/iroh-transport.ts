@@ -584,18 +584,20 @@ class IrohPeerConnection implements PeerConnection {
             continue;
           }
 
-          // Priority 2: Notify onStream() callbacks (persistent listeners)
+          // Priority 2: Notify the FIRST onStream() callback (persistent listener)
+          // IMPORTANT: Only fire ONE callback per stream to avoid multiple handlers
+          // fighting over the same stream. The first registered callback wins.
           if (this.streamCallbacks.length > 0) {
             // Trace stream being fired to callback
             protocolTracer.traceStream("", this.peerId, streamId, "transport", "stream.callback.fired", {
               source: "loop",
+              callbackCount: this.streamCallbacks.length,
             });
-            for (const callback of this.streamCallbacks) {
-              try {
-                callback(stream);
-              } catch (err) {
-                this.logger.error("Error in stream callback:", err);
-              }
+            const callback = this.streamCallbacks[0];
+            try {
+              callback(stream);
+            } catch (err) {
+              this.logger.error("Error in stream callback:", err);
             }
           } else {
             // Priority 3: Queue for later acceptStream() call
@@ -806,30 +808,27 @@ class IrohPeerConnection implements PeerConnection {
       pendingCount: this.pendingStreams.length,
     });
 
-    // CRITICAL: Drain any pending streams to the callback immediately
-    // This prevents a race condition where:
-    // 1. Caller registers callback via onStream
-    // 2. Accept loop delivers pending stream to callback
-    // 3. Caller calls acceptStream expecting pending stream
-    // 4. acceptStream blocks forever because stream was already delivered
-    //
-    // By draining here, pending streams go to the callback, and acceptStream
-    // won't be called for streams that don't exist.
-    while (this.pendingStreams.length > 0) {
-      const stream = this.pendingStreams.shift()!;
-      this.logger.debug(
-        `[${this.peerId.slice(0, 8)}] onStream: draining pending stream ${stream.id} to callback`
-      );
+    // CRITICAL: Only drain pending streams if this is the FIRST callback
+    // This ensures consistent behavior - all streams go to the first registered callback.
+    // Without this check, pending streams would go to a newly registered callback
+    // while future streams go to the first callback, causing inconsistency.
+    if (this.streamCallbacks.length === 1) {
+      while (this.pendingStreams.length > 0) {
+        const stream = this.pendingStreams.shift()!;
+        this.logger.debug(
+          `[${this.peerId.slice(0, 8)}] onStream: draining pending stream ${stream.id} to first callback`
+        );
 
-      // Trace stream being fired to callback
-      protocolTracer.traceStream("", this.peerId, stream.id, "transport", "stream.callback.fired", {
-        source: "drain",
-      });
+        // Trace stream being fired to callback
+        protocolTracer.traceStream("", this.peerId, stream.id, "transport", "stream.callback.fired", {
+          source: "drain",
+        });
 
-      try {
-        callback(stream);
-      } catch (err) {
-        this.logger.error("Error in stream callback while draining:", err);
+        try {
+          callback(stream);
+        } catch (err) {
+          this.logger.error("Error in stream callback while draining:", err);
+        }
       }
     }
 
