@@ -327,16 +327,16 @@ export class CloudSync extends EventEmitter<CloudSyncEvents> {
    */
   private async loadConfigFromCRDT(): Promise<CloudStorageConfig | null> {
     if (!this.vaultKey) {
-      this.logger.debug("Cannot load CRDT cloud config: vault key not set");
+      this.logger.info("Cannot load CRDT cloud config: vault key not set");
       return null;
     }
 
     const encryptedConfig = this.documentManager.getCloudConfig();
     if (!encryptedConfig) {
-      this.logger.debug("No cloud config found in CRDT metadata");
+      this.logger.info("No cloud config found in CRDT metadata (cloudConfig key missing)");
       return null;
     }
-    this.logger.debug(`Found encrypted cloud config in CRDT (${encryptedConfig.length} bytes)`);
+    this.logger.info(`Found encrypted cloud config in CRDT (${encryptedConfig.length} bytes)`);
 
     try {
       const decryptedBytes = decrypt(encryptedConfig, this.vaultKey);
