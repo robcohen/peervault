@@ -130,6 +130,8 @@ export interface VersionInfoMessage extends SyncMessage {
   protocolVersion?: number;
   /** Plugin version (e.g., "0.2.53") - must match exactly to sync */
   pluginVersion?: string;
+  /** Whether this device has the vault encryption key for cloud sync (protocol v2+) */
+  hasVaultKey?: boolean;
 }
 
 /** Snapshot request message - for new peers requesting full document */

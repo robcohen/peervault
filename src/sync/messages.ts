@@ -32,6 +32,8 @@ import {
   type WebRTCIceCandidateMessage,
   type WebRTCReadyMessage,
   type WebRTCFailedMessage,
+  type KeyExchangeRequestMessage,
+  type KeyExchangeResponseMessage,
 } from "./types";
 import { SyncErrors } from "../errors";
 
@@ -256,6 +258,10 @@ export function serializeMessage(message: AnySyncMessage): Uint8Array {
       return serializeWebRTCReady(message);
     case SyncMessageType.WEBRTC_FAILED:
       return serializeWebRTCFailed(message);
+    case SyncMessageType.KEY_EXCHANGE_REQUEST:
+      return serializeKeyExchangeRequest(message);
+    case SyncMessageType.KEY_EXCHANGE_RESPONSE:
+      return serializeKeyExchangeResponse(message);
     default:
       throw SyncErrors.invalidMessage(
         (message as AnySyncMessage).type,
@@ -320,6 +326,10 @@ export function deserializeMessage(data: Uint8Array): AnySyncMessage {
       return deserializeWebRTCReady(timestamp);
     case SyncMessageType.WEBRTC_FAILED:
       return deserializeWebRTCFailed(data, timestamp);
+    case SyncMessageType.KEY_EXCHANGE_REQUEST:
+      return deserializeKeyExchangeRequest(data, timestamp);
+    case SyncMessageType.KEY_EXCHANGE_RESPONSE:
+      return deserializeKeyExchangeResponse(data, timestamp);
     default:
       throw SyncErrors.invalidMessage(type);
   }
@@ -400,6 +410,7 @@ function serializeVersionInfo(msg: VersionInfoMessage): Uint8Array {
       }
       totalLength += 8; // lastSeen
     }
+    totalLength += 1; // hasVaultKey byte (0 or 1)
   }
 
   const buffer = new ArrayBuffer(totalLength);
@@ -496,6 +507,9 @@ function serializeVersionInfo(msg: VersionInfoMessage): Uint8Array {
       view.setBigUint64(offset, BigInt(peer.lastSeen), false);
       offset += 8;
     }
+
+    // Write hasVaultKey (1 byte: 0 = false, 1 = true)
+    view.setUint8(offset++, msg.hasVaultKey ? 1 : 0);
   }
 
   return bytes;
@@ -540,6 +554,7 @@ function deserializeVersionInfo(
   let pluginVersion: string | undefined;
   let groupIds: string[] | undefined;
   let knownPeers: KnownPeerInfo[] | undefined;
+  let hasVaultKey: boolean | undefined;
 
   if (offset < data.length) {
     protocolVersion = view.getUint8(offset++);
@@ -605,6 +620,11 @@ function deserializeVersionInfo(
           lastSeen,
         });
       }
+
+      // Read hasVaultKey if present (1 byte: 0 = false, 1 = true)
+      if (offset < data.length) {
+        hasVaultKey = view.getUint8(offset++) === 1;
+      }
     }
   }
 
@@ -620,6 +640,7 @@ function deserializeVersionInfo(
     pluginVersion,
     groupIds,
     knownPeers,
+    hasVaultKey,
   };
 }
 
@@ -989,6 +1010,7 @@ export function createVersionInfoMessage(
   knownPeers?: KnownPeerInfo[],
   protocolVersion?: number,
   pluginVersion?: string,
+  hasVaultKey?: boolean,
 ): VersionInfoMessage {
   return {
     type: SyncMessageType.VERSION_INFO,
@@ -1002,6 +1024,7 @@ export function createVersionInfoMessage(
     knownPeers,
     protocolVersion: protocolVersion ?? SYNC_PROTOCOL_VERSION,
     pluginVersion,
+    hasVaultKey,
   };
 }
 
@@ -2046,5 +2069,141 @@ export function createWebRTCFailedMessage(reason: string): WebRTCFailedMessage {
     type: SyncMessageType.WEBRTC_FAILED,
     timestamp: Date.now(),
     reason,
+  };
+}
+
+// ============================================================================
+// KEY_EXCHANGE_REQUEST
+// ============================================================================
+
+/**
+ * KEY_EXCHANGE_REQUEST format:
+ * - u8: type (0x30)
+ * - u64: timestamp
+ * - u32: publicKey length
+ * - bytes: publicKey (32 bytes Curve25519 public key)
+ * - u8: hasExistingKey (0 or 1)
+ */
+function serializeKeyExchangeRequest(msg: KeyExchangeRequestMessage): Uint8Array {
+  const totalLength = 1 + 8 + 4 + msg.publicKey.length + 1;
+
+  const buffer = new ArrayBuffer(totalLength);
+  const view = new DataView(buffer);
+  const bytes = new Uint8Array(buffer);
+  let offset = 0;
+
+  view.setUint8(offset++, msg.type);
+  view.setBigUint64(offset, BigInt(msg.timestamp), false);
+  offset += 8;
+
+  view.setUint32(offset, msg.publicKey.length, false);
+  offset += 4;
+  bytes.set(msg.publicKey, offset);
+  offset += msg.publicKey.length;
+
+  view.setUint8(offset, msg.hasExistingKey ? 1 : 0);
+
+  return bytes;
+}
+
+function deserializeKeyExchangeRequest(
+  data: Uint8Array,
+  timestamp: number,
+): KeyExchangeRequestMessage {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  let offset = 9; // Skip type and timestamp
+
+  const publicKeyLen = view.getUint32(offset, false);
+  offset += 4;
+  const publicKey = data.slice(offset, offset + publicKeyLen);
+  offset += publicKeyLen;
+
+  const hasExistingKey = view.getUint8(offset) === 1;
+
+  return {
+    type: SyncMessageType.KEY_EXCHANGE_REQUEST,
+    timestamp,
+    publicKey,
+    hasExistingKey,
+  };
+}
+
+export function createKeyExchangeRequestMessage(
+  publicKey: Uint8Array,
+  hasExistingKey: boolean,
+): KeyExchangeRequestMessage {
+  return {
+    type: SyncMessageType.KEY_EXCHANGE_REQUEST,
+    timestamp: Date.now(),
+    publicKey,
+    hasExistingKey,
+  };
+}
+
+// ============================================================================
+// KEY_EXCHANGE_RESPONSE
+// ============================================================================
+
+/**
+ * KEY_EXCHANGE_RESPONSE format:
+ * - u8: type (0x31)
+ * - u64: timestamp
+ * - u32: encryptedKey length
+ * - bytes: encryptedKey (encrypted vault key bundle)
+ * - u8: isNewKey (0 or 1)
+ */
+function serializeKeyExchangeResponse(msg: KeyExchangeResponseMessage): Uint8Array {
+  const totalLength = 1 + 8 + 4 + msg.encryptedKey.length + 1;
+
+  const buffer = new ArrayBuffer(totalLength);
+  const view = new DataView(buffer);
+  const bytes = new Uint8Array(buffer);
+  let offset = 0;
+
+  view.setUint8(offset++, msg.type);
+  view.setBigUint64(offset, BigInt(msg.timestamp), false);
+  offset += 8;
+
+  view.setUint32(offset, msg.encryptedKey.length, false);
+  offset += 4;
+  bytes.set(msg.encryptedKey, offset);
+  offset += msg.encryptedKey.length;
+
+  view.setUint8(offset, msg.isNewKey ? 1 : 0);
+
+  return bytes;
+}
+
+function deserializeKeyExchangeResponse(
+  data: Uint8Array,
+  timestamp: number,
+): KeyExchangeResponseMessage {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  let offset = 9; // Skip type and timestamp
+
+  const encryptedKeyLen = view.getUint32(offset, false);
+  offset += 4;
+  const encryptedKey = data.slice(offset, offset + encryptedKeyLen);
+  offset += encryptedKeyLen;
+
+  const isNewKey = view.getUint8(offset) === 1;
+
+  return {
+    type: SyncMessageType.KEY_EXCHANGE_RESPONSE,
+    timestamp,
+    encryptedKey,
+    isNewKey,
+  };
+}
+
+export function createKeyExchangeResponseMessage(
+  encryptedKey: Uint8Array,
+  isNewKey: boolean,
+): KeyExchangeResponseMessage {
+  return {
+    type: SyncMessageType.KEY_EXCHANGE_RESPONSE,
+    timestamp: Date.now(),
+    encryptedKey,
+    isNewKey,
   };
 }

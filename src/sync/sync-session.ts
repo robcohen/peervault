@@ -29,6 +29,8 @@ import {
   type WebRTCOfferMessage,
   type WebRTCAnswerMessage,
   type WebRTCIceCandidateMessage,
+  type KeyExchangeRequestMessage,
+  type KeyExchangeResponseMessage,
 } from "./types";
 import {
   serializeMessage,
@@ -52,6 +54,8 @@ import {
   createWebRTCIceCandidateMessage,
   createWebRTCReadyMessage,
   createWebRTCFailedMessage,
+  createKeyExchangeRequestMessage,
+  createKeyExchangeResponseMessage,
 } from "./messages";
 import { EventEmitter } from "../utils/events";
 
@@ -158,6 +162,33 @@ export interface SyncSessionConfig {
 
   /** Callback when WebRTC connection state changes */
   onWebRTCStateChange?: (state: WebRTCUpgradeState) => void;
+
+  // Vault key exchange (gossip) configuration
+  /** Whether we have the vault encryption key */
+  hasVaultKey?: boolean;
+
+  /** Our public key for vault key exchange (32 bytes Curve25519) */
+  vaultKeyExchangePublicKey?: Uint8Array;
+
+  /**
+   * Called when peer needs the vault key (they sent KEY_EXCHANGE_REQUEST).
+   * Should encrypt our vault key for the peer's public key.
+   * Returns the encrypted key bundle, or null if we don't have the key.
+   */
+  onPeerNeedsVaultKey?: (peerPublicKey: Uint8Array) => Promise<{ encryptedKey: Uint8Array; isNewKey: boolean } | null>;
+
+  /**
+   * Called when we receive a vault key from peer (KEY_EXCHANGE_RESPONSE).
+   * Should decrypt and store the vault key.
+   * Returns true if successfully stored.
+   */
+  onVaultKeyReceived?: (encryptedKey: Uint8Array, isNewKey: boolean) => Promise<boolean>;
+
+  /**
+   * Called when we receive peer's hasVaultKey status and we need the key.
+   * Should be used to trigger a key exchange request.
+   */
+  onPeerHasVaultKey?: (peerHasVaultKey: boolean) => void;
 }
 
 const DEFAULT_CONFIG: Omit<
@@ -174,6 +205,11 @@ const DEFAULT_CONFIG: Omit<
   | "onPeerLeft"
   | "ourNodeId"
   | "onWebRTCStateChange"
+  | "hasVaultKey"
+  | "vaultKeyExchangePublicKey"
+  | "onPeerNeedsVaultKey"
+  | "onVaultKeyReceived"
+  | "onPeerHasVaultKey"
 > & {
   peerIsReadOnly: boolean;
   allowVaultAdoption: boolean;
@@ -216,6 +252,7 @@ interface SyncSessionEvents extends Record<string, unknown> {
   "peer:removed": string | undefined; // reason
   "blob:received": string; // blob hash
   "live:updates": void; // CRDT updates imported during live mode
+  "vaultKey:received": void; // vault key received from peer during live mode
   error: Error;
 }
 
@@ -241,6 +278,11 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     | "onPeerLeft"
     | "ourNodeId"
     | "onWebRTCStateChange"
+    | "hasVaultKey"
+    | "vaultKeyExchangePublicKey"
+    | "onPeerNeedsVaultKey"
+    | "onVaultKeyReceived"
+    | "onPeerHasVaultKey"
   > & {
     ourTicket: string;
     ourHostname: string;
@@ -254,6 +296,11 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     onPeerLeft?: (nodeId: string, groupIds: string[], reason: "removed" | "disconnected" | "left") => void;
     ourNodeId?: string;
     onWebRTCStateChange?: (state: WebRTCUpgradeState) => void;
+    hasVaultKey?: boolean;
+    vaultKeyExchangePublicKey?: Uint8Array;
+    onPeerNeedsVaultKey?: (peerPublicKey: Uint8Array) => Promise<{ encryptedKey: Uint8Array; isNewKey: boolean } | null>;
+    onVaultKeyReceived?: (encryptedKey: Uint8Array, isNewKey: boolean) => Promise<boolean>;
+    onPeerHasVaultKey?: (peerHasVaultKey: boolean) => void;
   };
   private aborted = false;
   private unsubscribeLocalUpdates: (() => void) | null = null;
@@ -286,6 +333,10 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
   private _blobsToSend = 0;
   private _blobsSent = 0;
   private _blobsToReceive = 0;
+
+  // Vault key exchange state
+  private _peerHasVaultKey: boolean | undefined = undefined;
+  private _vaultKeyExchangeInProgress = false;
   private _blobsReceived = 0;
 
   constructor(
@@ -402,6 +453,9 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       this.emitProgress("live");
       this.startPingTimer();
       this.subscribeToLocalUpdates();
+
+      // Automatically request vault key if we don't have it but peer does
+      this.tryVaultKeyGossip();
       this.scheduleWebRTCUpgrade(); // Attempt WebRTC upgrade for direct connection
       this.startLiveLoop().catch((err) => {
         this.logger.error("Live loop error:", err);
@@ -515,6 +569,12 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
         if (this.config.onPeerDiscoveryInfo && (peerGroupIds.length > 0 || peerKnownPeers.length > 0)) {
           this.config.onPeerDiscoveryInfo(peerGroupIds, peerKnownPeers);
         }
+
+        // Track peer's vault key status for gossip
+        this._peerHasVaultKey = peerVersionInfo.hasVaultKey;
+        if (this.config.onPeerHasVaultKey && peerVersionInfo.hasVaultKey !== undefined) {
+          this.config.onPeerHasVaultKey(peerVersionInfo.hasVaultKey);
+        }
       }
 
       // Get known peers for discovery (if callback provided)
@@ -532,6 +592,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
           knownPeers,
           SYNC_PROTOCOL_VERSION,
           this.config.ourPluginVersion,
+          this.config.hasVaultKey,
         ),
       );
 
@@ -561,6 +622,9 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       this.emitProgress("live");
       this.startPingTimer();
       this.subscribeToLocalUpdates();
+
+      // Automatically request vault key if we don't have it but peer does
+      this.tryVaultKeyGossip();
       this.scheduleWebRTCUpgrade(); // Attempt WebRTC upgrade for direct connection
       this.startLiveLoop().catch((err) => {
         this.logger.error("Live loop error:", err);
@@ -828,6 +892,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
         knownPeers,
         SYNC_PROTOCOL_VERSION,
         this.config.ourPluginVersion,
+        this.config.hasVaultKey,
       ),
     );
 
@@ -874,6 +939,12 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       const peerKnownPeers = peerVersionInfo.knownPeers || [];
       if (this.config.onPeerDiscoveryInfo && (peerGroupIds.length > 0 || peerKnownPeers.length > 0)) {
         this.config.onPeerDiscoveryInfo(peerGroupIds, peerKnownPeers);
+      }
+
+      // Track peer's vault key status for gossip
+      this._peerHasVaultKey = peerVersionInfo.hasVaultKey;
+      if (this.config.onPeerHasVaultKey && peerVersionInfo.hasVaultKey !== undefined) {
+        this.config.onPeerHasVaultKey(peerVersionInfo.hasVaultKey);
       }
     }
 
@@ -1484,6 +1555,21 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
             this.logger.info("Peer reported WebRTC failed:", (message as { reason: string }).reason);
             this.setWebRTCState("failed");
             this.scheduleWebRTCRetry();
+            break;
+          }
+
+          // Vault key exchange messages (for key gossip during live mode)
+          case SyncMessageType.KEY_EXCHANGE_REQUEST: {
+            const keyRequest = message as KeyExchangeRequestMessage;
+            this.logger.info("Received vault key exchange request from peer");
+            await this.handleVaultKeyRequest(keyRequest);
+            break;
+          }
+
+          case SyncMessageType.KEY_EXCHANGE_RESPONSE: {
+            const keyResponse = message as KeyExchangeResponseMessage;
+            this.logger.info("Received vault key exchange response from peer");
+            await this.handleVaultKeyResponse(keyResponse);
             break;
           }
 
@@ -2156,5 +2242,135 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     });
 
     return true;
+  }
+
+  // ===========================================================================
+  // Vault Key Exchange (Gossip)
+  // ===========================================================================
+
+  /**
+   * Request the vault key from peer.
+   * Call this during live mode if we don't have the vault key but peer does.
+   * @returns true if request was sent, false if not possible
+   */
+  async requestVaultKey(): Promise<boolean> {
+    if (this.state !== "live") {
+      this.logger.warn("Cannot request vault key: not in live mode");
+      return false;
+    }
+
+    if (this.config.hasVaultKey) {
+      this.logger.debug("Not requesting vault key: we already have it");
+      return false;
+    }
+
+    if (!this._peerHasVaultKey) {
+      this.logger.debug("Not requesting vault key: peer doesn't have it");
+      return false;
+    }
+
+    if (this._vaultKeyExchangeInProgress) {
+      this.logger.debug("Not requesting vault key: exchange already in progress");
+      return false;
+    }
+
+    if (!this.config.vaultKeyExchangePublicKey) {
+      this.logger.warn("Cannot request vault key: no public key configured");
+      return false;
+    }
+
+    this._vaultKeyExchangeInProgress = true;
+    this.logger.info("Requesting vault key from peer");
+
+    try {
+      await this.sendMessage(
+        createKeyExchangeRequestMessage(
+          this.config.vaultKeyExchangePublicKey,
+          false, // We don't have an existing key
+        ),
+      );
+      return true;
+    } catch (error) {
+      this._vaultKeyExchangeInProgress = false;
+      this.logger.error("Failed to request vault key:", error);
+      return false;
+    }
+  }
+
+  /**
+   * Handle incoming vault key request from peer.
+   */
+  private async handleVaultKeyRequest(request: KeyExchangeRequestMessage): Promise<void> {
+    if (!this.config.onPeerNeedsVaultKey) {
+      this.logger.warn("Received vault key request but no handler configured");
+      return;
+    }
+
+    try {
+      const result = await this.config.onPeerNeedsVaultKey(request.publicKey);
+
+      if (!result) {
+        this.logger.info("No vault key to share with peer (we don't have it)");
+        return;
+      }
+
+      // Send the encrypted vault key
+      await this.sendMessage(
+        createKeyExchangeResponseMessage(result.encryptedKey, result.isNewKey),
+      );
+      this.logger.info("Sent vault key to peer");
+    } catch (error) {
+      this.logger.error("Failed to handle vault key request:", error);
+    }
+  }
+
+  /**
+   * Handle incoming vault key response from peer.
+   */
+  private async handleVaultKeyResponse(response: KeyExchangeResponseMessage): Promise<void> {
+    this._vaultKeyExchangeInProgress = false;
+
+    if (!this.config.onVaultKeyReceived) {
+      this.logger.warn("Received vault key but no handler configured");
+      return;
+    }
+
+    try {
+      const success = await this.config.onVaultKeyReceived(
+        response.encryptedKey,
+        response.isNewKey,
+      );
+
+      if (success) {
+        this.logger.info("Successfully received and stored vault key from peer");
+        // Emit an event so other parts of the system know we now have the key
+        this.emit("vaultKey:received", undefined);
+      } else {
+        this.logger.error("Failed to store vault key from peer");
+      }
+    } catch (error) {
+      this.logger.error("Failed to handle vault key response:", error);
+    }
+  }
+
+  /**
+   * Get whether the peer has the vault key.
+   */
+  getPeerHasVaultKey(): boolean | undefined {
+    return this._peerHasVaultKey;
+  }
+
+  /**
+   * Try to initiate vault key gossip.
+   * Called when entering live mode to automatically request the key if needed.
+   */
+  private tryVaultKeyGossip(): void {
+    // Check if we need to request the vault key
+    if (!this.config.hasVaultKey && this._peerHasVaultKey && this.config.vaultKeyExchangePublicKey) {
+      this.logger.info("Peer has vault key, requesting it via gossip...");
+      this.requestVaultKey().catch((err) => {
+        this.logger.error("Failed to request vault key via gossip:", err);
+      });
+    }
   }
 }

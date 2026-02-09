@@ -29,6 +29,11 @@ import {
   PairingKeyExchange,
   isKeyExchangeMessage,
   parseKeyExchangeMessage,
+  generateKeyExchangeKeypair,
+  encryptVaultKeyForRecipient,
+  decryptVaultKeyFromSender,
+  serializeKeyBundle,
+  deserializeKeyBundle,
 } from "../crypto";
 
 /**
@@ -212,9 +217,9 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   /** Timer for connection repair */
   private connectionRepairTimer: ReturnType<typeof setInterval> | null = null;
   /** Interval for connection repair (ms) */
-  private static readonly CONNECTION_REPAIR_INTERVAL = 30 * 1000; // 30 seconds
+  private static readonly CONNECTION_REPAIR_INTERVAL = 15 * 1000; // 15 seconds (was 30s)
   /** Minimum time since last seen before attempting repair (ms) */
-  private static readonly REPAIR_STALE_THRESHOLD = 60 * 1000; // 1 minute
+  private static readonly REPAIR_STALE_THRESHOLD = 15 * 1000; // 15 seconds (was 60s)
   private config: Omit<Required<PeerManagerConfig>, "hostname" | "nickname" | "pluginVersion"> & { hostname: string; nickname?: string; pluginVersion?: string };
   private autoSyncTimer: ReturnType<typeof setInterval> | null = null;
   private initialSyncTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -231,6 +236,8 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   private pendingAddPeerTickets = new Set<string>();
   /** Key exchange handler for vault key sharing during pairing */
   private pairingKeyExchange: PairingKeyExchange | null = null;
+  /** Keypair for vault key exchange during live sync (gossip) */
+  private vaultKeyExchangeKeypair: { publicKey: Uint8Array; secretKey: Uint8Array } | null = null;
 
   constructor(
     private transport: Transport,
@@ -258,6 +265,120 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
    */
   getPairingKeyExchange(): PairingKeyExchange | null {
     return this.pairingKeyExchange;
+  }
+
+  /**
+   * Get or create the vault key exchange keypair.
+   * This keypair is used for vault key gossip during live sync.
+   */
+  private getVaultKeyExchangeKeypair(): { publicKey: Uint8Array; secretKey: Uint8Array } {
+    if (!this.vaultKeyExchangeKeypair) {
+      this.vaultKeyExchangeKeypair = generateKeyExchangeKeypair();
+      this.logger.debug("Generated vault key exchange keypair for gossip");
+    }
+    return this.vaultKeyExchangeKeypair;
+  }
+
+  /**
+   * Get the vault key exchange configuration for sync sessions.
+   * This enables vault key gossip during live sync.
+   */
+  private getVaultKeyExchangeConfig(): {
+    hasVaultKey?: boolean;
+    vaultKeyExchangePublicKey?: Uint8Array;
+    onPeerNeedsVaultKey?: (peerPublicKey: Uint8Array) => Promise<{ encryptedKey: Uint8Array; isNewKey: boolean } | null>;
+    onVaultKeyReceived?: (encryptedKey: Uint8Array, isNewKey: boolean) => Promise<boolean>;
+    onPeerHasVaultKey?: (peerHasVaultKey: boolean) => void;
+  } {
+    const keypair = this.getVaultKeyExchangeKeypair();
+
+    // Check if we have the vault key synchronously - we'll use a cached value
+    // that gets updated when we load/store the key
+    let hasVaultKey = false;
+    if (this.pairingKeyExchange) {
+      // Note: This is a sync check at config creation time.
+      // The actual key availability will be checked in the callbacks.
+      // We set this to true if we have a pairingKeyExchange configured,
+      // since that's a prerequisite for having or receiving a vault key.
+      // The actual sharing happens via the callback which checks async.
+      this.pairingKeyExchange.hasVaultKey().then((has) => {
+        // This is fire-and-forget to update our local understanding,
+        // but the message uses the value at config creation time.
+      }).catch(() => {});
+      hasVaultKey = true; // Assume we might have it, callbacks will verify
+    }
+
+    return {
+      // Report whether we have (or can have) the vault key
+      hasVaultKey,
+      vaultKeyExchangePublicKey: keypair.publicKey,
+
+      // Called when peer requests our vault key
+      onPeerNeedsVaultKey: async (peerPublicKey: Uint8Array) => {
+        if (!this.pairingKeyExchange) {
+          this.logger.debug("Cannot share vault key: no pairing key exchange configured");
+          return null;
+        }
+
+        const vaultKey = await this.pairingKeyExchange.getVaultKey();
+        if (!vaultKey) {
+          this.logger.debug("Cannot share vault key: we don't have it");
+          return null;
+        }
+
+        // Encrypt the vault key for the peer
+        const bundle = encryptVaultKeyForRecipient(vaultKey, peerPublicKey);
+        const encryptedKey = serializeKeyBundle(bundle);
+
+        this.logger.info("Encrypting vault key for peer during gossip");
+        return { encryptedKey, isNewKey: false };
+      },
+
+      // Called when we receive a vault key from peer
+      onVaultKeyReceived: async (encryptedKey: Uint8Array, _isNewKey: boolean) => {
+        if (!this.pairingKeyExchange) {
+          this.logger.error("Cannot store vault key: no pairing key exchange configured");
+          return false;
+        }
+
+        // Check if we already have the key
+        if (await this.pairingKeyExchange.hasVaultKey()) {
+          this.logger.debug("Already have vault key, ignoring received key");
+          return true; // Consider it success since we already have the key
+        }
+
+        try {
+          // Decrypt the vault key
+          const bundle = deserializeKeyBundle(encryptedKey);
+          const vaultKey = decryptVaultKeyFromSender(bundle, keypair.secretKey);
+
+          if (!vaultKey) {
+            this.logger.error("Failed to decrypt vault key from peer");
+            return false;
+          }
+
+          // Store the vault key
+          await this.pairingKeyExchange.storeVaultKey(vaultKey);
+          this.logger.info("Stored vault key received from peer during gossip");
+
+          // Emit event so the plugin can update cloud sync
+          this.emit("vault:key-received", vaultKey);
+          return true;
+        } catch (error) {
+          this.logger.error("Error storing vault key from gossip:", error);
+          return false;
+        }
+      },
+
+      // Called when we learn peer's vault key status
+      onPeerHasVaultKey: (peerHasVaultKey: boolean) => {
+        if (peerHasVaultKey && this.pairingKeyExchange) {
+          // If peer has the key and we don't, we might want to request it
+          // But this happens in live mode, so the session will handle it
+          this.logger.debug(`Peer reports hasVaultKey=${peerHasVaultKey}`);
+        }
+      },
+    };
   }
 
   /**
@@ -509,8 +630,13 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     try {
       this.setStatus("syncing");
 
-      // Connect to peer
-      const connection = await this.transport.connectWithTicket(ticket);
+      // Connect to peer with timeout to prevent hanging
+      const connection = await Promise.race([
+        this.transport.connectWithTicket(ticket),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("Connection timeout (30s)")), 30000)
+        ),
+      ]);
       const nodeId = connection.peerId;
 
       // Check for duplicate session - if we already have an active session, skip
@@ -873,10 +999,13 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       });
     });
 
-    // Clean up listener when connection closes
+    // Clean up listener and trigger reconnection when connection closes
     connection.onStateChange((state) => {
       if (state === "disconnected" || state === "error") {
         unsubscribeStream();
+        // Trigger immediate reconnection attempt
+        this.logger.info(`Connection to ${nodeId.slice(0, 8)} ${state}, scheduling immediate reconnection`);
+        this.handleSyncError(nodeId, state === "disconnected");
       }
     });
 
@@ -1628,7 +1757,13 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     if (!connection && peer.ticket) {
       try {
         this.logger.debug("No existing connection, connecting with ticket...");
-        connection = await this.transport.connectWithTicket(peer.ticket);
+        // Add timeout to prevent hanging on unreachable peers
+        connection = await Promise.race([
+          this.transport.connectWithTicket(peer.ticket),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error("Connection timeout (30s)")), 30000)
+          ),
+        ]);
       } catch (error) {
         this.logger.error("Failed to connect to peer:", nodeId, error);
         this.updatePeerState(nodeId, "error");
@@ -1653,10 +1788,13 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       });
     });
 
-    // Clean up listener when connection closes
+    // Clean up listener and trigger reconnection when connection closes
     connection.onStateChange((state) => {
       if (state === "disconnected" || state === "error") {
         unsubscribeStream();
+        // Trigger immediate reconnection attempt
+        this.logger.info(`Connection to ${nodeId.slice(0, 8)} ${state}, scheduling immediate reconnection`);
+        this.handleSyncError(nodeId, state === "disconnected");
       }
     });
 
@@ -1791,10 +1929,13 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
       });
     });
 
-    // Clean up listener when connection closes
+    // Clean up listener and trigger reconnection when connection closes
     connection.onStateChange((state) => {
       if (state === "disconnected" || state === "error") {
         unsubscribe();
+        // Trigger immediate reconnection attempt
+        this.logger.info(`Connection to ${nodeId.slice(0, 8)} ${state}, scheduling immediate reconnection`);
+        this.handleSyncError(nodeId, state === "disconnected");
       }
     });
 
@@ -1962,6 +2103,8 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
         // WebRTC upgrade (in-band signaling)
         enableWebRTC: this.config.enableWebRTC,
         ourNodeId: this.transport.getNodeId(),
+        // Vault key exchange (gossip during live sync)
+        ...this.getVaultKeyExchangeConfig(),
       },
       this.blobStore,
     );
@@ -2070,6 +2213,8 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
         // WebRTC upgrade (in-band signaling)
         enableWebRTC: this.config.enableWebRTC,
         ourNodeId: this.transport.getNodeId(),
+        // Vault key exchange (gossip during live sync)
+        ...this.getVaultKeyExchangeConfig(),
       },
       this.blobStore,
     );
@@ -2272,6 +2417,8 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
         // WebRTC upgrade (in-band signaling)
         enableWebRTC: this.config.enableWebRTC,
         ourNodeId: this.transport.getNodeId(),
+        // Vault key exchange (gossip during live sync)
+        ...this.getVaultKeyExchangeConfig(),
       },
       this.blobStore,
     );
@@ -3055,32 +3202,47 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
     this.logger.info(`Connection repair: found ${peersToRepair.length} peer(s) without live sessions`);
 
     // Attempt to repair each peer
+    // Both peers can initiate repair (bidirectional) with randomized jitter to prevent collision
+    const ourNodeId = this.transport.getNodeId();
+
     for (const peer of peersToRepair) {
-      // Use deterministic ordering - only initiate if we have lower node ID
-      const ourNodeId = this.transport.getNodeId();
-      if (ourNodeId > peer.nodeId) {
-        // Wait for them to connect to us
-        this.logger.debug(
-          `Repair: waiting for ${peer.nodeId.slice(0, 8)} to connect (node ID ordering)`
-        );
-        // Update peer state to show we're aware it's disconnected
-        if (peer.state !== "offline" && peer.state !== "error") {
-          this.updatePeerState(peer.nodeId, "offline");
-        }
-        continue;
+      // Calculate jitter based on node ID ordering to stagger attempts
+      // Lower node ID gets shorter jitter (0-2s), higher node ID gets longer jitter (2-4s)
+      const isLowerNodeId = ourNodeId < peer.nodeId;
+      const baseJitter = isLowerNodeId ? 0 : 2000;
+      const jitter = baseJitter + Math.random() * 2000;
+
+      this.logger.debug(
+        `Repair: scheduling reconnection to ${peer.nodeId.slice(0, 8)} in ${Math.round(jitter)}ms`
+      );
+
+      // Update peer state to show we're aware it's disconnected
+      if (peer.state !== "offline" && peer.state !== "syncing") {
+        this.updatePeerState(peer.nodeId, "offline");
       }
 
-      // We initiate - attempt reconnection
-      this.logger.debug(`Repair: initiating reconnection to ${peer.nodeId.slice(0, 8)}`);
+      // Schedule repair with jitter to prevent both peers connecting simultaneously
+      const timer = setTimeout(() => {
+        this.reconnectTimers.delete(peer.nodeId);
 
-      // Update state
-      this.updatePeerState(peer.nodeId, "syncing");
+        // Double-check we still need to repair (session might have been established)
+        const currentSession = this.sessions.get(peer.nodeId);
+        if (currentSession && currentSession.getState() === "live") {
+          this.logger.debug(`Repair: ${peer.nodeId.slice(0, 8)} already has live session, skipping`);
+          return;
+        }
 
-      // Attempt to sync with this peer
-      this.syncPeer(peer.nodeId).catch(err => {
-        this.logger.debug(`Repair: failed to reconnect to ${peer.nodeId.slice(0, 8)}:`, err);
-        // handleSyncError will schedule a retry with backoff
-      });
+        this.logger.debug(`Repair: initiating reconnection to ${peer.nodeId.slice(0, 8)}`);
+        this.updatePeerState(peer.nodeId, "syncing");
+
+        this.syncPeer(peer.nodeId).catch(err => {
+          this.logger.debug(`Repair: failed to reconnect to ${peer.nodeId.slice(0, 8)}:`, err);
+          // handleSyncError will schedule a retry with backoff
+        });
+      }, jitter);
+
+      // Track the timer so it can be cancelled if needed
+      this.reconnectTimers.set(peer.nodeId, timer);
     }
   }
 }
