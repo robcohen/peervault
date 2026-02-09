@@ -333,8 +333,10 @@ export class CloudSync extends EventEmitter<CloudSyncEvents> {
 
     const encryptedConfig = this.documentManager.getCloudConfig();
     if (!encryptedConfig) {
+      this.logger.debug("No cloud config found in CRDT metadata");
       return null;
     }
+    this.logger.debug(`Found encrypted cloud config in CRDT (${encryptedConfig.length} bytes)`);
 
     try {
       const decryptedBytes = decrypt(encryptedConfig, this.vaultKey);
@@ -379,6 +381,7 @@ export class CloudSync extends EventEmitter<CloudSyncEvents> {
    * @returns true if config was updated
    */
   async checkForConfigUpdate(): Promise<boolean> {
+    this.logger.info("Checking for cloud config updates from CRDT...");
     const crdtConfig = await this.loadConfigFromCRDT();
     const crdtConfigTime = this.documentManager.getCloudConfigUpdatedAt() || 0;
 
@@ -386,13 +389,17 @@ export class CloudSync extends EventEmitter<CloudSyncEvents> {
     const timeData = await this.storage.read(CLOUD_CONFIG_KEY + "-time");
     const localConfigTime = timeData ? parseInt(new TextDecoder().decode(timeData), 10) || 0 : 0;
 
+    this.logger.info(`Cloud config timestamps - CRDT: ${crdtConfigTime}, local: ${localConfigTime}, hasConfig: ${!!crdtConfig}`);
+
     // If CRDT config is newer, apply it
     if (crdtConfig && crdtConfigTime > localConfigTime) {
       this.logger.info("Cloud config updated from peer sync");
 
       // Test the new config
       const testClient = createS3Client(crdtConfig);
+      this.logger.info("Testing cloud config connection...");
       const connected = await testClient.testConnection();
+      this.logger.info(`Cloud config connection test: ${connected ? "success" : "failed"}`);
 
       if (connected) {
         this.config = crdtConfig;
