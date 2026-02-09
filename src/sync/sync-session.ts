@@ -26,6 +26,9 @@ import {
   type PeerRequestMessage,
   type PeerLeftMessage,
   type KnownPeerInfo,
+  type WebRTCOfferMessage,
+  type WebRTCAnswerMessage,
+  type WebRTCIceCandidateMessage,
 } from "./types";
 import {
   serializeMessage,
@@ -44,6 +47,11 @@ import {
   createPeerAnnouncementMessage,
   createPeerRequestMessage,
   createPeerLeftMessage,
+  createWebRTCOfferMessage,
+  createWebRTCAnswerMessage,
+  createWebRTCIceCandidateMessage,
+  createWebRTCReadyMessage,
+  createWebRTCFailedMessage,
 } from "./messages";
 import { EventEmitter } from "../utils/events";
 
@@ -58,6 +66,21 @@ const BLOB_MAX_RETRIES = 3;
 
 /** Delay between blob retry attempts (ms) */
 const BLOB_RETRY_DELAY_MS = 500;
+
+/** Delay before attempting WebRTC upgrade after entering live mode (ms) */
+const WEBRTC_UPGRADE_DELAY_MS = 2000;
+
+/** Timeout for WebRTC connection attempt (ms) */
+const WEBRTC_CONNECTION_TIMEOUT_MS = 30000;
+
+/** Delay before retrying WebRTC upgrade after failure (ms) */
+const WEBRTC_RETRY_DELAY_MS = 60000;
+
+/** Maximum WebRTC upgrade attempts before giving up */
+const WEBRTC_MAX_ATTEMPTS = 3;
+
+/** WebRTC upgrade state */
+type WebRTCUpgradeState = "none" | "initiating" | "responding" | "connected" | "failed";
 
 /**
  * Sanitize peer-provided string to prevent excessively long values.
@@ -126,6 +149,15 @@ export interface SyncSessionConfig {
 
   /** Callback when a peer left notification is received */
   onPeerLeft?: (nodeId: string, groupIds: string[], reason: "removed" | "disconnected" | "left") => void;
+
+  /** Whether to attempt WebRTC upgrade for direct connection */
+  enableWebRTC?: boolean;
+
+  /** Our node ID (used for deterministic initiator selection) */
+  ourNodeId?: string;
+
+  /** Callback when WebRTC connection state changes */
+  onWebRTCStateChange?: (state: WebRTCUpgradeState) => void;
 }
 
 const DEFAULT_CONFIG: Omit<
@@ -140,9 +172,12 @@ const DEFAULT_CONFIG: Omit<
   | "onPeerDiscoveryInfo"
   | "onPeerAnnouncement"
   | "onPeerLeft"
+  | "ourNodeId"
+  | "onWebRTCStateChange"
 > & {
   peerIsReadOnly: boolean;
   allowVaultAdoption: boolean;
+  enableWebRTC: boolean;
 } = {
   pingInterval: 15000, // Reduced from 30000 for faster stale detection
   pingTimeout: 10000,
@@ -150,6 +185,7 @@ const DEFAULT_CONFIG: Omit<
   maxRetries: 3,
   peerIsReadOnly: false,
   allowVaultAdoption: false,
+  enableWebRTC: false, // Disabled by default - enable when stable
 };
 
 /** Sync progress information */
@@ -203,6 +239,8 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     | "onPeerDiscoveryInfo"
     | "onPeerAnnouncement"
     | "onPeerLeft"
+    | "ourNodeId"
+    | "onWebRTCStateChange"
   > & {
     ourTicket: string;
     ourHostname: string;
@@ -214,9 +252,19 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     onPeerDiscoveryInfo?: (groupIds: string[], knownPeers: KnownPeerInfo[]) => void;
     onPeerAnnouncement?: (peers: KnownPeerInfo[], reason: "joined" | "discovered" | "updated") => void;
     onPeerLeft?: (nodeId: string, groupIds: string[], reason: "removed" | "disconnected" | "left") => void;
+    ourNodeId?: string;
+    onWebRTCStateChange?: (state: WebRTCUpgradeState) => void;
   };
   private aborted = false;
   private unsubscribeLocalUpdates: (() => void) | null = null;
+
+  // WebRTC upgrade state
+  private webrtcState: WebRTCUpgradeState = "none";
+  private webrtcPeerConnection: RTCPeerConnection | null = null;
+  private webrtcDataChannel: RTCDataChannel | null = null;
+  private webrtcUpgradeTimer: ReturnType<typeof setTimeout> | null = null;
+  private webrtcAttempts = 0;
+  private pendingIceCandidates: RTCIceCandidateInit[] = [];
 
   // Micro-batching for reduced latency
   private pendingUpdates: Uint8Array[] = [];
@@ -354,6 +402,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       this.emitProgress("live");
       this.startPingTimer();
       this.subscribeToLocalUpdates();
+      this.scheduleWebRTCUpgrade(); // Attempt WebRTC upgrade for direct connection
       this.startLiveLoop().catch((err) => {
         this.logger.error("Live loop error:", err);
         this.emit("error", err as Error);
@@ -512,6 +561,7 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
       this.emitProgress("live");
       this.startPingTimer();
       this.subscribeToLocalUpdates();
+      this.scheduleWebRTCUpgrade(); // Attempt WebRTC upgrade for direct connection
       this.startLiveLoop().catch((err) => {
         this.logger.error("Live loop error:", err);
         this.emit("error", err as Error);
@@ -687,6 +737,13 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     this.aborted = true;
     this.stopPingTimer();
     this.stopLocalUpdateSubscription();
+
+    // Clear WebRTC upgrade timer and clean up WebRTC resources
+    if (this.webrtcUpgradeTimer) {
+      clearTimeout(this.webrtcUpgradeTimer);
+      this.webrtcUpgradeTimer = null;
+    }
+    this.cleanupWebRTC();
 
     // Clear micro-batch timer and flush any pending updates
     if (this.flushTimer) {
@@ -1395,6 +1452,41 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
             break;
           }
 
+          // WebRTC signaling messages (in-band signaling for direct connection upgrade)
+          case SyncMessageType.WEBRTC_OFFER: {
+            const offerMsg = message as WebRTCOfferMessage;
+            this.logger.info("Received WebRTC offer from peer");
+            await this.handleWebRTCOffer(offerMsg.sdp);
+            break;
+          }
+
+          case SyncMessageType.WEBRTC_ANSWER: {
+            const answerMsg = message as WebRTCAnswerMessage;
+            this.logger.info("Received WebRTC answer from peer");
+            await this.handleWebRTCAnswer(answerMsg.sdp);
+            break;
+          }
+
+          case SyncMessageType.WEBRTC_ICE_CANDIDATE: {
+            const iceMsg = message as WebRTCIceCandidateMessage;
+            this.logger.debug("Received ICE candidate from peer");
+            await this.handleWebRTCIceCandidate(iceMsg);
+            break;
+          }
+
+          case SyncMessageType.WEBRTC_READY: {
+            this.logger.info("Peer confirmed WebRTC is ready");
+            this.setWebRTCState("connected");
+            break;
+          }
+
+          case SyncMessageType.WEBRTC_FAILED: {
+            this.logger.info("Peer reported WebRTC failed:", (message as { reason: string }).reason);
+            this.setWebRTCState("failed");
+            this.scheduleWebRTCRetry();
+            break;
+          }
+
           default:
             this.logger.warn("Unexpected message in live mode:", message.type);
         }
@@ -1641,6 +1733,428 @@ export class SyncSession extends EventEmitter<SyncSessionEvents> {
     }
 
     // Default: assume transient for unknown errors
+    return true;
+  }
+
+  // ===========================================================================
+  // Private: WebRTC Upgrade
+  // ===========================================================================
+
+  /**
+   * Schedule WebRTC upgrade attempt after entering live mode.
+   * Uses deterministic initiator selection based on node IDs.
+   */
+  private scheduleWebRTCUpgrade(): void {
+    if (!this.config.enableWebRTC) {
+      return;
+    }
+
+    if (this.webrtcAttempts >= WEBRTC_MAX_ATTEMPTS) {
+      this.logger.debug("WebRTC max attempts reached, not scheduling upgrade");
+      return;
+    }
+
+    // Clear any existing timer
+    if (this.webrtcUpgradeTimer) {
+      clearTimeout(this.webrtcUpgradeTimer);
+    }
+
+    const delay = this.webrtcAttempts === 0 ? WEBRTC_UPGRADE_DELAY_MS : WEBRTC_RETRY_DELAY_MS;
+    this.logger.debug(`Scheduling WebRTC upgrade in ${delay}ms (attempt ${this.webrtcAttempts + 1})`);
+
+    this.webrtcUpgradeTimer = setTimeout(() => {
+      this.webrtcUpgradeTimer = null;
+      this.attemptWebRTCUpgradeInternal().catch((err) => {
+        this.logger.error("WebRTC upgrade error:", err);
+        this.setWebRTCState("failed");
+        this.scheduleWebRTCRetry();
+      });
+    }, delay);
+  }
+
+  /**
+   * Schedule a retry of WebRTC upgrade after failure.
+   */
+  private scheduleWebRTCRetry(): void {
+    if (!this.config.enableWebRTC) return;
+    if (this.webrtcAttempts >= WEBRTC_MAX_ATTEMPTS) {
+      this.logger.info("WebRTC upgrade failed after max attempts, giving up");
+      return;
+    }
+
+    this.webrtcAttempts++;
+    this.scheduleWebRTCUpgrade();
+  }
+
+  /**
+   * Attempt to upgrade to WebRTC (internal).
+   * Only the "initiator" (lower node ID) creates the offer.
+   */
+  private async attemptWebRTCUpgradeInternal(): Promise<void> {
+    if (this.webrtcState !== "none" && this.webrtcState !== "failed") {
+      this.logger.debug("WebRTC upgrade already in progress or connected");
+      return;
+    }
+
+    if (!this.config.ourNodeId) {
+      this.logger.debug("No node ID configured, skipping WebRTC upgrade");
+      return;
+    }
+
+    // Deterministic initiator selection: lower node ID creates offer
+    const weAreInitiator = this.config.ourNodeId < this.peerId;
+    if (!weAreInitiator) {
+      this.logger.debug("We are not the initiator for WebRTC, waiting for offer");
+      return;
+    }
+
+    this.logger.info("Initiating WebRTC upgrade");
+    this.setWebRTCState("initiating");
+
+    try {
+      // Create peer connection
+      this.webrtcPeerConnection = new RTCPeerConnection({
+        iceServers: [
+          { urls: "stun:stun.l.google.com:19302" },
+          { urls: "stun:stun1.l.google.com:19302" },
+        ],
+      });
+
+      // Set up ICE candidate handling
+      this.webrtcPeerConnection.onicecandidate = (event) => {
+        if (event.candidate) {
+          this.sendWebRTCIceCandidate(event.candidate).catch((err) => {
+            this.logger.error("Failed to send ICE candidate:", err);
+          });
+        }
+      };
+
+      // Set up connection state handling
+      this.webrtcPeerConnection.onconnectionstatechange = () => {
+        const state = this.webrtcPeerConnection?.connectionState;
+        this.logger.debug("WebRTC connection state:", state);
+        if (state === "connected") {
+          this.onWebRTCConnected();
+        } else if (state === "failed" || state === "disconnected") {
+          this.onWebRTCFailed("Connection " + state);
+        }
+      };
+
+      // Create data channel
+      this.webrtcDataChannel = this.webrtcPeerConnection.createDataChannel("sync", {
+        ordered: true,
+      });
+      this.setupDataChannel(this.webrtcDataChannel);
+
+      // Create and send offer
+      const offer = await this.webrtcPeerConnection.createOffer();
+      await this.webrtcPeerConnection.setLocalDescription(offer);
+
+      if (offer.sdp) {
+        await this.sendMessage(createWebRTCOfferMessage(offer.sdp));
+      }
+
+      // Set timeout for connection
+      setTimeout(() => {
+        if (this.webrtcState === "initiating") {
+          this.onWebRTCFailed("Connection timeout");
+        }
+      }, WEBRTC_CONNECTION_TIMEOUT_MS);
+
+    } catch (err) {
+      this.logger.error("Failed to create WebRTC offer:", err);
+      this.onWebRTCFailed(err instanceof Error ? err.message : "Unknown error");
+    }
+  }
+
+  /**
+   * Handle incoming WebRTC offer from peer.
+   */
+  private async handleWebRTCOffer(sdp: string): Promise<void> {
+    if (!this.config.enableWebRTC) {
+      await this.sendMessage(createWebRTCFailedMessage("WebRTC not enabled"));
+      return;
+    }
+
+    if (this.webrtcState === "connected") {
+      this.logger.debug("Already connected via WebRTC, ignoring offer");
+      return;
+    }
+
+    this.logger.info("Responding to WebRTC offer");
+    this.setWebRTCState("responding");
+
+    try {
+      // Create peer connection
+      this.webrtcPeerConnection = new RTCPeerConnection({
+        iceServers: [
+          { urls: "stun:stun.l.google.com:19302" },
+          { urls: "stun:stun1.l.google.com:19302" },
+        ],
+      });
+
+      // Set up ICE candidate handling
+      this.webrtcPeerConnection.onicecandidate = (event) => {
+        if (event.candidate) {
+          this.sendWebRTCIceCandidate(event.candidate).catch((err) => {
+            this.logger.error("Failed to send ICE candidate:", err);
+          });
+        }
+      };
+
+      // Set up connection state handling
+      this.webrtcPeerConnection.onconnectionstatechange = () => {
+        const state = this.webrtcPeerConnection?.connectionState;
+        this.logger.debug("WebRTC connection state:", state);
+        if (state === "connected") {
+          this.onWebRTCConnected();
+        } else if (state === "failed" || state === "disconnected") {
+          this.onWebRTCFailed("Connection " + state);
+        }
+      };
+
+      // Handle incoming data channel
+      this.webrtcPeerConnection.ondatachannel = (event) => {
+        this.webrtcDataChannel = event.channel;
+        this.setupDataChannel(this.webrtcDataChannel);
+      };
+
+      // Set remote description (the offer)
+      await this.webrtcPeerConnection.setRemoteDescription({
+        type: "offer",
+        sdp,
+      });
+
+      // Add any pending ICE candidates
+      for (const candidate of this.pendingIceCandidates) {
+        await this.webrtcPeerConnection.addIceCandidate(candidate);
+      }
+      this.pendingIceCandidates = [];
+
+      // Create and send answer
+      const answer = await this.webrtcPeerConnection.createAnswer();
+      await this.webrtcPeerConnection.setLocalDescription(answer);
+
+      if (answer.sdp) {
+        await this.sendMessage(createWebRTCAnswerMessage(answer.sdp));
+      }
+
+    } catch (err) {
+      this.logger.error("Failed to handle WebRTC offer:", err);
+      this.onWebRTCFailed(err instanceof Error ? err.message : "Unknown error");
+    }
+  }
+
+  /**
+   * Handle incoming WebRTC answer from peer.
+   */
+  private async handleWebRTCAnswer(sdp: string): Promise<void> {
+    if (!this.webrtcPeerConnection) {
+      this.logger.warn("Received WebRTC answer but no peer connection");
+      return;
+    }
+
+    try {
+      await this.webrtcPeerConnection.setRemoteDescription({
+        type: "answer",
+        sdp,
+      });
+
+      // Add any pending ICE candidates
+      for (const candidate of this.pendingIceCandidates) {
+        await this.webrtcPeerConnection.addIceCandidate(candidate);
+      }
+      this.pendingIceCandidates = [];
+
+    } catch (err) {
+      this.logger.error("Failed to handle WebRTC answer:", err);
+      this.onWebRTCFailed(err instanceof Error ? err.message : "Unknown error");
+    }
+  }
+
+  /**
+   * Handle incoming ICE candidate from peer.
+   */
+  private async handleWebRTCIceCandidate(msg: WebRTCIceCandidateMessage): Promise<void> {
+    const candidate: RTCIceCandidateInit = {
+      candidate: msg.candidate,
+      sdpMid: msg.sdpMid,
+      sdpMLineIndex: msg.sdpMLineIndex,
+    };
+
+    if (!this.webrtcPeerConnection || !this.webrtcPeerConnection.remoteDescription) {
+      // Queue candidate until we have remote description
+      this.pendingIceCandidates.push(candidate);
+      return;
+    }
+
+    try {
+      await this.webrtcPeerConnection.addIceCandidate(candidate);
+    } catch (err) {
+      this.logger.error("Failed to add ICE candidate:", err);
+    }
+  }
+
+  /**
+   * Send an ICE candidate to the peer.
+   */
+  private async sendWebRTCIceCandidate(candidate: RTCIceCandidate): Promise<void> {
+    await this.sendMessage(
+      createWebRTCIceCandidateMessage(
+        candidate.candidate,
+        candidate.sdpMid,
+        candidate.sdpMLineIndex,
+      ),
+    );
+  }
+
+  /**
+   * Set up data channel event handlers.
+   */
+  private setupDataChannel(channel: RTCDataChannel): void {
+    channel.binaryType = "arraybuffer";
+
+    channel.onopen = () => {
+      this.logger.info("WebRTC data channel opened");
+    };
+
+    channel.onclose = () => {
+      this.logger.info("WebRTC data channel closed");
+      if (this.webrtcState === "connected") {
+        this.setWebRTCState("failed");
+        this.scheduleWebRTCRetry();
+      }
+    };
+
+    channel.onerror = (event) => {
+      this.logger.error("WebRTC data channel error:", event);
+    };
+
+    channel.onmessage = (event) => {
+      // Handle incoming messages from WebRTC data channel
+      // For now, we don't use the data channel for receiving
+      // All sync messages still come through Iroh
+      this.logger.debug("Received message on WebRTC data channel:", event.data.byteLength, "bytes");
+    };
+  }
+
+  /**
+   * Called when WebRTC connection is established.
+   */
+  private onWebRTCConnected(): void {
+    this.logger.info("WebRTC connection established");
+    this.setWebRTCState("connected");
+    this.webrtcAttempts = 0; // Reset attempts on success
+
+    // Notify peer that we're ready
+    this.sendMessage(createWebRTCReadyMessage()).catch((err) => {
+      this.logger.error("Failed to send WebRTC ready:", err);
+    });
+  }
+
+  /**
+   * Called when WebRTC connection fails.
+   */
+  private onWebRTCFailed(reason: string): void {
+    this.logger.warn("WebRTC connection failed:", reason);
+    this.cleanupWebRTC();
+    this.setWebRTCState("failed");
+
+    // Notify peer
+    this.sendMessage(createWebRTCFailedMessage(reason)).catch((err) => {
+      this.logger.error("Failed to send WebRTC failed:", err);
+    });
+
+    this.scheduleWebRTCRetry();
+  }
+
+  /**
+   * Clean up WebRTC resources.
+   */
+  private cleanupWebRTC(): void {
+    if (this.webrtcDataChannel) {
+      try {
+        this.webrtcDataChannel.close();
+      } catch {
+        // Ignore
+      }
+      this.webrtcDataChannel = null;
+    }
+
+    if (this.webrtcPeerConnection) {
+      try {
+        this.webrtcPeerConnection.close();
+      } catch {
+        // Ignore
+      }
+      this.webrtcPeerConnection = null;
+    }
+
+    this.pendingIceCandidates = [];
+  }
+
+  /**
+   * Update WebRTC state and notify callback.
+   */
+  private setWebRTCState(state: WebRTCUpgradeState): void {
+    if (this.webrtcState === state) return;
+
+    this.logger.debug(`WebRTC state: ${this.webrtcState} -> ${state}`);
+    this.webrtcState = state;
+
+    if (this.config.onWebRTCStateChange) {
+      this.config.onWebRTCStateChange(state);
+    }
+  }
+
+  /**
+   * Get current WebRTC state.
+   */
+  getWebRTCState(): WebRTCUpgradeState {
+    return this.webrtcState;
+  }
+
+  /**
+   * Check if WebRTC is connected and ready for use.
+   */
+  isWebRTCConnected(): boolean {
+    return (
+      this.webrtcState === "connected" &&
+      this.webrtcDataChannel !== null &&
+      this.webrtcDataChannel.readyState === "open"
+    );
+  }
+
+  /**
+   * Manually trigger a WebRTC upgrade attempt.
+   * @returns true if upgrade was initiated, false if not possible
+   */
+  attemptWebRTCUpgrade(): boolean {
+    if (!this.config.enableWebRTC) {
+      return false;
+    }
+    if (this.state !== "live") {
+      return false;
+    }
+    if (this.webrtcState === "connected") {
+      return false; // Already connected
+    }
+    if (this.webrtcState === "initiating" || this.webrtcState === "responding") {
+      return false; // Already in progress
+    }
+
+    // Clear any existing retry timer
+    if (this.webrtcUpgradeTimer) {
+      clearTimeout(this.webrtcUpgradeTimer);
+      this.webrtcUpgradeTimer = null;
+    }
+
+    // Attempt upgrade immediately
+    this.attemptWebRTCUpgradeInternal().catch((err) => {
+      this.logger.error("Manual WebRTC upgrade error:", err);
+      this.setWebRTCState("failed");
+    });
+
     return true;
   }
 }

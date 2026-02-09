@@ -27,6 +27,11 @@ import {
   type PeerRequestMessage,
   type PeerLeftMessage,
   type KnownPeerInfo,
+  type WebRTCOfferMessage,
+  type WebRTCAnswerMessage,
+  type WebRTCIceCandidateMessage,
+  type WebRTCReadyMessage,
+  type WebRTCFailedMessage,
 } from "./types";
 import { SyncErrors } from "../errors";
 
@@ -241,6 +246,16 @@ export function serializeMessage(message: AnySyncMessage): Uint8Array {
       return serializePeerRequest(message);
     case SyncMessageType.PEER_LEFT:
       return serializePeerLeft(message);
+    case SyncMessageType.WEBRTC_OFFER:
+      return serializeWebRTCOffer(message);
+    case SyncMessageType.WEBRTC_ANSWER:
+      return serializeWebRTCAnswer(message);
+    case SyncMessageType.WEBRTC_ICE_CANDIDATE:
+      return serializeWebRTCIceCandidate(message);
+    case SyncMessageType.WEBRTC_READY:
+      return serializeWebRTCReady(message);
+    case SyncMessageType.WEBRTC_FAILED:
+      return serializeWebRTCFailed(message);
     default:
       throw SyncErrors.invalidMessage(
         (message as AnySyncMessage).type,
@@ -295,6 +310,16 @@ export function deserializeMessage(data: Uint8Array): AnySyncMessage {
       return deserializePeerRequest(data, timestamp);
     case SyncMessageType.PEER_LEFT:
       return deserializePeerLeft(data, timestamp);
+    case SyncMessageType.WEBRTC_OFFER:
+      return deserializeWebRTCOffer(data, timestamp);
+    case SyncMessageType.WEBRTC_ANSWER:
+      return deserializeWebRTCAnswer(data, timestamp);
+    case SyncMessageType.WEBRTC_ICE_CANDIDATE:
+      return deserializeWebRTCIceCandidate(data, timestamp);
+    case SyncMessageType.WEBRTC_READY:
+      return deserializeWebRTCReady(timestamp);
+    case SyncMessageType.WEBRTC_FAILED:
+      return deserializeWebRTCFailed(data, timestamp);
     default:
       throw SyncErrors.invalidMessage(type);
   }
@@ -1754,6 +1779,272 @@ export function createPeerLeftMessage(
     timestamp: Date.now(),
     nodeId,
     groupIds,
+    reason,
+  };
+}
+
+// ============================================================================
+// WEBRTC_OFFER
+// ============================================================================
+
+/**
+ * WEBRTC_OFFER format:
+ * - u8: type (0x40)
+ * - u64: timestamp
+ * - u32: sdp length
+ * - bytes: sdp (UTF-8)
+ */
+function serializeWebRTCOffer(msg: WebRTCOfferMessage): Uint8Array {
+  const sdpBytes = TEXT_ENCODER.encode(msg.sdp);
+  const totalLength = 1 + 8 + 4 + sdpBytes.length;
+
+  return new MessageWriter(totalLength)
+    .writeHeader(msg.type, msg.timestamp)
+    .writeBytes(sdpBytes)
+    .finish();
+}
+
+function deserializeWebRTCOffer(
+  data: Uint8Array,
+  timestamp: number,
+): WebRTCOfferMessage {
+  const reader = new MessageReader(data);
+  const sdp = reader.readString();
+
+  return {
+    type: SyncMessageType.WEBRTC_OFFER,
+    timestamp,
+    sdp,
+  };
+}
+
+export function createWebRTCOfferMessage(sdp: string): WebRTCOfferMessage {
+  return {
+    type: SyncMessageType.WEBRTC_OFFER,
+    timestamp: Date.now(),
+    sdp,
+  };
+}
+
+// ============================================================================
+// WEBRTC_ANSWER
+// ============================================================================
+
+/**
+ * WEBRTC_ANSWER format:
+ * - u8: type (0x41)
+ * - u64: timestamp
+ * - u32: sdp length
+ * - bytes: sdp (UTF-8)
+ */
+function serializeWebRTCAnswer(msg: WebRTCAnswerMessage): Uint8Array {
+  const sdpBytes = TEXT_ENCODER.encode(msg.sdp);
+  const totalLength = 1 + 8 + 4 + sdpBytes.length;
+
+  return new MessageWriter(totalLength)
+    .writeHeader(msg.type, msg.timestamp)
+    .writeBytes(sdpBytes)
+    .finish();
+}
+
+function deserializeWebRTCAnswer(
+  data: Uint8Array,
+  timestamp: number,
+): WebRTCAnswerMessage {
+  const reader = new MessageReader(data);
+  const sdp = reader.readString();
+
+  return {
+    type: SyncMessageType.WEBRTC_ANSWER,
+    timestamp,
+    sdp,
+  };
+}
+
+export function createWebRTCAnswerMessage(sdp: string): WebRTCAnswerMessage {
+  return {
+    type: SyncMessageType.WEBRTC_ANSWER,
+    timestamp: Date.now(),
+    sdp,
+  };
+}
+
+// ============================================================================
+// WEBRTC_ICE_CANDIDATE
+// ============================================================================
+
+/**
+ * WEBRTC_ICE_CANDIDATE format:
+ * - u8: type (0x42)
+ * - u64: timestamp
+ * - u32: candidate length
+ * - bytes: candidate (UTF-8)
+ * - u16: sdpMid length (0 if null)
+ * - bytes: sdpMid (UTF-8, optional)
+ * - i16: sdpMLineIndex (-1 if null)
+ */
+function serializeWebRTCIceCandidate(msg: WebRTCIceCandidateMessage): Uint8Array {
+  const candidateBytes = TEXT_ENCODER.encode(msg.candidate);
+  const sdpMidBytes = msg.sdpMid ? TEXT_ENCODER.encode(msg.sdpMid) : null;
+  const totalLength = 1 + 8 + 4 + candidateBytes.length + 2 + (sdpMidBytes?.length || 0) + 2;
+
+  const buffer = new ArrayBuffer(totalLength);
+  const view = new DataView(buffer);
+  const bytes = new Uint8Array(buffer);
+  let offset = 0;
+
+  view.setUint8(offset++, msg.type);
+  view.setBigUint64(offset, BigInt(msg.timestamp), false);
+  offset += 8;
+
+  view.setUint32(offset, candidateBytes.length, false);
+  offset += 4;
+  bytes.set(candidateBytes, offset);
+  offset += candidateBytes.length;
+
+  view.setUint16(offset, sdpMidBytes?.length || 0, false);
+  offset += 2;
+  if (sdpMidBytes) {
+    bytes.set(sdpMidBytes, offset);
+    offset += sdpMidBytes.length;
+  }
+
+  view.setInt16(offset, msg.sdpMLineIndex ?? -1, false);
+
+  return bytes;
+}
+
+function deserializeWebRTCIceCandidate(
+  data: Uint8Array,
+  timestamp: number,
+): WebRTCIceCandidateMessage {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  let offset = 9; // Skip type and timestamp
+
+  const candidateLen = view.getUint32(offset, false);
+  offset += 4;
+  const candidate = TEXT_DECODER.decode(data.slice(offset, offset + candidateLen));
+  offset += candidateLen;
+
+  const sdpMidLen = view.getUint16(offset, false);
+  offset += 2;
+  const sdpMid = sdpMidLen > 0
+    ? TEXT_DECODER.decode(data.slice(offset, offset + sdpMidLen))
+    : null;
+  offset += sdpMidLen;
+
+  const sdpMLineIndexRaw = view.getInt16(offset, false);
+  const sdpMLineIndex = sdpMLineIndexRaw === -1 ? null : sdpMLineIndexRaw;
+
+  return {
+    type: SyncMessageType.WEBRTC_ICE_CANDIDATE,
+    timestamp,
+    candidate,
+    sdpMid,
+    sdpMLineIndex,
+  };
+}
+
+export function createWebRTCIceCandidateMessage(
+  candidate: string,
+  sdpMid: string | null,
+  sdpMLineIndex: number | null,
+): WebRTCIceCandidateMessage {
+  return {
+    type: SyncMessageType.WEBRTC_ICE_CANDIDATE,
+    timestamp: Date.now(),
+    candidate,
+    sdpMid,
+    sdpMLineIndex,
+  };
+}
+
+// ============================================================================
+// WEBRTC_READY
+// ============================================================================
+
+/**
+ * WEBRTC_READY format:
+ * - u8: type (0x43)
+ * - u64: timestamp
+ */
+function serializeWebRTCReady(msg: WebRTCReadyMessage): Uint8Array {
+  const buffer = new ArrayBuffer(9);
+  const view = new DataView(buffer);
+
+  view.setUint8(0, msg.type);
+  view.setBigUint64(1, BigInt(msg.timestamp), false);
+
+  return new Uint8Array(buffer);
+}
+
+function deserializeWebRTCReady(timestamp: number): WebRTCReadyMessage {
+  return {
+    type: SyncMessageType.WEBRTC_READY,
+    timestamp,
+  };
+}
+
+export function createWebRTCReadyMessage(): WebRTCReadyMessage {
+  return {
+    type: SyncMessageType.WEBRTC_READY,
+    timestamp: Date.now(),
+  };
+}
+
+// ============================================================================
+// WEBRTC_FAILED
+// ============================================================================
+
+/**
+ * WEBRTC_FAILED format:
+ * - u8: type (0x44)
+ * - u64: timestamp
+ * - u16: reason length
+ * - bytes: reason (UTF-8)
+ */
+function serializeWebRTCFailed(msg: WebRTCFailedMessage): Uint8Array {
+  const reasonBytes = TEXT_ENCODER.encode(msg.reason);
+  const totalLength = 1 + 8 + 2 + reasonBytes.length;
+
+  const buffer = new ArrayBuffer(totalLength);
+  const view = new DataView(buffer);
+  const bytes = new Uint8Array(buffer);
+  let offset = 0;
+
+  view.setUint8(offset++, msg.type);
+  view.setBigUint64(offset, BigInt(msg.timestamp), false);
+  offset += 8;
+
+  view.setUint16(offset, reasonBytes.length, false);
+  offset += 2;
+  bytes.set(reasonBytes, offset);
+
+  return bytes;
+}
+
+function deserializeWebRTCFailed(
+  data: Uint8Array,
+  timestamp: number,
+): WebRTCFailedMessage {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  let offset = 9; // Skip type and timestamp
+
+  const reasonLen = view.getUint16(offset, false);
+  offset += 2;
+  const reason = TEXT_DECODER.decode(data.slice(offset, offset + reasonLen));
+
+  return {
+    type: SyncMessageType.WEBRTC_FAILED,
+    timestamp,
+    reason,
+  };
+}
+
+export function createWebRTCFailedMessage(reason: string): WebRTCFailedMessage {
+  return {
+    type: SyncMessageType.WEBRTC_FAILED,
+    timestamp: Date.now(),
     reason,
   };
 }

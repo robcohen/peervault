@@ -143,4 +143,7 @@ export interface PeerManagerConfig {
 
   /** Our plugin version (e.g., "0.2.53") - peers must match to sync */
   pluginVersion?: string;
+
+  /** Enable WebRTC upgrade for direct connections (in-band signaling) */
+  enableWebRTC?: boolean;
 }

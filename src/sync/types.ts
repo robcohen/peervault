@@ -67,6 +67,22 @@ export enum SyncMessageType {
 
   /** Response with encrypted vault key */
   KEY_EXCHANGE_RESPONSE = 0x31,
+
+  // WebRTC signaling messages (0x40 range) - in-band signaling for direct connection upgrade
+  /** WebRTC SDP offer */
+  WEBRTC_OFFER = 0x40,
+
+  /** WebRTC SDP answer */
+  WEBRTC_ANSWER = 0x41,
+
+  /** WebRTC ICE candidate */
+  WEBRTC_ICE_CANDIDATE = 0x42,
+
+  /** WebRTC connection ready (upgrade complete) */
+  WEBRTC_READY = 0x43,
+
+  /** WebRTC upgrade failed or not supported */
+  WEBRTC_FAILED = 0x44,
 }
 
 /** Base sync message structure */
@@ -260,6 +276,43 @@ export interface KeyExchangeResponseMessage extends SyncMessage {
   isNewKey: boolean;
 }
 
+/** WebRTC offer message - contains SDP offer for direct connection upgrade */
+export interface WebRTCOfferMessage extends SyncMessage {
+  type: SyncMessageType.WEBRTC_OFFER;
+  /** SDP offer string */
+  sdp: string;
+}
+
+/** WebRTC answer message - contains SDP answer */
+export interface WebRTCAnswerMessage extends SyncMessage {
+  type: SyncMessageType.WEBRTC_ANSWER;
+  /** SDP answer string */
+  sdp: string;
+}
+
+/** WebRTC ICE candidate message */
+export interface WebRTCIceCandidateMessage extends SyncMessage {
+  type: SyncMessageType.WEBRTC_ICE_CANDIDATE;
+  /** ICE candidate string */
+  candidate: string;
+  /** SDP mid */
+  sdpMid: string | null;
+  /** SDP M-line index */
+  sdpMLineIndex: number | null;
+}
+
+/** WebRTC ready message - signals upgrade complete */
+export interface WebRTCReadyMessage extends SyncMessage {
+  type: SyncMessageType.WEBRTC_READY;
+}
+
+/** WebRTC failed message - signals upgrade failed or not supported */
+export interface WebRTCFailedMessage extends SyncMessage {
+  type: SyncMessageType.WEBRTC_FAILED;
+  /** Reason for failure */
+  reason: string;
+}
+
 /** Sync error codes */
 export enum SyncErrorCode {
   UNKNOWN = 0,
@@ -289,7 +342,12 @@ export type AnySyncMessage =
   | PeerRequestMessage
   | PeerLeftMessage
   | KeyExchangeRequestMessage
-  | KeyExchangeResponseMessage;
+  | KeyExchangeResponseMessage
+  | WebRTCOfferMessage
+  | WebRTCAnswerMessage
+  | WebRTCIceCandidateMessage
+  | WebRTCReadyMessage
+  | WebRTCFailedMessage;
 
 /** Sync session state */
 export type SyncSessionState =

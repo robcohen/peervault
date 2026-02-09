@@ -116,6 +116,7 @@ const DEFAULT_CONFIG: Omit<Required<PeerManagerConfig>, "hostname" | "nickname" 
   autoReconnect: true,
   maxReconnectAttempts: 10,
   reconnectBackoff: 500, // Reduced from 1000 for faster reconnection
+  enableWebRTC: false, // Disabled by default, enable for direct connection upgrade
 };
 
 /** Vault adoption request for user confirmation */
@@ -662,6 +663,30 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   getPeerConnectionType(nodeId: string): import("../transport/types").ConnectionType | undefined {
     const connection = this.transport.getConnection(nodeId);
     return connection?.getConnectionType();
+  }
+
+  /**
+   * Get WebRTC upgrade state for a peer.
+   * @param nodeId Peer's node ID
+   * @returns WebRTC state or undefined if no active session
+   */
+  getPeerWebRTCState(nodeId: string): "none" | "initiating" | "responding" | "connected" | "failed" | undefined {
+    const session = this.sessions.get(nodeId);
+    return session?.getWebRTCState();
+  }
+
+  /**
+   * Attempt WebRTC upgrade for a peer.
+   * @param nodeId Peer's node ID
+   * @returns true if upgrade was initiated, false if not possible
+   */
+  attemptWebRTCUpgrade(nodeId: string): boolean {
+    const session = this.sessions.get(nodeId);
+    if (!session) {
+      this.logger.warn(`Cannot upgrade WebRTC: no session for ${nodeId.slice(0, 8)}`);
+      return false;
+    }
+    return session.attemptWebRTCUpgrade();
   }
 
   /**
@@ -1934,6 +1959,9 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
         onPeerLeft: (nodeId, groupIds, reason) => {
           this.handlePeerLeft(nodeId, groupIds, reason);
         },
+        // WebRTC upgrade (in-band signaling)
+        enableWebRTC: this.config.enableWebRTC,
+        ourNodeId: this.transport.getNodeId(),
       },
       this.blobStore,
     );
@@ -2039,6 +2067,9 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
         onPeerLeft: (nodeId, groupIds, reason) => {
           this.handlePeerLeft(nodeId, groupIds, reason);
         },
+        // WebRTC upgrade (in-band signaling)
+        enableWebRTC: this.config.enableWebRTC,
+        ourNodeId: this.transport.getNodeId(),
       },
       this.blobStore,
     );
@@ -2238,6 +2269,9 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
         ourHostname: this.config.hostname,
         ourNickname: this.config.nickname,
         ourPluginVersion: this.config.pluginVersion,
+        // WebRTC upgrade (in-band signaling)
+        enableWebRTC: this.config.enableWebRTC,
+        ourNodeId: this.transport.getNodeId(),
       },
       this.blobStore,
     );

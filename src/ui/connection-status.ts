@@ -486,7 +486,7 @@ export class ConnectionStatusModal extends Modal {
           : (peer.nickname || nodeIdToWords(peer.nodeId)),
       );
 
-      // Connection type (for connected peers)
+      // Connection type and WebRTC status (for connected peers)
       if (peer.connectionState === "connected" || peer.connectionState === "syncing") {
         const connType = this.plugin.peerManager?.getPeerConnectionType(peer.nodeId);
         if (connType) {
@@ -501,6 +501,39 @@ export class ConnectionStatusModal extends Modal {
             : connType === "mixed"
             ? "Mixed connection (direct + relay)"
             : "Connection type unknown";
+        }
+
+        // WebRTC status and upgrade button
+        if (this.plugin.settings.enableWebRTC) {
+          const webrtcState = this.plugin.peerManager?.getPeerWebRTCState(peer.nodeId);
+          if (webrtcState) {
+            const webrtcEl = item.createSpan({ cls: "peervault-peer-webrtc" });
+            if (webrtcState === "connected") {
+              webrtcEl.setText("⚡");
+              webrtcEl.title = "WebRTC direct connection active";
+              webrtcEl.addClass("peervault-webrtc-connected");
+            } else if (webrtcState === "initiating" || webrtcState === "responding") {
+              webrtcEl.setText("⏳");
+              webrtcEl.title = "WebRTC upgrade in progress...";
+              webrtcEl.addClass("peervault-webrtc-pending");
+            } else if (webrtcState === "none" || webrtcState === "failed") {
+              const upgradeBtn = item.createEl("button", {
+                text: "Upgrade",
+                cls: "peervault-webrtc-upgrade-btn",
+              });
+              upgradeBtn.title = "Attempt WebRTC direct connection";
+              upgradeBtn.onclick = () => {
+                const started = this.plugin.peerManager?.attemptWebRTCUpgrade(peer.nodeId);
+                if (started) {
+                  new Notice("WebRTC upgrade initiated...");
+                  upgradeBtn.disabled = true;
+                  upgradeBtn.setText("...");
+                } else {
+                  new Notice("Cannot upgrade: session not ready");
+                }
+              };
+            }
+          }
         }
       }
 

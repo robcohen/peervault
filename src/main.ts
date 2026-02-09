@@ -180,15 +180,20 @@ export default class PeerVaultPlugin extends Plugin {
       // Initialize Iroh WASM module (bundled inline) - only needed for real transports
       await initIrohWasm();
 
-      if (this.settings.transportType === "hybrid") {
+      if (this.settings.transportType === "hybrid" && this.settings.enableWebRTC) {
+        // Only use HybridTransport when WebRTC is actually enabled
+        // HybridTransport wraps connections in HybridConnection which adds complexity
+        // for stream detection and can cause race conditions
         this.logger.info("Initializing Hybrid transport (Iroh + WebRTC)...");
         this.transport = new HybridTransport({
           ...transportConfig,
-          enableWebRTC: this.settings.enableWebRTC,
+          enableWebRTC: true,
           autoUpgradeToWebRTC: this.settings.autoWebRTCUpgrade,
           webrtcUpgradeTimeout: this.settings.webrtcUpgradeTimeout,
         });
       } else {
+        // Use plain IrohTransport when WebRTC is disabled
+        // This avoids the HybridConnection wrapper and its stream detection complexity
         this.logger.info("Initializing Iroh transport...");
         this.transport = new IrohTransport(transportConfig);
       }
@@ -252,6 +257,7 @@ export default class PeerVaultPlugin extends Plugin {
         hostname,
         nickname,
         pluginVersion: this.manifest.version,
+        enableWebRTC: this.settings.enableWebRTC,
       },
       this.blobStore,
     );
