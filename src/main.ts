@@ -275,12 +275,19 @@ export default class PeerVaultPlugin extends Plugin {
     await this.cloudSync.initialize();
 
     // Set vault key for cloud encryption if available
+    const hasVaultKeyManager = !!this.vaultKeyManager;
+    const hasVaultKey = hasVaultKeyManager && await this.vaultKeyManager!.hasKey();
+    this.logger.info(`Vault key check: manager=${hasVaultKeyManager}, hasKey=${hasVaultKey}`);
+
     const vaultKey = await this.vaultKeyManager?.getKey();
     if (vaultKey) {
+      this.logger.info("Vault key loaded, setting on CloudSync");
       this.cloudSync.setVaultKey(vaultKey);
       // Re-check CRDT for cloud config now that we have the key to decrypt it
       // (initialize() couldn't decrypt it because vault key wasn't set yet)
       await this.cloudSync.checkForConfigUpdate();
+    } else {
+      this.logger.info("No vault key available - cloud config decryption will not work");
     }
 
     // Start auto-sync if enabled (check again after potential config update)
