@@ -238,6 +238,8 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   private pairingKeyExchange: PairingKeyExchange | null = null;
   /** Keypair for vault key exchange during live sync (gossip) */
   private vaultKeyExchangeKeypair: { publicKey: Uint8Array; secretKey: Uint8Array } | null = null;
+  /** Cached vault key status (updated when key is loaded/stored) */
+  private _hasVaultKey = false;
 
   constructor(
     private transport: Transport,
@@ -258,6 +260,23 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   setPairingKeyExchange(keyExchange: PairingKeyExchange): void {
     this.pairingKeyExchange = keyExchange;
     this.logger.debug("Pairing key exchange handler configured");
+
+    // Check if we already have the vault key and cache the status
+    keyExchange.hasVaultKey().then((has) => {
+      this._hasVaultKey = has;
+      this.logger.info(`Vault key status: ${has ? "available" : "not available"}`);
+    }).catch((err) => {
+      this.logger.error("Error checking vault key status:", err);
+    });
+  }
+
+  /**
+   * Update the cached vault key status.
+   * Call this after storing a vault key.
+   */
+  updateVaultKeyStatus(hasKey: boolean): void {
+    this._hasVaultKey = hasKey;
+    this.logger.info(`Vault key status updated: ${hasKey ? "available" : "not available"}`);
   }
 
   /**
@@ -292,24 +311,15 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
   } {
     const keypair = this.getVaultKeyExchangeKeypair();
 
-    // Check if we have the vault key synchronously - we'll use a cached value
-    // that gets updated when we load/store the key
-    let hasVaultKey = false;
-    if (this.pairingKeyExchange) {
-      // Note: This is a sync check at config creation time.
-      // The actual key availability will be checked in the callbacks.
-      // We set this to true if we have a pairingKeyExchange configured,
-      // since that's a prerequisite for having or receiving a vault key.
-      // The actual sharing happens via the callback which checks async.
-      this.pairingKeyExchange.hasVaultKey().then((has) => {
-        // This is fire-and-forget to update our local understanding,
-        // but the message uses the value at config creation time.
-      }).catch(() => {});
-      hasVaultKey = true; // Assume we might have it, callbacks will verify
-    }
+    // Use the cached vault key status (updated when key is loaded/stored)
+    // This is accurate because setPairingKeyExchange checks the status
+    // and onVaultKeyReceived updates it when we receive a key
+    const hasVaultKey = this._hasVaultKey;
+
+    this.logger.debug(`Creating vault key exchange config: hasVaultKey=${hasVaultKey}`);
 
     return {
-      // Report whether we have (or can have) the vault key
+      // Report whether we actually have the vault key
       hasVaultKey,
       vaultKeyExchangePublicKey: keypair.publicKey,
 
@@ -361,6 +371,9 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
           await this.pairingKeyExchange.storeVaultKey(vaultKey);
           this.logger.info("Stored vault key received from peer during gossip");
 
+          // Update cached status
+          this._hasVaultKey = true;
+
           // Emit event so the plugin can update cloud sync
           this.emit("vault:key-received", vaultKey);
           return true;
@@ -372,11 +385,10 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> {
 
       // Called when we learn peer's vault key status
       onPeerHasVaultKey: (peerHasVaultKey: boolean) => {
-        if (peerHasVaultKey && this.pairingKeyExchange) {
-          // If peer has the key and we don't, we might want to request it
-          // But this happens in live mode, so the session will handle it
-          this.logger.debug(`Peer reports hasVaultKey=${peerHasVaultKey}`);
-        }
+        this.logger.info(
+          `Peer vault key status: peer=${peerHasVaultKey}, us=${this._hasVaultKey}, ` +
+          `needsKey=${!this._hasVaultKey && peerHasVaultKey}`
+        );
       },
     };
   }
