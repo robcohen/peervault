@@ -844,6 +844,7 @@ impl WasmPeerVault {
         let pending_pairings = self.pending_pairings.clone();
         let known_peers = self.known_peers.clone();
         let blobs_bridge = self.blobs_bridge.clone();
+        let encryption_key = self.encryption_key.clone();
 
         future_to_promise(async move {
             // Create BlobsBridge with a MemStore for iroh-blobs transfer
@@ -876,6 +877,8 @@ impl WasmPeerVault {
             let on_event_for_accept = on_event.clone();
             let pending_pairings_for_accept = pending_pairings.clone();
             let known_peers_for_accept = known_peers.clone();
+            let encryption_key_for_accept = encryption_key.clone();
+            let blobs_bridge_for_accept = blobs_bridge.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 run_accept_loop(
                     transport_for_accept,
@@ -884,6 +887,8 @@ impl WasmPeerVault {
                     on_event_for_accept,
                     pending_pairings_for_accept,
                     known_peers_for_accept,
+                    encryption_key_for_accept,
+                    blobs_bridge_for_accept,
                 ).await;
             });
 
@@ -908,6 +913,7 @@ impl WasmPeerVault {
         let pending_pairings = self.pending_pairings.clone();
         let known_peers = self.known_peers.clone();
         let blobs_bridge = self.blobs_bridge.clone();
+        let encryption_key = self.encryption_key.clone();
 
         future_to_promise(async move {
             // Create BlobsBridge
@@ -942,6 +948,8 @@ impl WasmPeerVault {
             let on_event_for_accept = on_event.clone();
             let pending_pairings_for_accept = pending_pairings.clone();
             let known_peers_for_accept = known_peers.clone();
+            let encryption_key_for_accept = encryption_key.clone();
+            let blobs_bridge_for_accept = blobs_bridge.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 run_accept_loop(
                     transport_for_accept,
@@ -950,6 +958,8 @@ impl WasmPeerVault {
                     on_event_for_accept,
                     pending_pairings_for_accept,
                     known_peers_for_accept,
+                    encryption_key_for_accept,
+                    blobs_bridge_for_accept,
                 ).await;
             });
 
@@ -1118,9 +1128,10 @@ impl WasmPeerVault {
         let transport = self.transport.clone();
         let connections = self.connections.clone();
         let store = self.store.clone();
-        let _vault_id = self.vault_id;
         let device_name = self.device_name.clone();
         let on_event = self.on_event.clone();
+        let encryption_key = self.encryption_key.clone();
+        let blobs_bridge = self.blobs_bridge.clone();
         let ticket_str = ticket_str.to_string();
 
         // Convert JsValue to Option<String>
@@ -1129,93 +1140,128 @@ impl WasmPeerVault {
         } else {
             pairing_nonce.as_string()
         };
-        let our_device_name: Option<String> = if our_device_name.is_null() || our_device_name.is_undefined() {
-            Some(device_name.clone())
-        } else {
-            our_device_name.as_string().or(Some(device_name.clone()))
-        };
 
         future_to_promise(async move {
-            web_sys::console::log_1(&JsValue::from_str(&format!(
-                "[WASM] connectPeerWithPairing: parsing ticket, nonce={}",
-                pairing_nonce.as_deref().map(|n| &n[..16.min(n.len())]).unwrap_or("none")
-            )));
+            info!("connectPeer: parsing ticket, nonce={}",
+                pairing_nonce.as_deref().map(|n| &n[..16.min(n.len())]).unwrap_or("none"));
             let ticket = Ticket::from_string(&ticket_str)
                 .map_err(|e| JsValue::from_str(&format!("Invalid ticket: {}", e)))?;
 
             let peer_id = ticket.node_id.to_string();
-            web_sys::console::log_1(&JsValue::from_str(&format!("[WASM] connectPeer: peer_id={}", &peer_id[..16])));
+            info!("connectPeer: peer_id={}", &peer_id[..16.min(peer_id.len())]);
 
-            // Check if we already have an active connection to this peer
-            // (e.g., from an incoming connection they initiated)
-            {
+            // Helper: create SyncEngine from store + key
+            async fn create_sync_engine(
+                store: &Arc<RwLock<Option<LoroStore>>>,
+                enc_key: &Arc<RwLock<Option<VaultKey>>>,
+            ) -> Result<SyncEngine, JsValue> {
+                let store_guard = store.read().await;
+                let loro_store = store_guard.as_ref()
+                    .ok_or_else(|| JsValue::from_str("Store not initialized"))?;
+                let key_guard = enc_key.read().await;
+                let vault_key = key_guard.clone()
+                    .ok_or_else(|| JsValue::from_str("No encryption key"))?;
+                drop(key_guard);
+                let host = Arc::new(crate::host::mock::MockHost::new());
+                let engine = SyncEngine::new_with_key(host, vault_key)
+                    .map_err(|e| JsValue::from_str(&format!("SyncEngine: {}", e)))?;
+                let snapshot = loro_store.export_snapshot()
+                    .map_err(|e| JsValue::from_str(&format!("Export snapshot: {}", e)))?;
+                drop(store_guard);
+                engine.import_snapshot_raw(&snapshot)
+                    .map_err(|e| JsValue::from_str(&format!("Import snapshot: {}", e)))?;
+                Ok(engine)
+            }
+
+            // Helper: import results back
+            async fn import_engine_results(
+                engine: &SyncEngine,
+                store: &Arc<RwLock<Option<LoroStore>>>,
+            ) -> Result<(), JsValue> {
+                let updated = engine.export_snapshot_raw()
+                    .map_err(|e| JsValue::from_str(&format!("Export: {}", e)))?;
+                let store_guard = store.read().await;
+                let loro_store = store_guard.as_ref()
+                    .ok_or_else(|| JsValue::from_str("Store not initialized"))?;
+                loro_store.import_snapshot(&updated)
+                    .map_err(|e| JsValue::from_str(&format!("Import: {}", e)))?;
+                Ok(())
+            }
+
+            // Get or create connection
+            let mut stream = {
+                // Check existing connection
                 let connections_guard = connections.read().await;
                 if let Some(existing_conn) = connections_guard.get(&peer_id) {
                     if !existing_conn.is_closed() {
-                        web_sys::console::log_1(&JsValue::from_str(&format!(
-                            "[WASM] connectPeer: reusing existing connection to {}",
-                            &peer_id[..16]
-                        )));
-
-                        // Use existing connection for sync
-                        let store_guard = store.read().await;
-                        let loro_store = store_guard.as_ref()
-                            .ok_or_else(|| JsValue::from_str("Store not initialized"))?;
-
-                        // Open a stream on the existing connection
-                        let mut stream = existing_conn.open_stream()
-                            .await
-                            .map_err(|e| JsValue::from_str(&format!("Failed to open stream: {}", e)))?;
-
-                        // Run sync as initiator on existing connection
-                        run_initiator_sync(
-                            &peer_id, &mut stream, loro_store, &on_event,
-                            pairing_nonce.clone(), our_device_name.clone()
-                        ).await?;
-
-                        return Ok(JsValue::from_str(&peer_id));
+                        info!("connectPeer: reusing existing connection to {}", &peer_id[..16.min(peer_id.len())]);
+                        let s = existing_conn.open_stream().await
+                            .map_err(|e| JsValue::from_str(&format!("Open stream: {}", e)))?;
+                        drop(connections_guard);
+                        s
+                    } else {
+                        drop(connections_guard);
+                        // Fall through to new connection
+                        info!("connectPeer: connecting...");
+                        let connection = {
+                            let guard = transport.read().await;
+                            let t = guard.as_ref()
+                                .ok_or_else(|| JsValue::from_str("Transport not started"))?;
+                            t.connect(&ticket).await
+                                .map_err(|e| JsValue::from_str(&format!("Connect failed: {}", e)))?
+                        };
+                        connections.write().await.insert(peer_id.clone(), connection);
+                        let cg = connections.read().await;
+                        let conn = cg.get(&peer_id).ok_or_else(|| JsValue::from_str("Connection lost"))?;
+                        let s = conn.open_stream().await
+                            .map_err(|e| JsValue::from_str(&format!("Open stream: {}", e)))?;
+                        drop(cg);
+                        s
                     }
+                } else {
+                    drop(connections_guard);
+                    info!("connectPeer: connecting...");
+                    let connection = {
+                        let guard = transport.read().await;
+                        let t = guard.as_ref()
+                            .ok_or_else(|| JsValue::from_str("Transport not started"))?;
+                        t.connect(&ticket).await
+                            .map_err(|e| JsValue::from_str(&format!("Connect failed: {}", e)))?
+                    };
+                    info!("connectPeer: connected!");
+                    connections.write().await.insert(peer_id.clone(), connection);
+                    let cg = connections.read().await;
+                    let conn = cg.get(&peer_id).ok_or_else(|| JsValue::from_str("Connection lost"))?;
+                    let s = conn.open_stream().await
+                        .map_err(|e| JsValue::from_str(&format!("Open stream: {}", e)))?;
+                    drop(cg);
+                    s
                 }
-            }
-
-            // Connect to peer
-            web_sys::console::log_1(&JsValue::from_str("[WASM] connectPeer: connecting..."));
-            let connection = {
-                let guard = transport.read().await;
-                let t = guard.as_ref()
-                    .ok_or_else(|| JsValue::from_str("Transport not started"))?;
-
-                t.connect(&ticket)
-                    .await
-                    .map_err(|e| JsValue::from_str(&format!("Failed to connect: {}", e)))?
             };
-            web_sys::console::log_1(&JsValue::from_str("[WASM] connectPeer: connected!"));
 
-            // Store the connection
-            web_sys::console::log_1(&JsValue::from_str("[WASM] connectPeer: storing connection"));
-            connections.write().await.insert(peer_id.clone(), connection);
+            // Run V3 sync
+            let engine = create_sync_engine(&store, &encryption_key).await?;
 
-            // Get connection back for sync
-            let connections_guard = connections.read().await;
-            let conn = connections_guard.get(&peer_id)
-                .ok_or_else(|| JsValue::from_str("Connection lost"))?;
+            let bridge_guard = blobs_bridge.read().await;
+            let transport_guard = transport.read().await;
 
-            // Open a stream for sync
-            web_sys::console::log_1(&JsValue::from_str("[WASM] connectPeer: opening stream..."));
-            let mut stream = conn.open_stream()
-                .await
-                .map_err(|e| JsValue::from_str(&format!("Failed to open stream: {}", e)))?;
-            web_sys::console::log_1(&JsValue::from_str("[WASM] connectPeer: stream opened!"));
-
-            // Run sync as initiator
-            let store_guard = store.read().await;
-            let loro_store = store_guard.as_ref()
-                .ok_or_else(|| JsValue::from_str("Store not initialized"))?;
-
-            run_initiator_sync(
-                &peer_id, &mut stream, loro_store, &on_event,
-                pairing_nonce, our_device_name
+            run_initiator_sync_v3(
+                &peer_id,
+                &mut stream,
+                &engine,
+                &device_name,
+                None,
+                None,
+                pairing_nonce,
+                bridge_guard.as_ref(),
+                transport_guard.as_ref().map(|t| t.endpoint()),
+                &on_event,
             ).await?;
+
+            drop(bridge_guard);
+            drop(transport_guard);
+
+            import_engine_results(&engine, &store).await?;
 
             Ok(JsValue::from_str(&peer_id))
         })
@@ -1606,10 +1652,472 @@ impl WasmPeerVault {
 }
 
 // =============================================================================
-// Accept Loop
+// V3 Sync Protocol (binary, async, with pairing + blobs)
 // =============================================================================
 
 use tracing::{info, warn, debug, error};
+
+use crate::blobs_bridge::BlobsBridge;
+use crate::protocol::sync::{self as proto, Message as SyncMessage, PROTOCOL_VERSION};
+
+/// Send a binary protocol message on an IrohStream
+async fn send_sync_msg(stream: &mut IrohStream, msg: &SyncMessage) -> Result<(), String> {
+    let data = msg.encode().map_err(|e| format!("encode: {}", e))?;
+    stream.send(&data).await.map_err(|e| format!("send: {}", e))
+}
+
+/// Receive a binary protocol message from an IrohStream
+async fn recv_sync_msg(stream: &mut IrohStream) -> Result<SyncMessage, String> {
+    let data = stream.recv().await.map_err(|e| format!("recv: {}", e))?;
+    SyncMessage::decode(&data).map_err(|e| format!("decode: {}", e))
+}
+
+/// Pairing validation using snapshots of known_peers + pending_pairings.
+/// Takes snapshots to avoid holding locks during sync.
+struct PairingValidation {
+    is_known: bool,
+    is_new_peer: bool,
+    consumed_nonce: Option<String>,
+}
+
+/// Validate a peer's pairing status.
+/// Returns Ok(PairingValidation) if accepted, Err(reason) if rejected.
+fn validate_pairing(
+    peer_id: &str,
+    pairing_nonce: Option<&str>,
+    known_peers: &std::collections::HashMap<String, u64>,
+    pending_pairings: &std::collections::HashMap<String, u64>,
+) -> Result<PairingValidation, String> {
+    // Known peer — always accept
+    if known_peers.contains_key(peer_id) {
+        return Ok(PairingValidation {
+            is_known: true,
+            is_new_peer: false,
+            consumed_nonce: None,
+        });
+    }
+
+    // Unknown peer — must have valid nonce
+    let nonce = pairing_nonce.ok_or_else(|| "Unknown peer, pairing nonce required".to_string())?;
+
+    let expires_at = pending_pairings.get(nonce)
+        .ok_or_else(|| format!("Unknown pairing nonce: {}...", &nonce[..16.min(nonce.len())]))?;
+
+    let now = web_time::SystemTime::now()
+        .duration_since(web_time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    if now > *expires_at {
+        return Err("Pairing nonce expired".to_string());
+    }
+
+    Ok(PairingValidation {
+        is_known: false,
+        is_new_peer: true,
+        consumed_nonce: Some(nonce.to_string()),
+    })
+}
+
+/// Run sync as INITIATOR using V3 binary protocol.
+///
+/// Protocol: VersionInfo → Updates → BlobHashes → BlobTransfer → SyncComplete
+async fn run_initiator_sync_v3(
+    peer_id: &str,
+    stream: &mut IrohStream,
+    engine: &SyncEngine,
+    hostname: &str,
+    nickname: Option<&str>,
+    plugin_version: Option<&str>,
+    pairing_nonce: Option<String>,
+    blobs_bridge: Option<&BlobsBridge>,
+    endpoint: Option<&iroh::Endpoint>,
+    on_event: &Option<Function>,
+) -> Result<(), JsValue> {
+    let map_err = |e: String| JsValue::from_str(&e);
+
+    // Phase 1: Send our VERSION_INFO (initiator sends first)
+    let our_info = proto::VersionInfo {
+        protocol_version: PROTOCOL_VERSION,
+        vault_id: *engine.vault_id(),
+        version_bytes: engine.version_vector(),
+        hostname: hostname.to_string(),
+        nickname: nickname.map(|s| s.to_string()),
+        has_vault_key: true,
+        plugin_version: plugin_version.map(|s| s.to_string()),
+        pairing_nonce,
+        supports_iroh_blobs: true,
+    };
+    send_sync_msg(stream, &SyncMessage::VersionInfo(our_info)).await.map_err(map_err)?;
+
+    // Receive peer's VERSION_INFO
+    let peer_info = match recv_sync_msg(stream).await.map_err(map_err)? {
+        SyncMessage::VersionInfo(info) => info,
+        SyncMessage::Error(e) => {
+            return Err(JsValue::from_str(&format!("Peer rejected: {} (code {})", e.message, e.code)));
+        }
+        other => {
+            return Err(JsValue::from_str(&format!("Expected VersionInfo, got {:?}", other.message_type())));
+        }
+    };
+
+    // Validate vault ID
+    if peer_info.vault_id != *engine.vault_id() {
+        let err = SyncMessage::Error(proto::SyncError {
+            code: proto::error_codes::VAULT_MISMATCH,
+            message: "Vault ID mismatch".into(),
+        });
+        let _ = send_sync_msg(stream, &err).await;
+        return Err(JsValue::from_str("Vault ID mismatch"));
+    }
+
+    info!("Initiator: connected to {} (v{}, iroh-blobs={})",
+        peer_info.hostname, peer_info.protocol_version, peer_info.supports_iroh_blobs);
+
+    // Phase 2: Exchange CRDT updates
+    let updates = engine.export_updates_since(&peer_info.version_bytes)
+        .map_err(|e| JsValue::from_str(&format!("Export updates failed: {}", e)))?;
+    let updates_len = updates.len();
+    send_sync_msg(stream, &SyncMessage::Updates(proto::Updates {
+        data: updates,
+        op_count: 0,
+    })).await.map_err(map_err)?;
+
+    // Receive peer's updates
+    let mut updates_received = 0;
+    loop {
+        match recv_sync_msg(stream).await.map_err(map_err)? {
+            SyncMessage::Updates(updates) => {
+                engine.import_updates(&updates.data)
+                    .map_err(|e| JsValue::from_str(&format!("Import updates failed: {}", e)))?;
+                updates_received += 1;
+            }
+            SyncMessage::SyncComplete(complete) => {
+                // Peer completed — send our completion
+                let our_complete = SyncMessage::SyncComplete(proto::SyncComplete {
+                    version_bytes: engine.version_vector(),
+                });
+                send_sync_msg(stream, &our_complete).await.map_err(map_err)?;
+                break;
+            }
+            SyncMessage::Error(e) => {
+                return Err(JsValue::from_str(&format!("Sync error: {}", e.message)));
+            }
+            _ => continue,
+        }
+    }
+
+    // Phase 3: Blob exchange (V3 via iroh-blobs if both support it)
+    if peer_info.supports_iroh_blobs {
+        if let (Some(bridge), Some(ep)) = (blobs_bridge, endpoint) {
+            // Exchange blob hashes
+            let our_hashes = bridge.list_host_hashes().await
+                .map_err(|e| JsValue::from_str(&format!("List blobs failed: {}", e)))?;
+
+            send_sync_msg(stream, &SyncMessage::BlobHashes(proto::BlobHashes {
+                hashes: our_hashes.clone(),
+            })).await.map_err(map_err)?;
+
+            let peer_hashes = match recv_sync_msg(stream).await.map_err(map_err)? {
+                SyncMessage::BlobHashes(bh) => bh.hashes,
+                SyncMessage::BlobSyncComplete(_) => vec![], // peer has no blobs
+                other => {
+                    warn!("Expected BlobHashes, got {:?}", other.message_type());
+                    vec![]
+                }
+            };
+
+            // Compute diffs
+            let our_set: std::collections::HashSet<_> = our_hashes.iter().collect();
+            let peer_set: std::collections::HashSet<_> = peer_hashes.iter().collect();
+            let need: Vec<_> = peer_hashes.iter().filter(|h| !our_set.contains(h)).cloned().collect();
+            let send: Vec<_> = our_hashes.iter().filter(|h| !peer_set.contains(h)).cloned().collect();
+
+            if !need.is_empty() || !send.is_empty() {
+                let peer_endpoint_id: iroh::EndpointId = peer_id.parse()
+                    .map_err(|e| JsValue::from_str(&format!("Invalid peer ID: {}", e)))?;
+
+                bridge.exchange_blobs_v3(ep, peer_endpoint_id, &need, &send).await
+                    .map_err(|e| JsValue::from_str(&format!("Blob transfer failed: {}", e)))?;
+            }
+
+            // Signal completion
+            send_sync_msg(stream, &SyncMessage::BlobSyncComplete(proto::BlobSyncComplete {
+                blob_count: 0,
+            })).await.map_err(map_err)?;
+
+            // Wait for peer's completion
+            loop {
+                match recv_sync_msg(stream).await.map_err(map_err)? {
+                    SyncMessage::BlobSyncComplete(_) => break,
+                    _ => continue,
+                }
+            }
+        }
+    }
+
+    // Emit sync_complete event
+    if let Some(ref callback) = on_event {
+        let event = serde_json::json!({
+            "type": "sync_complete",
+            "peer_id": peer_id,
+            "direction": "outgoing",
+            "updates_received": updates_received,
+            "updates_sent": 1,
+        });
+        let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(&event.to_string()));
+    }
+
+    Ok(())
+}
+
+/// Handle incoming streams using V3 binary protocol (acceptor side).
+async fn handle_incoming_streams_v3(
+    peer_id: String,
+    connections: Arc<RwLock<HashMap<String, IrohConnection>>>,
+    store: Arc<RwLock<Option<LoroStore>>>,
+    on_event: Option<Function>,
+    pending_pairings: Arc<RwLock<HashMap<String, u64>>>,
+    known_peers: Arc<RwLock<HashMap<String, u64>>>,
+    encryption_key: Arc<RwLock<Option<VaultKey>>>,
+    blobs_bridge_arc: Arc<RwLock<Option<BlobsBridge>>>,
+    transport: Arc<RwLock<Option<IrohTransport>>>,
+) {
+    let result = handle_incoming_streams_v3_inner(
+        &peer_id, &connections, &store, &on_event,
+        &pending_pairings, &known_peers, &encryption_key,
+        &blobs_bridge_arc, &transport,
+    ).await;
+
+    if let Err(e) = result {
+        warn!("Incoming sync from {} failed: {:?}", &peer_id[..16.min(peer_id.len())], e);
+    }
+}
+
+async fn handle_incoming_streams_v3_inner(
+    peer_id: &str,
+    connections: &Arc<RwLock<HashMap<String, IrohConnection>>>,
+    store: &Arc<RwLock<Option<LoroStore>>>,
+    on_event: &Option<Function>,
+    pending_pairings: &Arc<RwLock<HashMap<String, u64>>>,
+    known_peers: &Arc<RwLock<HashMap<String, u64>>>,
+    encryption_key: &Arc<RwLock<Option<VaultKey>>>,
+    blobs_bridge_arc: &Arc<RwLock<Option<BlobsBridge>>>,
+    transport: &Arc<RwLock<Option<IrohTransport>>>,
+) -> Result<(), JsValue> {
+    let map_err = |e: String| JsValue::from_str(&e);
+
+    // Accept a stream from the connection
+    let connections_guard = connections.read().await;
+    let conn = connections_guard.get(peer_id)
+        .ok_or_else(|| JsValue::from_str("Connection lost"))?;
+    let mut stream = conn.accept_stream().await
+        .map_err(|e| JsValue::from_str(&format!("Accept stream failed: {}", e)))?;
+    drop(connections_guard);
+
+    // Phase 1: Receive initiator's VERSION_INFO
+    let peer_info = match recv_sync_msg(&mut stream).await.map_err(map_err)? {
+        SyncMessage::VersionInfo(info) => info,
+        other => {
+            return Err(JsValue::from_str(&format!("Expected VersionInfo, got {:?}", other.message_type())));
+        }
+    };
+
+    info!("Acceptor: received VersionInfo from {} (v{}, nonce={})",
+        peer_info.hostname, peer_info.protocol_version,
+        peer_info.pairing_nonce.as_deref().map(|n| &n[..16.min(n.len())]).unwrap_or("none"));
+
+    // Validate pairing (take snapshots to avoid holding locks)
+    let known_snap: std::collections::HashMap<String, u64> = known_peers.read().await.clone();
+    let pending_snap: std::collections::HashMap<String, u64> = pending_pairings.read().await.clone();
+
+    let validation = match validate_pairing(
+        peer_id,
+        peer_info.pairing_nonce.as_deref(),
+        &known_snap,
+        &pending_snap,
+    ) {
+        Ok(v) => v,
+        Err(reason) => {
+            warn!("Pairing rejected for {}: {}", &peer_id[..16.min(peer_id.len())], reason);
+            let err = SyncMessage::Error(proto::SyncError {
+                code: proto::error_codes::PAIRING_REJECTED,
+                message: reason,
+            });
+            let _ = send_sync_msg(&mut stream, &err).await;
+            return Err(JsValue::from_str("Pairing rejected"));
+        }
+    };
+
+    // Update state if newly paired
+    if validation.is_new_peer {
+        if let Some(nonce) = &validation.consumed_nonce {
+            pending_pairings.write().await.remove(nonce);
+        }
+        known_peers.write().await.insert(
+            peer_id.to_string(),
+            web_time::SystemTime::now()
+                .duration_since(web_time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        );
+
+        // Emit pairing_complete event
+        if let Some(ref callback) = on_event {
+            let event = serde_json::json!({
+                "type": "pairing_complete",
+                "peer_id": peer_id,
+                "device_name": peer_info.hostname,
+            });
+            let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(&event.to_string()));
+        }
+    }
+
+    // Get encryption key and store
+    let key_guard = encryption_key.read().await;
+    let vault_key = key_guard.clone()
+        .ok_or_else(|| JsValue::from_str("No encryption key"))?;
+    drop(key_guard);
+
+    let store_guard = store.read().await;
+    let loro_store = store_guard.as_ref()
+        .ok_or_else(|| JsValue::from_str("Store not initialized"))?;
+
+    // Create SyncEngine for this sync session
+    let host = Arc::new(crate::host::mock::MockHost::new());
+    let engine = SyncEngine::new_with_key(host, vault_key)
+        .map_err(|e| JsValue::from_str(&format!("SyncEngine failed: {}", e)))?;
+    let snapshot = loro_store.export_snapshot()
+        .map_err(|e| JsValue::from_str(&format!("Export snapshot failed: {}", e)))?;
+    engine.import_snapshot_raw(&snapshot)
+        .map_err(|e| JsValue::from_str(&format!("Import snapshot failed: {}", e)))?;
+
+    // Validate vault ID
+    if peer_info.vault_id != *engine.vault_id() {
+        let err = SyncMessage::Error(proto::SyncError {
+            code: proto::error_codes::VAULT_MISMATCH,
+            message: "Vault ID mismatch".into(),
+        });
+        let _ = send_sync_msg(&mut stream, &err).await;
+        return Err(JsValue::from_str("Vault ID mismatch"));
+    }
+
+    // Send our VERSION_INFO (acceptor sends after receiving)
+    let our_info = proto::VersionInfo {
+        protocol_version: PROTOCOL_VERSION,
+        vault_id: *engine.vault_id(),
+        version_bytes: engine.version_vector(),
+        hostname: "PeerVault".to_string(), // TODO: use device_name from WasmPeerVault
+        nickname: None,
+        has_vault_key: true,
+        plugin_version: None,
+        pairing_nonce: None, // acceptor never sends nonce
+        supports_iroh_blobs: true,
+    };
+    send_sync_msg(&mut stream, &SyncMessage::VersionInfo(our_info)).await.map_err(map_err)?;
+
+    // Phase 2: Exchange CRDT updates
+    let updates = engine.export_updates_since(&peer_info.version_bytes)
+        .map_err(|e| JsValue::from_str(&format!("Export updates failed: {}", e)))?;
+    send_sync_msg(&mut stream, &SyncMessage::Updates(proto::Updates {
+        data: updates,
+        op_count: 0,
+    })).await.map_err(map_err)?;
+
+    // Receive peer's updates and wait for SyncComplete
+    let mut updates_received = 0;
+    loop {
+        match recv_sync_msg(&mut stream).await.map_err(map_err)? {
+            SyncMessage::Updates(updates) => {
+                engine.import_updates(&updates.data)
+                    .map_err(|e| JsValue::from_str(&format!("Import failed: {}", e)))?;
+                updates_received += 1;
+            }
+            SyncMessage::SyncComplete(complete) => {
+                let our_complete = SyncMessage::SyncComplete(proto::SyncComplete {
+                    version_bytes: engine.version_vector(),
+                });
+                send_sync_msg(&mut stream, &our_complete).await.map_err(map_err)?;
+                break;
+            }
+            SyncMessage::Error(e) => {
+                return Err(JsValue::from_str(&format!("Peer error: {}", e.message)));
+            }
+            _ => continue,
+        }
+    }
+
+    // Phase 3: Blob exchange (V3 via iroh-blobs)
+    if peer_info.supports_iroh_blobs {
+        let bridge_guard = blobs_bridge_arc.read().await;
+        let transport_guard = transport.read().await;
+        if let (Some(bridge), Some(tp)) = (bridge_guard.as_ref(), transport_guard.as_ref()) {
+            let our_hashes = bridge.list_host_hashes().await
+                .map_err(|e| JsValue::from_str(&format!("List blobs failed: {}", e)))?;
+
+            send_sync_msg(&mut stream, &SyncMessage::BlobHashes(proto::BlobHashes {
+                hashes: our_hashes.clone(),
+            })).await.map_err(map_err)?;
+
+            let peer_hashes = match recv_sync_msg(&mut stream).await.map_err(map_err)? {
+                SyncMessage::BlobHashes(bh) => bh.hashes,
+                SyncMessage::BlobSyncComplete(_) => vec![],
+                other => {
+                    warn!("Expected BlobHashes, got {:?}", other.message_type());
+                    vec![]
+                }
+            };
+
+            let our_set: std::collections::HashSet<_> = our_hashes.iter().collect();
+            let peer_set: std::collections::HashSet<_> = peer_hashes.iter().collect();
+            let need: Vec<_> = peer_hashes.iter().filter(|h| !our_set.contains(h)).cloned().collect();
+            let send: Vec<_> = our_hashes.iter().filter(|h| !peer_set.contains(h)).cloned().collect();
+
+            if !need.is_empty() || !send.is_empty() {
+                let peer_endpoint_id: iroh::EndpointId = peer_id.parse()
+                    .map_err(|e| JsValue::from_str(&format!("Invalid peer ID: {}", e)))?;
+                bridge.exchange_blobs_v3(tp.endpoint(), peer_endpoint_id, &need, &send).await
+                    .map_err(|e| JsValue::from_str(&format!("Blob transfer: {}", e)))?;
+            }
+
+            send_sync_msg(&mut stream, &SyncMessage::BlobSyncComplete(proto::BlobSyncComplete {
+                blob_count: 0,
+            })).await.map_err(map_err)?;
+
+            loop {
+                match recv_sync_msg(&mut stream).await.map_err(map_err)? {
+                    SyncMessage::BlobSyncComplete(_) => break,
+                    _ => continue,
+                }
+            }
+        }
+    }
+
+    // Import updated state back to LoroStore
+    let updated_snapshot = engine.export_snapshot_raw()
+        .map_err(|e| JsValue::from_str(&format!("Export snapshot: {}", e)))?;
+    loro_store.import_snapshot(&updated_snapshot)
+        .map_err(|e| JsValue::from_str(&format!("Import snapshot: {}", e)))?;
+    drop(store_guard);
+
+    // Emit sync_complete event
+    if let Some(ref callback) = on_event {
+        let event = serde_json::json!({
+            "type": "sync_complete",
+            "peer_id": peer_id,
+            "direction": "incoming",
+            "updates_received": updates_received,
+            "updates_sent": 1,
+        });
+        let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(&event.to_string()));
+    }
+
+    Ok(())
+}
+
+// =============================================================================
+// Accept Loop
+// =============================================================================
 
 /// Background accept loop for incoming peer connections
 ///
@@ -1622,8 +2130,10 @@ async fn run_accept_loop(
     on_event: Option<Function>,
     pending_pairings: Arc<RwLock<HashMap<String, u64>>>,
     known_peers: Arc<RwLock<HashMap<String, u64>>>,
+    encryption_key: Arc<RwLock<Option<VaultKey>>>,
+    blobs_bridge: Arc<RwLock<Option<BlobsBridge>>>,
 ) {
-    web_sys::console::log_1(&JsValue::from_str("[WASM] Accept loop started"));
+    info!("Accept loop started");
 
     loop {
         // Get transport reference
@@ -1631,7 +2141,7 @@ async fn run_accept_loop(
         let iroh = match transport_guard.as_ref() {
             Some(t) => t,
             None => {
-                web_sys::console::log_1(&JsValue::from_str("[WASM] Accept loop: transport not available"));
+                info!("Accept loop: transport not available");
                 break;
             }
         };
@@ -1640,7 +2150,7 @@ async fn run_accept_loop(
         match iroh.accept().await {
             Ok(connection) => {
                 let peer_id = connection.peer_id().to_string();
-                web_sys::console::log_1(&JsValue::from_str(&format!("[WASM] Accept loop: accepted connection from {}", &peer_id[..16])));
+                info!("Accept loop: accepted connection from {}", &peer_id[..16.min(peer_id.len())]);
 
                 // Store the connection
                 connections.write().await.insert(peer_id.clone(), connection);
@@ -1658,27 +2168,31 @@ async fn run_accept_loop(
                     );
                 }
 
-                // Spawn a task to handle streams from this connection
+                // Spawn V3 handler for this connection
                 let connections_clone = connections.clone();
                 let store_clone = store.clone();
                 let on_event_clone = on_event.clone();
-                let peer_id_clone = peer_id.clone();
                 let pending_pairings_clone = pending_pairings.clone();
                 let known_peers_clone = known_peers.clone();
+                let encryption_key_clone = encryption_key.clone();
+                let blobs_bridge_clone = blobs_bridge.clone();
+                let transport_clone = transport.clone();
 
                 wasm_bindgen_futures::spawn_local(async move {
-                    handle_incoming_streams(
-                        peer_id_clone,
+                    handle_incoming_streams_v3(
+                        peer_id,
                         connections_clone,
                         store_clone,
                         on_event_clone,
                         pending_pairings_clone,
                         known_peers_clone,
+                        encryption_key_clone,
+                        blobs_bridge_clone,
+                        transport_clone,
                     ).await;
                 });
             }
             Err(e) => {
-                // Check if this is a shutdown or a real error
                 let err_str = format!("{}", e);
                 if err_str.contains("closed") || err_str.contains("shutdown") {
                     debug!("Transport closed, stopping accept loop");
@@ -1700,6 +2214,10 @@ async fn run_accept_loop(
 
     info!("Accept loop stopped");
 }
+
+// Old sync implementations (run_initiator_sync, handle_incoming_streams,
+// PairingHandshake, PairingResponse) have been replaced by the V3 binary
+// protocol functions above (run_initiator_sync_v3, handle_incoming_streams_v3).
 
 /// Run sync protocol as initiator on an open stream
 ///

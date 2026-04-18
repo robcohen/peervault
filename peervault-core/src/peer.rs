@@ -13,7 +13,14 @@ use crate::sync::{SyncEngine, SyncSession};
 use crate::blob::BlobStore;
 use crate::keys::KeyManager;
 use crate::error::CoreError;
-use crate::net::sync_runner::SyncConfig;
+/// Configuration for sync session (local definition, replaces net::sync_runner::SyncConfig)
+pub struct SyncConfig {
+    pub vault_id: [u8; 32],
+    pub hostname: String,
+    pub nickname: Option<String>,
+    pub has_vault_key: bool,
+    pub plugin_version: Option<String>,
+}
 use crate::{CoreConfig, PeerInfo, SyncResult};
 
 /// Manages connections and sync sessions with peers
