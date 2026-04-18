@@ -71,8 +71,12 @@ export class VaultController {
           if (!overwrite) {
             throw new Error('File already exists.');
           }
-          // Delete existing to replace
-          await vault.delete(existing);
+          // Delete existing to replace (ignore errors if already deleted)
+          try {
+            await vault.delete(existing);
+          } catch (e) {
+            // File may have been deleted concurrently, ignore
+          }
         }
 
         // Create the file

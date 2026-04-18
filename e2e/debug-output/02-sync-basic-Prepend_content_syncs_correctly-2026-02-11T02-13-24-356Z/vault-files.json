@@ -1,0 +1,26 @@
+{
+  "TEST": [
+    "prepend-test.md",
+    "append-test.md",
+    "rapid-modify.md",
+    "links-test.md",
+    "frontmatter-test.md",
+    "batch/file-3.md",
+    "batch/file-2.md",
+    "batch/file-1.md",
+    "sync-test-2.md",
+    "sync-test-1.md"
+  ],
+  "TEST2": [
+    "prepend-test.md",
+    "append-test.md",
+    "rapid-modify.md",
+    "links-test.md",
+    "frontmatter-test.md",
+    "batch/file-3.md",
+    "batch/file-2.md",
+    "batch/file-1.md",
+    "sync-test-2.md",
+    "sync-test-1.md"
+  ]
+}

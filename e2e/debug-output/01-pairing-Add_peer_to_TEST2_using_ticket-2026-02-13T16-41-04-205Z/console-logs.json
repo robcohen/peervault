@@ -1,0 +1,19 @@
+{
+  "total": {
+    "TEST": 0,
+    "TEST2": 22
+  },
+  "TEST": [],
+  "TEST2": [
+    "[log] [PeerVault] Using shared encryption key from pairing ticket",
+    "[log] [PeerVault] Using shared encryption key from pairing ticket",
+    "[log] [PeerVault] Connecting to peer with nonce: 806c230752a59174...",
+    "[log] [PeerVault] Connecting to peer with nonce: 806c230752a59174...",
+    "[log] [WASM] connectPeerWithPairing: parsing ticket, nonce=806c230752a59174",
+    "[log] [WASM] connectPeerWithPairing: parsing ticket, nonce=806c230752a59174",
+    "[log] [WASM] connectPeer: peer_id=b7c209043d1ebb83",
+    "[log] [WASM] connectPeer: peer_id=b7c209043d1ebb83",
+    "[log] [WASM] connectPeer: connecting...",
+    "[log] [WASM] connectPeer: connecting..."
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "TEST": [
+    "frontmatter-test.md",
+    "sync-test-1.md",
+    "batch/file-3.md",
+    "batch/file-2.md",
+    "batch/file-1.md"
+  ],
+  "TEST2": [
+    "links-test.md",
+    "sync-test-2.md",
+    "sync-test-1.md"
+  ]
+}

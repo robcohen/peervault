@@ -11,6 +11,7 @@ import {
   assertFileNotExists,
   assertNotInCrdt,
 } from "../../lib/assertions";
+import { delay } from "../../config";
 
 export default [
   {
@@ -58,7 +59,7 @@ export default [
 
   {
     name: "Delete folder removes all contents on both vaults",
-    parallel: true,
+    parallel: false, // Sequential for debugging
     async fn(ctx: TestContext) {
       await ctx.test.vault.createFile("delete-folder/file-1.md", "File 1");
       await ctx.test.vault.createFile("delete-folder/file-2.md", "File 2");
@@ -92,7 +93,7 @@ export default [
       await ctx.test2.sync.waitForFileDeletion(path);
 
       // Wait for CRDT to update and sync
-      await new Promise((r) => setTimeout(r, 2000));
+      await delay(2000);
 
       // Check that the file is not in the vault (the important thing)
       const testVaultFiles = await ctx.test.vault.listFiles();
@@ -117,21 +118,30 @@ export default [
 
   {
     name: "Create file with same name after delete",
-    parallel: true,
+    parallel: false, // Sequential for debugging
     async fn(ctx: TestContext) {
       const path = "recreate-test.md";
 
+      // Step 1: Create and sync
       await ctx.test.vault.createFile(path, "Version 1");
       await ctx.test2.sync.waitForFile(path);
+      console.log("  Step 1: File created and synced");
 
+      // Step 2: Delete and sync deletion
       await ctx.test.vault.deleteFile(path);
       await ctx.test2.sync.waitForFileDeletion(path);
+      console.log("  Step 2: File deleted and deletion synced");
 
-      // Short wait before recreating
-      await new Promise((r) => setTimeout(r, 500));
+      // Wait for CRDT to converge after deletion
+      await ctx.waitForConvergence(10000);
 
+      // Step 3: Recreate on TEST2
       await ctx.test2.vault.createFile(path, "Version 2 - Recreated");
+      console.log("  Step 3: File recreated on TEST2");
+
+      // Step 4: Wait for file to sync to TEST
       await ctx.test.sync.waitForFile(path);
+      console.log("  Step 4: File synced to TEST");
 
       const content = await ctx.test.vault.readFile(path);
       if (!content.includes("Version 2")) {

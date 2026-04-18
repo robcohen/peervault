@@ -4,6 +4,7 @@
  * Tests syncing binary files (images, etc.) between vaults.
  */
 
+import { delay } from "../../config";
 import type { TestContext } from "../../lib/context";
 import {
   assert,
@@ -24,7 +25,7 @@ export default [
       console.log("  Binary file exists in TEST vault");
 
       // Wait for debounce (vault sync debounces file changes)
-      await new Promise((r) => setTimeout(r, 500));
+      await delay(500);
 
       // Check if file is tracked in TEST's CRDT
       let crdtFiles1 = await ctx.test.plugin.getCrdtFiles();
@@ -35,14 +36,14 @@ export default [
       if (!inCrdt1) {
         console.log("  File not in CRDT, triggering sync...");
         await ctx.test.plugin.sync();
-        await new Promise((r) => setTimeout(r, 1000));
+        await delay(1000);
         crdtFiles1 = await ctx.test.plugin.getCrdtFiles();
         inCrdt1 = crdtFiles1.includes("test-image.png");
         console.log(`  After sync - File in TEST CRDT: ${inCrdt1} (${crdtFiles1.length} files total)`);
       }
 
       // Give the live sync a moment
-      await new Promise((r) => setTimeout(r, 2000));
+      await delay(2000);
 
       // Check CRDT state on TEST2
       const crdtFiles2 = await ctx.test2.plugin.getCrdtFiles();
@@ -64,7 +65,7 @@ export default [
       // Wait a bit longer and check again
       if (blobInfo2.missingHashes.length > 0) {
         console.log("  TEST2 has missing blobs, waiting for automatic transfer...");
-        await new Promise((r) => setTimeout(r, 3000));
+        await delay(3000);
         const blobInfo2After = await ctx.test2.plugin.getBlobStoreInfo();
         console.log(`  After wait - TEST2 blob store: ${blobInfo2After.blobCount} blobs, ${blobInfo2After.missingHashes.length} missing`);
         const blobRecvCountAfter = await ctx.test2.plugin.getBlobReceivedCount();
@@ -120,6 +121,7 @@ export default [
 
   {
     name: "Create and sync inline binary file",
+    tags: ["slow"], // Requires full blob sync which mock transport may not support
     async fn(ctx: TestContext) {
       // Create a small binary file (fake PNG header)
       const binary = new Uint8Array([
@@ -136,7 +138,7 @@ export default [
       console.log("  Created inline binary file");
 
       // Wait for CRDT sync (debounce)
-      await new Promise((r) => setTimeout(r, 1000));
+      await delay(1000);
 
       // Check CRDT status on both sides
       const crdtFiles2 = await ctx.test2.plugin.getCrdtFiles();
@@ -144,7 +146,7 @@ export default [
       console.log(`  File in TEST2 CRDT: ${inCrdt2}`);
 
       // Wait for live sync to transfer CRDT update
-      await new Promise((r) => setTimeout(r, 2000));
+      await delay(2000);
 
       const crdtFiles1 = await ctx.test.plugin.getCrdtFiles();
       const inCrdt1 = crdtFiles1.includes("inline-binary.png");
@@ -177,6 +179,7 @@ export default [
 
   {
     name: "Modify binary file syncs correctly",
+    tags: ["slow"], // Depends on inline binary test
     async fn(ctx: TestContext) {
       // Create modified version with larger size
       const modified = new Uint8Array([
@@ -196,7 +199,7 @@ export default [
       console.log(`  Modified binary file (${modified.length} bytes)`);
 
       // Wait for CRDT sync
-      await new Promise((r) => setTimeout(r, 3000));
+      await delay(3000);
 
       // Force syncFromDocument on TEST to write the modified file
       console.log("  Triggering syncFromDocument on TEST...");
@@ -220,13 +223,14 @@ export default [
 
   {
     name: "Delete binary file syncs correctly",
+    tags: ["slow"], // Depends on inline binary test
     async fn(ctx: TestContext) {
       // Delete from TEST
       await ctx.test.vault.deleteFile("inline-binary.png");
       console.log("  Deleted binary file from TEST");
 
       // Wait for CRDT sync
-      await new Promise((r) => setTimeout(r, 3000));
+      await delay(3000);
 
       // Force syncFromDocument on TEST2 to apply the deletion
       await ctx.test2.client.evaluate(`

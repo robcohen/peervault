@@ -4,6 +4,7 @@
  * Tests syncing files with special names, unicode, deep nesting, etc.
  */
 
+import { delay } from "../../config";
 import type { TestContext } from "../../lib/context";
 import {
   assert,
@@ -17,7 +18,7 @@ export default [
     name: "Ensure sync sessions active before edge-cases",
     async fn(ctx: TestContext) {
       // Small delay to let Obsidian stabilize after error-recovery tests
-      await new Promise((r) => setTimeout(r, 2000));
+      await delay(2000);
 
       const test1Active = await ctx.test.plugin.ensureActiveSessions();
       const test2Active = await ctx.test2.plugin.ensureActiveSessions();

@@ -1,0 +1,12 @@
+Test: Add peer to TEST using ticket (bidirectional)
+Suite: 01-pairing
+
+Error: Connection lost
+
+Stack:
+Error: Connection lost
+    at fn (/home/user/Documents/my-projects/peervault/e2e/tests/01-pairing/01-invite.test.ts:131:21)
+    at async runTest (/home/user/Documents/my-projects/peervault/e2e/lib/context.ts:408:11)
+    at async runTestWithRetry (/home/user/Documents/my-projects/peervault/e2e/runner.ts:321:26)
+    at async runSuite (/home/user/Documents/my-projects/peervault/e2e/runner.ts:1145:30)
+    at async main (/home/user/Documents/my-projects/peervault/e2e/runner.ts:1430:13)

@@ -1,0 +1,4 @@
+{
+  "TEST": "[\"batch/file-3.md\",\"sync-test-1.md\",\"sync-test-2.md\"]",
+  "TEST2": "[\"links-test.md\",\"sync-test-1.md\",\"sync-test-2.md\"]"
+}

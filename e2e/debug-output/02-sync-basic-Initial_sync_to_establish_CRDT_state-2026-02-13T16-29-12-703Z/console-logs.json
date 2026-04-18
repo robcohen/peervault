@@ -1,0 +1,16 @@
+{
+  "total": {
+    "TEST": 1000,
+    "TEST2": 1000
+  },
+  "TEST": [
+    "[log] [PeerVault] syncAll: CRDT has 0 files before sync",
+    "[log] [PeerVault] syncAll: CRDT has 0 files before sync",
+    "[log] [PeerVault] syncAll: CRDT has 0 files before sync"
+  ],
+  "TEST2": [
+    "[log] [PeerVault] syncAll: CRDT has 0 files before sync",
+    "[log] [PeerVault] syncAll: CRDT has 0 files before sync",
+    "[log] [PeerVault] syncAll: CRDT has 0 files before sync"
+  ]
+}

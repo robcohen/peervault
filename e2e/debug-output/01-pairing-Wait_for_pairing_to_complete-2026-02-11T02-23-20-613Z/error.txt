@@ -1,0 +1,12 @@
+Test: Wait for pairing to complete
+Suite: 01-pairing
+
+Error: Pairing did not complete within timeout
+
+Stack:
+Error: Pairing did not complete within timeout
+    at fn (/home/user/Documents/my-projects/peervault/e2e/tests/01-pairing/01-invite.test.ts:142:17)
+    at async runTest (/home/user/Documents/my-projects/peervault/e2e/lib/context.ts:439:11)
+    at async runTestWithRetry (/home/user/Documents/my-projects/peervault/e2e/runner.ts:321:26)
+    at async runSuite (/home/user/Documents/my-projects/peervault/e2e/runner.ts:1145:30)
+    at async main (/home/user/Documents/my-projects/peervault/e2e/runner.ts:1430:13)

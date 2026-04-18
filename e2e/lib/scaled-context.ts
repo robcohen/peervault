@@ -243,9 +243,7 @@ export async function createScaledContext(): Promise<ScaledTestContext> {
     console.log(`  ${client.name}: ${nodeId.slice(0, 16)}...`);
   }
 
-  // Enable auto-accept for vault adoption on all clients
-  console.log("Enabling auto-accept for vault adoption...");
-  await Promise.all(clients.map((c) => c.plugin.enableAutoAcceptVaultAdoption()));
+  // Note: Auto-accept is not needed with WASM-based pairing
 
   return {
     clients,
@@ -268,6 +266,18 @@ export async function createScaledContext(): Promise<ScaledTestContext> {
     async resetAll(): Promise<void> {
       console.log(`Resetting ${clients.length} clients...`);
       await Promise.all(clients.map((c) => c.state.resetAll()));
+
+      // Wait for all plugins to be ready after reset
+      console.log("Waiting for plugins to reinitialize...");
+      await Promise.all(
+        clients.map(async (c) => {
+          const ready = await c.plugin.waitForReady(15000);
+          if (!ready) {
+            console.warn(`  ${c.name}: plugin not ready after reset`);
+          }
+        })
+      );
+
       console.log("All clients reset");
     },
 
@@ -366,27 +376,40 @@ export async function createScaledContext(): Promise<ScaledTestContext> {
     ): Promise<void> {
       console.log(`Pairing ${client1.name} with ${client2.name}...`);
 
-      // Generate invite from client1
-      const invite = await client1.plugin.generateInvite();
+      // Clear client2's encryption key so it adopts client1's key
+      // This ensures both vaults use the same encryption key
+      try {
+        await client2.state.clearEncryptionKey();
+      } catch (e) {
+        console.log(`  Warning: clearEncryptionKey failed: ${e}`);
+      }
+      await delay(500); // Allow state to settle
 
-      // Add peer on client2
-      const addPeerPromise = client2.plugin.addPeer(invite);
+      // Get pairing ticket from client1 (includes encryption key)
+      const ticket1 = await client1.plugin.getPairingTicket();
 
-      // Wait a bit for connection to establish
-      const timeoutPromise = new Promise<void>((resolve) => {
-        setTimeout(resolve, 5000);
-      });
-
-      await Promise.race([addPeerPromise, timeoutPromise]);
-      await delay(500);
-
-      // Accept pairing request on client1 if needed
-      const requests = await client1.plugin.getPendingPairingRequests();
-      if (requests.length > 0) {
-        await client1.plugin.acceptPairingRequest(requests[0].nodeId);
+      // client2 adds client1 as peer (adopts client1's encryption key)
+      try {
+        await client2.plugin.addPeer(ticket1, client1.name);
+        console.log(`  ${client2.name} -> ${client1.name}: OK`);
+      } catch (e) {
+        console.log(`  ${client2.name} -> ${client1.name}: ${e}`);
       }
 
-      // Wait for connection
+      // Wait for sync to complete
+      await delay(2000);
+
+      // Now get client2's pairing ticket and add to client1
+      // Using getPairingTicket() to ensure both directions have full ticket format
+      const ticket2 = await client2.plugin.getPairingTicket();
+      try {
+        await client1.plugin.addPeer(ticket2, client2.name);
+        console.log(`  ${client1.name} -> ${client2.name}: OK`);
+      } catch (e) {
+        console.log(`  ${client1.name} -> ${client2.name}: ${e}`);
+      }
+
+      // Wait for bidirectional sync
       await delay(2000);
 
       console.log(`  ${client1.name} <-> ${client2.name} paired`);
@@ -419,7 +442,7 @@ export async function createScaledContext(): Promise<ScaledTestContext> {
       const expectedPeers = numClients - 1;
 
       for (const client of clients) {
-        const peers = await client.plugin.getConnectedPeers();
+        const peers = await client.plugin.getPeers();
         if (peers.length < expectedPeers) {
           console.warn(`  ${client.name} has ${peers.length}/${expectedPeers} peers`);
           allConnected = false;

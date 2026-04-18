@@ -1,0 +1,18 @@
+{
+  "TEST": {
+    "enabled": true,
+    "ready": true,
+    "nodeId": "6f2312e7363f7b3d44a45d88987ebb1a8e6ee97564a003984f1ad8cc666c4374",
+    "peerCount": 0,
+    "fileCount": 0,
+    "hasEncryptionKey": false
+  },
+  "TEST2": {
+    "enabled": true,
+    "ready": true,
+    "nodeId": "c3dbb9284ad9df245e91f6dbc5d37d0a03f1510a852246472e659a8ae96c2c14",
+    "peerCount": 0,
+    "fileCount": 0,
+    "hasEncryptionKey": false
+  }
+}

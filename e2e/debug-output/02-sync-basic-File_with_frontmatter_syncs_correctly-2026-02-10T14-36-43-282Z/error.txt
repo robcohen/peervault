@@ -1,0 +1,15 @@
+Test: File with frontmatter syncs correctly
+Suite: 02-sync-basic
+
+Error: File "frontmatter-test.md" not found in vault "TEST2" after 20000ms
+
+Stack:
+Error: File "frontmatter-test.md" not found in vault "TEST2" after 20000ms
+    at waitForFile (/home/user/Documents/my-projects/peervault/e2e/lib/sync-waiter.ts:88:17)
+    at async fn (/home/user/Documents/my-projects/peervault/e2e/tests/02-sync-basic/01-create-sync.test.ts:182:28)
+    at async runTest (/home/user/Documents/my-projects/peervault/e2e/lib/context.ts:432:11)
+    at async runTestWithRetry (/home/user/Documents/my-projects/peervault/e2e/runner.ts:321:26)
+    at async <anonymous> (/home/user/Documents/my-projects/peervault/e2e/runner.ts:1097:32)
+    at async <anonymous> (/home/user/Documents/my-projects/peervault/e2e/runner.ts:1101:39)
+    at async runSuite (/home/user/Documents/my-projects/peervault/e2e/runner.ts:1142:20)
+    at async main (/home/user/Documents/my-projects/peervault/e2e/runner.ts:1430:13)

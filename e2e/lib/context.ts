@@ -2,18 +2,17 @@
  * Test Context
  *
  * Factory for creating test context with all managers and utilities.
- * Provides a unified interface for test suites.
+ * Simplified for the new WASM-based plugin architecture.
  */
 
 import { config } from "../config";
 import { CDPClient } from "./cdp-client";
-import { discoverVaults, waitForVaults, type VaultPage } from "./cdp-discovery";
+import { waitForVaults, type VaultPage } from "./cdp-discovery";
 import { VaultController } from "./vault-controller";
 import { PluginAPI } from "./plugin-api";
 import { PluginLifecycleManager } from "./plugin-lifecycle";
-import { BRATManager } from "./brat";
 import { StateManager } from "./state-manager";
-import { SyncWaiter, waitForVersionConvergence, waitForFileListConvergence } from "./sync-waiter";
+import { SyncWaiter, waitForFileListConvergence } from "./sync-waiter";
 
 /** Test vault context */
 export interface VaultContext {
@@ -23,20 +22,28 @@ export interface VaultContext {
   vault: VaultController;
   plugin: PluginAPI;
   lifecycle: PluginLifecycleManager;
-  brat: BRATManager;
   state: StateManager;
   sync: SyncWaiter;
 }
 
-/** Full test context with both vaults */
+/** Options for creating test context */
+export interface CreateTestContextOptions {
+  /** Include TEST3 vault (for 3-way sync tests) */
+  includeTest3?: boolean;
+}
+
+/** Full test context with vaults */
 export interface TestContext {
   test: VaultContext;
   test2: VaultContext;
+  /** Third vault for 3-way sync tests (optional) */
+  test3?: VaultContext;
 
   // Convenience references
   vaults: {
     test: VaultContext;
     test2: VaultContext;
+    test3?: VaultContext;
   };
 
   // Cross-vault utilities
@@ -44,27 +51,9 @@ export interface TestContext {
   waitForFileListMatch: (timeoutMs?: number) => Promise<void>;
 
   // Cleanup
-  /**
-   * Clean up state between tests.
-   * Clears console messages to avoid memory buildup.
-   */
   cleanupBetweenTests: () => void;
-
-  /**
-   * Reset files in both vaults (keeps peer connections).
-   * Use between tests that need a clean file state but maintain pairing.
-   */
   resetFiles: () => Promise<void>;
-
-  /**
-   * Full state reset in both vaults (clears peers, files, CRDT).
-   * Use between test suites or when starting fresh.
-   */
   resetAll: () => Promise<void>;
-
-  /**
-   * Close all connections (call at end of test run).
-   */
   close: () => Promise<void>;
 }
 
@@ -76,6 +65,8 @@ export interface TestResult {
   skipped?: boolean;
   error?: Error;
   duration: number;
+  retriesAttempted?: number;
+  passedAfterRetry?: boolean;
 }
 
 /** Test suite result */
@@ -88,13 +79,19 @@ export interface SuiteResult {
 }
 
 /**
- * Create test context for both vaults.
+ * Create test context for vaults.
  */
-export async function createTestContext(): Promise<TestContext> {
-  console.log("Discovering vaults...");
+export async function createTestContext(options?: CreateTestContextOptions): Promise<TestContext> {
+  const includeTest3 = options?.includeTest3 ?? false;
 
-  // Wait for both vaults to be available
+  console.log(`Discovering vaults... (includeTest3: ${includeTest3})`);
+
+  // Wait for vaults to be available
   const vaultNames = [config.vaults.TEST.name, config.vaults.TEST2.name];
+  if (includeTest3 && config.vaults.TEST3) {
+    vaultNames.push(config.vaults.TEST3.name);
+  }
+
   const pages = await waitForVaults(vaultNames, {
     port: config.cdp.port,
     timeoutMs: 30000,
@@ -102,9 +99,13 @@ export async function createTestContext(): Promise<TestContext> {
 
   const testPage = pages.get(config.vaults.TEST.name)!;
   const test2Page = pages.get(config.vaults.TEST2.name)!;
+  const test3Page = includeTest3 && config.vaults.TEST3 ? pages.get(config.vaults.TEST3.name) : undefined;
 
   console.log(`Found vault: ${testPage.name} (${testPage.id})`);
   console.log(`Found vault: ${test2Page.name} (${test2Page.id})`);
+  if (test3Page) {
+    console.log(`Found vault: ${test3Page.name} (${test3Page.id})`);
+  }
 
   // Create CDP clients
   console.log("Connecting to vaults via CDP...");
@@ -119,35 +120,48 @@ export async function createTestContext(): Promise<TestContext> {
     evaluateTimeout: config.cdp.evaluateTimeout,
   });
 
-  await Promise.all([testClient.connect(), test2Client.connect()]);
+  const test3Client = test3Page ? new CDPClient(test3Page.wsUrl, {
+    connectionTimeout: config.cdp.connectionTimeout,
+    evaluateTimeout: config.cdp.evaluateTimeout,
+  }) : undefined;
 
-  console.log("Connected to both vaults");
+  const connectPromises = [testClient.connect(), test2Client.connect()];
+  if (test3Client) {
+    connectPromises.push(test3Client.connect());
+  }
+  await Promise.all(connectPromises);
+
+  // Enable console capture for debugging
+  const enablePromises = [testClient.enableConsole(), test2Client.enableConsole()];
+  if (test3Client) {
+    enablePromises.push(test3Client.enableConsole());
+  }
+  await Promise.all(enablePromises);
+
+  console.log(`Connected to ${includeTest3 ? "all three" : "both"} vaults`);
 
   // Create vault contexts
   const testContext = createVaultContext(testPage, testClient);
   const test2Context = createVaultContext(test2Page, test2Client);
-
-  // Enable auto-accept for vault adoption requests on both vaults
-  // This handles the "Join Sync Network?" modal that appears on first pairing
-  console.log("Enabling auto-accept for vault adoption...");
-  await Promise.all([
-    testContext.plugin.enableAutoAcceptVaultAdoption(),
-    test2Context.plugin.enableAutoAcceptVaultAdoption(),
-  ]);
-  console.log("Auto-accept enabled on both vaults");
+  const test3Context = test3Page && test3Client ? createVaultContext(test3Page, test3Client) : undefined;
 
   // Create full context
   const context: TestContext = {
     test: testContext,
     test2: test2Context,
+    test3: test3Context,
     vaults: {
       test: testContext,
       test2: test2Context,
+      test3: test3Context,
     },
     waitForConvergence: async (timeoutMs?: number) => {
-      await waitForVersionConvergence(testContext.sync, test2Context.sync, {
+      // Wait for file lists to converge
+      await waitForFileListConvergence(testContext.sync, test2Context.sync, {
         timeoutMs: timeoutMs ?? config.sync.defaultTimeout,
       });
+      // Brief delay for filesystem sync
+      await new Promise(r => setTimeout(r, 500));
     },
     waitForFileListMatch: async (timeoutMs?: number) => {
       await waitForFileListConvergence(testContext.sync, test2Context.sync, {
@@ -158,23 +172,38 @@ export async function createTestContext(): Promise<TestContext> {
       // Clear console message buffers to prevent memory buildup
       testClient.clearConsoleMessages();
       test2Client.clearConsoleMessages();
+      if (test3Client) {
+        test3Client.clearConsoleMessages();
+      }
     },
     resetFiles: async () => {
       // Delete all files but keep peer connections
-      await Promise.all([
+      const resetPromises = [
         testContext.state.resetVaultFiles(),
         test2Context.state.resetVaultFiles(),
-      ]);
+      ];
+      if (test3Context) {
+        resetPromises.push(test3Context.state.resetVaultFiles());
+      }
+      await Promise.all(resetPromises);
     },
     resetAll: async () => {
       // Full reset - clears peers, CRDT state, and files
-      await Promise.all([
+      const resetPromises = [
         testContext.state.resetAll(),
         test2Context.state.resetAll(),
-      ]);
+      ];
+      if (test3Context) {
+        resetPromises.push(test3Context.state.resetAll());
+      }
+      await Promise.all(resetPromises);
     },
     close: async () => {
-      await Promise.all([testClient.close(), test2Client.close()]);
+      const closePromises = [testClient.close(), test2Client.close()];
+      if (test3Client) {
+        closePromises.push(test3Client.close());
+      }
+      await Promise.all(closePromises);
     },
   };
 
@@ -192,7 +221,6 @@ function createVaultContext(page: VaultPage, client: CDPClient): VaultContext {
     vault: new VaultController(client, page.name),
     plugin: new PluginAPI(client, page.name),
     lifecycle: new PluginLifecycleManager(client, page.name),
-    brat: new BRATManager(client, page.name),
     state: new StateManager(client, page.name),
     sync: new SyncWaiter(client, page.name),
   };
@@ -218,7 +246,6 @@ export class TestReporter {
   endSuite(): SuiteResult | null {
     if (!this.currentSuite) return null;
 
-    // Calculate totals
     this.currentSuite.passed = this.currentSuite.tests.filter(
       (t) => t.passed
     ).length;
@@ -241,12 +268,19 @@ export class TestReporter {
       this.currentSuite.tests.push(result);
     }
 
-    // Log result
     const status = result.passed ? "✓" : "✗";
     const duration = `(${result.duration}ms)`;
+
+    let retryInfo = "";
+    if (result.passedAfterRetry && result.retriesAttempted) {
+      retryInfo = ` [passed after ${result.retriesAttempted} retry${result.retriesAttempted > 1 ? "ies" : ""}]`;
+    } else if (!result.passed && result.retriesAttempted) {
+      retryInfo = ` [failed after ${result.retriesAttempted} retry${result.retriesAttempted > 1 ? "ies" : ""}]`;
+    }
+
     const message = result.passed
-      ? `${status} ${result.name} ${duration}`
-      : `${status} ${result.name} ${duration}\n    Error: ${result.error?.message}`;
+      ? `${status} ${result.name} ${duration}${retryInfo}`
+      : `${status} ${result.name} ${duration}${retryInfo}\n    Error: ${result.error?.message}`;
 
     console.log(message);
   }
@@ -266,7 +300,6 @@ export class TestReporter {
         `\n${status} ${suite.name}: ${suite.passed}/${suite.tests.length} passed (${suite.duration}ms)`
       );
 
-      // Show failed tests
       const failed = suite.tests.filter((t) => !t.passed);
       for (const test of failed) {
         console.log(`    ✗ ${test.name}: ${test.error?.message}`);
@@ -283,9 +316,9 @@ export class TestReporter {
     );
 
     if (totalFailed > 0) {
-      console.log(`\n❌ ${totalFailed} test(s) failed`);
+      console.log(`\n${totalFailed} test(s) failed`);
     } else {
-      console.log(`\n✅ All tests passed!`);
+      console.log(`\nAll tests passed!`);
     }
   }
 
@@ -309,12 +342,96 @@ export class TestReporter {
 }
 
 /**
+ * Capture debug output on test failure.
+ */
+async function captureDebugOutput(
+  ctx: TestContext | undefined,
+  testName: string,
+  suiteName: string,
+  error: Error
+): Promise<string | undefined> {
+  if (!ctx) return undefined;
+
+  try {
+    const { mkdirSync, writeFileSync } = await import("node:fs");
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const safeName = testName.replace(/[^a-zA-Z0-9]/g, "_").slice(0, 50);
+    const debugDir = `e2e/debug-output/${suiteName}-${safeName}-${timestamp}`;
+
+    mkdirSync(debugDir, { recursive: true });
+
+    // Capture error details
+    writeFileSync(`${debugDir}/error.txt`, `Test: ${testName}\nSuite: ${suiteName}\n\nError: ${error.message}\n\nStack:\n${error.stack}`);
+
+    // Capture diagnostics from vaults
+    try {
+      const diag1 = await ctx.test.plugin.getDiagnostics();
+      const diag2 = await ctx.test2.plugin.getDiagnostics();
+      const diag3 = ctx.test3 ? await ctx.test3.plugin.getDiagnostics() : undefined;
+      const diagData: Record<string, unknown> = { TEST: diag1, TEST2: diag2 };
+      if (diag3 !== undefined) diagData.TEST3 = diag3;
+      writeFileSync(`${debugDir}/diagnostics.json`, JSON.stringify(diagData, null, 2));
+    } catch { /* ignore */ }
+
+    // Capture CRDT file lists
+    try {
+      const files1 = await ctx.test.plugin.listFiles();
+      const files2 = await ctx.test2.plugin.listFiles();
+      const files3 = ctx.test3 ? await ctx.test3.plugin.listFiles() : undefined;
+      const filesData: Record<string, unknown> = { TEST: files1, TEST2: files2 };
+      if (files3 !== undefined) filesData.TEST3 = files3;
+      writeFileSync(`${debugDir}/crdt-files.json`, JSON.stringify(filesData, null, 2));
+    } catch { /* ignore */ }
+
+    // Capture vault file lists
+    try {
+      const vaultFiles1 = await ctx.test.vault.listFiles();
+      const vaultFiles2 = await ctx.test2.vault.listFiles();
+      const vaultFiles3 = ctx.test3 ? await ctx.test3.vault.listFiles() : undefined;
+      const vaultFilesData: Record<string, unknown> = { TEST: vaultFiles1, TEST2: vaultFiles2 };
+      if (vaultFiles3 !== undefined) vaultFilesData.TEST3 = vaultFiles3;
+      writeFileSync(`${debugDir}/vault-files.json`, JSON.stringify(vaultFilesData, null, 2));
+    } catch { /* ignore */ }
+
+    // Capture all console logs from both vaults
+    try {
+      // Get all messages, then filter for relevant ones
+      const allLogs1 = ctx.test.client.getConsoleMessages();
+      const allLogs2 = ctx.test2.client.getConsoleMessages();
+      // Filter to PeerVault and WASM related logs
+      const relevant1 = allLogs1.filter(m =>
+        m.text.includes("PeerVault") || m.text.includes("WASM") || m.text.includes("[sync")
+      );
+      const relevant2 = allLogs2.filter(m =>
+        m.text.includes("PeerVault") || m.text.includes("WASM") || m.text.includes("[sync")
+      );
+      console.log(`  [Debug] Total console msgs: TEST=${allLogs1.length}, TEST2=${allLogs2.length}`);
+      console.log(`  [Debug] Relevant console logs: TEST=${relevant1.length}, TEST2=${relevant2.length}`);
+      const logsData: Record<string, unknown> = {
+        total: { TEST: allLogs1.length, TEST2: allLogs2.length },
+        TEST: relevant1.map(m => `[${m.type}] ${m.text}`),
+        TEST2: relevant2.map(m => `[${m.type}] ${m.text}`)
+      };
+      writeFileSync(`${debugDir}/console-logs.json`, JSON.stringify(logsData, null, 2));
+    } catch (e) {
+      console.error(`  [Debug] Failed to capture console logs: ${e}`);
+    }
+
+    return debugDir;
+  } catch (e) {
+    console.error("  Failed to capture debug output:", e);
+    return undefined;
+  }
+}
+
+/**
  * Run a test function and capture result.
  */
 export async function runTest(
   name: string,
   suite: string,
-  fn: () => Promise<void>
+  fn: () => Promise<void>,
+  ctx?: TestContext
 ): Promise<TestResult> {
   const startTime = Date.now();
 
@@ -327,11 +444,19 @@ export async function runTest(
       duration: Date.now() - startTime,
     };
   } catch (error) {
+    const err = error instanceof Error ? error : new Error(String(error));
+
+    // Capture debug output on failure
+    const debugDir = await captureDebugOutput(ctx, name, suite, err);
+    if (debugDir) {
+      console.log(`  Debug output saved to: ${debugDir}`);
+    }
+
     return {
       name,
       suite,
       passed: false,
-      error: error instanceof Error ? error : new Error(String(error)),
+      error: err,
       duration: Date.now() - startTime,
     };
   }

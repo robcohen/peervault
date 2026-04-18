@@ -1,0 +1,9 @@
+{
+  "TEST": [
+    "sync-test-1.md",
+    "batch/file-3.md"
+  ],
+  "TEST2": [
+    "sync-test-2.md"
+  ]
+}

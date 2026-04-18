@@ -1,0 +1,12 @@
+Test: Add peer to TEST2 using ticket
+Suite: 01-pairing
+
+Error: Pairing rejected: Pairing required - unknown peer
+
+Stack:
+Error: Pairing rejected: Pairing required - unknown peer
+    at fn (/home/user/Documents/my-projects/peervault/e2e/tests/01-pairing/01-invite.test.ts:88:21)
+    at async runTest (/home/user/Documents/my-projects/peervault/e2e/lib/context.ts:439:11)
+    at async runTestWithRetry (/home/user/Documents/my-projects/peervault/e2e/runner.ts:321:26)
+    at async runSuite (/home/user/Documents/my-projects/peervault/e2e/runner.ts:1145:30)
+    at async main (/home/user/Documents/my-projects/peervault/e2e/runner.ts:1430:13)

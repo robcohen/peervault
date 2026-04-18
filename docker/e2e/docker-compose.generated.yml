@@ -67,7 +67,7 @@ services:
       - PUID=1000
       - PGID=1000
       - TZ=Etc/UTC
-      - VAULT_NAME=client-1
+      - VAULT_NAME=TEST
       - CDP_PORT=9222
       - RELAY_URL=http://relay:3340
     volumes:
@@ -100,7 +100,7 @@ services:
       - PUID=1000
       - PGID=1000
       - TZ=Etc/UTC
-      - VAULT_NAME=client-2
+      - VAULT_NAME=TEST2
       - CDP_PORT=9222
       - RELAY_URL=http://relay:3340
     volumes:

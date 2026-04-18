@@ -6,7 +6,8 @@ set -e
 
 VAULT_NAME="${VAULT_NAME:-client}"
 RELAY_URL="${RELAY_URL:-http://relay:3340}"
-VAULT_PATH="/config/vault"
+# Use vault name as directory so Obsidian identifies it by name
+VAULT_PATH="/config/$VAULT_NAME"
 
 echo "=== Initializing E2E Vault: $VAULT_NAME ==="
 
@@ -14,10 +15,13 @@ echo "=== Initializing E2E Vault: $VAULT_NAME ==="
 mkdir -p "$VAULT_PATH/.obsidian/plugins/peervault"
 
 # Create Obsidian config files
+# restrictedMode: false enables community plugins
+# communityPluginsTrusted: true marks the vault as already trusted (skips the trust dialog)
 cat > "$VAULT_PATH/.obsidian/app.json" << 'EOF'
 {
   "promptDelete": false,
-  "restrictedMode": false
+  "restrictedMode": false,
+  "communityPluginsTrusted": true
 }
 EOF
 
@@ -44,21 +48,13 @@ if [ -d "/plugin-dist" ]; then
 fi
 
 # Create plugin settings with relay URL
+# Note: relayUrl is a single URL string, not an array
 cat > "$VAULT_PATH/.obsidian/plugins/peervault/data.json" << EOF
 {
+  "deviceName": "$VAULT_NAME",
   "autoSync": true,
-  "syncInterval": 0,
-  "excludedFolders": [],
-  "excludedExtensions": [],
-  "maxFileSize": 104857600,
-  "showStatusBar": true,
-  "debugMode": true,
-  "deviceNickname": "$VAULT_NAME",
-  "showDeviceList": true,
-  "relayServers": ["$RELAY_URL"],
-  "transportType": "hybrid",
-  "enableWebRTC": true,
-  "autoWebRTCUpgrade": true
+  "autoSyncInterval": 5,
+  "relayUrl": "$RELAY_URL"
 }
 EOF
 
@@ -74,7 +70,8 @@ mkdir -p "$OBSIDIAN_CONFIG_DIR"
 VAULT_ID=$(echo -n "$VAULT_PATH" | md5sum | cut -c1-16)
 TIMESTAMP=$(date +%s)000
 
-# Create obsidian.json with the vault pre-registered
+# Create obsidian.json with the vault pre-registered AND pre-trusted
+# The "trusted" field marks the vault as already having user consent for community plugins
 cat > "$OBSIDIAN_CONFIG_DIR/obsidian.json" << EOF
 {
   "vaults": {
@@ -85,7 +82,10 @@ cat > "$OBSIDIAN_CONFIG_DIR/obsidian.json" << EOF
     }
   },
   "frame": "native",
-  "updateDisabled": true
+  "updateDisabled": true,
+  "trustedVaults": {
+    "$VAULT_PATH": true
+  }
 }
 EOF
 

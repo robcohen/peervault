@@ -1,0 +1,8 @@
+Test: Initial sync to establish CRDT state
+Suite: 02-sync-basic
+
+Error: CDP command timeout: Runtime.evaluate
+
+Stack:
+Error: CDP command timeout: Runtime.evaluate
+    at <anonymous> (/home/user/Documents/my-projects/peervault/e2e/lib/cdp-client.ts:278:20)

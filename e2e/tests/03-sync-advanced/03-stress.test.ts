@@ -4,6 +4,7 @@
  * High-load tests to verify sync under pressure.
  */
 
+import { delay } from "../../config";
 import type { TestContext } from "../../lib/context";
 import {
   assert,
@@ -11,9 +12,56 @@ import {
   assertFileContent,
 } from "../../lib/assertions";
 
+/** Files and folders created by 03-sync-advanced suite */
+const SUITE_FOLDERS = ["stress", "deep-nest"];
+const SUITE_FILES = [
+  "concurrent-edit.md",
+  "large-file-1mb.md",
+  // From 01-bulk-sync and 02-binary-sync
+  "test-image.png",
+  "inline-binary.png",
+];
+
+/**
+ * Suite afterAll hook - cleans up all test files created by this suite.
+ */
+export async function afterAll(ctx: TestContext): Promise<void> {
+  console.log("  Cleaning up sync-advanced test files...");
+
+  for (const folder of SUITE_FOLDERS) {
+    try {
+      await ctx.test.vault.deleteFolder(folder);
+    } catch {
+      // Folder may not exist
+    }
+    try {
+      await ctx.test2.vault.deleteFolder(folder);
+    } catch {
+      // Folder may not exist
+    }
+  }
+
+  for (const file of SUITE_FILES) {
+    try {
+      await ctx.test.vault.deleteFile(file);
+    } catch {
+      // File may not exist
+    }
+    try {
+      await ctx.test2.vault.deleteFile(file);
+    } catch {
+      // File may not exist
+    }
+  }
+
+  await delay(2000);
+  console.log("  Cleanup complete");
+}
+
 export default [
   {
     name: "Stress test: Create 50 files rapidly and verify sync",
+    tags: ["slow", "protocol"],
     async fn(ctx: TestContext) {
       const fileCount = 50;
       const files: Array<{ path: string; content: string }> = [];
@@ -76,8 +124,8 @@ export default [
       const path = "concurrent-edit.md";
       const editCount = 10;
 
-      // Create initial file
-      await ctx.test.vault.createFile(path, "Initial content");
+      // Create initial file (overwrite if exists from previous run)
+      await ctx.test.vault.createFile(path, "Initial content", true);
       await ctx.test2.sync.waitForFile(path);
       console.log("  Initial file synced");
 
@@ -89,7 +137,7 @@ export default [
           await ctx.test2.vault.modifyFile(path, `Edit ${i} from TEST2`);
         }
         // Small delay to let writes process
-        await new Promise((r) => setTimeout(r, 100));
+        await delay(100);
       }
       console.log(`  Made ${editCount} rapid alternating edits`);
 
@@ -105,7 +153,7 @@ export default [
         content1 = await ctx.test.vault.readFile(path);
         content2 = await ctx.test2.vault.readFile(path);
         if (content1 === content2) break;
-        await new Promise((r) => setTimeout(r, 500));
+        await delay(500);
       }
 
       // Both vaults should have same content (CRDT resolution)
@@ -132,12 +180,20 @@ export default [
       await ctx.test.vault.createFile(path, largeContent);
       console.log("  File created in TEST");
 
-      // Wait for sync with extended timeout
+      // Wait for file to exist first
       await ctx.test2.sync.waitForFile(path, { timeoutMs: 60000 });
-      console.log("  File synced to TEST2");
+      console.log("  File appeared in TEST2");
 
-      // Verify content matches
-      const synced = await ctx.test2.vault.readFile(path);
+      // Wait for content to fully sync (CRDT sends create then content separately)
+      const startTime = Date.now();
+      const timeout = 60000;
+      let synced = "";
+      while (Date.now() - startTime < timeout) {
+        synced = await ctx.test2.vault.readFile(path);
+        if (synced.length === largeContent.length) break;
+        await new Promise(r => setTimeout(r, 100));
+      }
+
       assert(
         synced.length === largeContent.length,
         `Size mismatch: expected ${largeContent.length}, got ${synced.length}`
@@ -179,7 +235,7 @@ export default [
       }
 
       // Wait for deletions to sync
-      await new Promise((r) => setTimeout(r, 3000));
+      await delay(3000);
       console.log("  Cleanup complete");
     },
   },

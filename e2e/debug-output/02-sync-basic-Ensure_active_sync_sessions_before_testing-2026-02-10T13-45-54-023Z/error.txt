@@ -1,0 +1,14 @@
+Test: Ensure active sync sessions before testing
+Suite: 02-sync-basic
+
+Error: ctx.test.plugin.ensureActiveSessions is not a function. (In 'ctx.test.plugin.ensureActiveSessions()', 'ctx.test.plugin.ensureActiveSessions' is undefined)
+
+Stack:
+TypeError: ctx.test.plugin.ensureActiveSessions is not a function. (In 'ctx.test.plugin.ensureActiveSessions()', 'ctx.test.plugin.ensureActiveSessions' is undefined)
+    at fn (/home/user/Documents/my-projects/peervault/e2e/tests/02-sync-basic/01-create-sync.test.ts:21:49)
+    at fn (/home/user/Documents/my-projects/peervault/e2e/tests/02-sync-basic/01-create-sync.test.ts:18:14)
+    at runTest (/home/user/Documents/my-projects/peervault/e2e/lib/context.ts:408:11)
+    at runTest (/home/user/Documents/my-projects/peervault/e2e/lib/context.ts:400:3)
+    at runTestWithRetry (/home/user/Documents/my-projects/peervault/e2e/runner.ts:321:26)
+    at async runSuite (/home/user/Documents/my-projects/peervault/e2e/runner.ts:1145:30)
+    at async main (/home/user/Documents/my-projects/peervault/e2e/runner.ts:1430:13)

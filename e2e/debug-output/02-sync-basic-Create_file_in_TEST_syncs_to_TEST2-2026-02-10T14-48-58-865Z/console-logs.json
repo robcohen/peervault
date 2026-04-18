@@ -1,0 +1,46 @@
+{
+  "total": {
+    "TEST": 48,
+    "TEST2": 36
+  },
+  "TEST": [
+    "[log] [WASM] Accept loop: accepted connection from 3582b5ccab978971",
+    "[log] [WASM] Accept loop: accepted connection from 3582b5ccab978971",
+    "[log] [WASM] Stream handler started for peer 3582b5ccab978971",
+    "[log] [WASM] Stream handler started for peer 3582b5ccab978971"
+  ],
+  "TEST2": [
+    "[log] [PeerVault] syncAll: CRDT has 0 files before sync",
+    "[log] [PeerVault] syncAll: CRDT has 0 files before sync",
+    "[log] [PeerVault] Syncing with peer TEST (28090ffe)...",
+    "[log] [PeerVault] Syncing with peer TEST (28090ffe)...",
+    "[log] [PeerVault] Using ticket: eyJub2RlX2lkIjoiMjgwOTBmZmViNjQ0ZTcwNDAxZDhiZGNmMj...",
+    "[log] [PeerVault] Using ticket: eyJub2RlX2lkIjoiMjgwOTBmZmViNjQ0ZTcwNDAxZDhiZGNmMj...",
+    "[log] [WASM] connectPeer: parsing ticket",
+    "[log] [WASM] connectPeer: parsing ticket",
+    "[log] [WASM] connectPeer: peer_id=28090ffeb644e704",
+    "[log] [WASM] connectPeer: peer_id=28090ffeb644e704",
+    "[log] [WASM] connectPeer: connecting...",
+    "[log] [WASM] connectPeer: connecting...",
+    "[log] [WASM] connectPeer: connected!",
+    "[log] [WASM] connectPeer: connected!",
+    "[log] [WASM] connectPeer: storing connection",
+    "[log] [WASM] connectPeer: storing connection",
+    "[log] [WASM] connectPeer: opening stream...",
+    "[log] [WASM] connectPeer: opening stream...",
+    "[log] [WASM] connectPeer: stream opened!",
+    "[log] [WASM] connectPeer: stream opened!",
+    "[log] [WASM] INITIATOR: starting sync protocol",
+    "[log] [WASM] INITIATOR: starting sync protocol",
+    "[log] [WASM] INITIATOR Step 1: sending VV (len=24)",
+    "[log] [WASM] INITIATOR Step 1: sending VV (len=24)",
+    "[log] [WASM] INITIATOR Step 1: VV sent",
+    "[log] [WASM] INITIATOR Step 1: VV sent",
+    "[log] [WASM] INITIATOR Step 2: waiting for peer VV...",
+    "[log] [WASM] INITIATOR Step 2: waiting for peer VV...",
+    "[log] [PeerVault] Failed to sync with TEST: Failed to receive version: connection lost",
+    "[error] [PeerVault] Failed to sync with TEST:",
+    "[log] [PeerVault] Syncing 0 CRDT files to disk",
+    "[log] [PeerVault] Syncing 0 CRDT files to disk"
+  ]
+}

@@ -2,7 +2,7 @@
  * State Manager
  *
  * Handles resetting vault and plugin state between tests.
- * Ensures clean slate for each test suite.
+ * Simplified for the new WASM-based plugin architecture.
  */
 
 import type { CDPClient } from "./cdp-client";
@@ -35,35 +35,27 @@ export class StateManager {
   }
 
   /**
-   * Clear all peers and pending pairing requests.
+   * Clear all peers.
    */
   async resetPeers(): Promise<void> {
-    // First clear via the plugin API
     await this.plugin.clearAllPeers();
+  }
 
-    // Then force-clear storage directly to handle race conditions
-    // (when both vaults are connected, clearing one sends PEER_REMOVED to the other)
+  /**
+   * Clear the encryption key.
+   * This allows the vault to adopt a peer's key during pairing.
+   */
+  async clearEncryptionKey(): Promise<void> {
     await this.client.evaluate(`
       (async function() {
         const plugin = window.app?.plugins?.plugins?.["peervault"];
-        const pm = plugin?.peerManager;
-        if (!pm) return;
-
-        // Clear pending pairing requests
-        if (pm.pendingPairingRequests) {
-          pm.pendingPairingRequests.clear();
+        const client = plugin?.client;
+        if (!client?.clearEncryptionKey) {
+          console.log("[E2E] clearEncryptionKey not available, skipping");
+          return;
         }
-
-        // Force-clear the peers map and save to storage
-        pm.peers.clear();
-        pm.sessions.clear();
-        pm.reconnectAttempts.clear();
-
-        // Force save empty peers to storage
-        if (pm.storage) {
-          const data = new TextEncoder().encode(JSON.stringify([]));
-          await pm.storage.write("peervault-peers", data);
-        }
+        await client.clearEncryptionKey();
+        console.log("[E2E] Cleared encryption key");
       })()
     `);
   }
@@ -75,30 +67,11 @@ export class StateManager {
   async resetCrdtState(): Promise<void> {
     await this.client.evaluate(`
       (async function() {
-        const plugin = window.app?.plugins?.plugins?.["peervault"];
-        if (!plugin) return;
-
-        const dm = plugin.documentManager;
-        const pm = plugin.peerManager;
-
-        // Close any active sessions first
-        if (pm?.sessions) {
-          for (const [id, session] of pm.sessions) {
-            try {
-              await session.close();
-            } catch (e) {
-              console.warn("Failed to close session:", id, e);
-            }
-          }
-          pm.sessions.clear();
-        }
-
-        // Delete all CRDT-related storage using Obsidian's adapter
         const adapter = window.app.vault.adapter;
-        const basePath = window.app.vault.configDir + "/plugins/peervault/peervault-storage";
+        const basePath = window.app.vault.configDir + "/plugins/peervault/data";
 
         try {
-          // Delete the entire storage directory
+          // Delete the entire data directory
           if (await adapter.exists(basePath)) {
             const listing = await adapter.list(basePath);
             // Delete all files in the directory
@@ -108,28 +81,16 @@ export class StateManager {
             }
             // Delete the directory itself
             await adapter.rmdir(basePath, true);
-            console.log("[E2E] Deleted peervault-storage directory");
+            console.log("[E2E] Deleted peervault data directory");
           }
         } catch (e) {
           console.log("[E2E] Error deleting storage:", e);
         }
-
-        // Also clear the blob store data directory
-        const blobPath = window.app.vault.configDir + "/plugins/peervault/blobs";
-        try {
-          if (await adapter.exists(blobPath)) {
-            const listing = await adapter.list(blobPath);
-            for (const file of listing.files) {
-              await adapter.remove(file);
-            }
-            await adapter.rmdir(blobPath, true);
-            console.log("[E2E] Deleted blobs directory");
-          }
-        } catch (e) {
-          console.log("[E2E] Error deleting blobs:", e);
-        }
       })()
     `);
+
+    // Reload the plugin to pick up fresh state from disk
+    await this.lifecycle.reload();
   }
 
   /**
@@ -143,16 +104,9 @@ export class StateManager {
 
         // Reset to defaults
         plugin.settings = {
+          deviceName: "",
           autoSync: true,
-          syncInterval: 0,
-          excludedFolders: [],
-          excludedExtensions: [],
-          maxFileSize: 104857600, // 100MB
-          showStatusBar: true,
-          debugMode: false,
-          deviceNickname: "",
-          showDeviceList: true,
-          relayUrl: "https://use1-1.relay.n0.iroh-canary.iroh.link./",
+          autoSyncInterval: 5,
         };
 
         await plugin.saveSettings();
@@ -161,11 +115,14 @@ export class StateManager {
   }
 
   /**
-   * Full reset - clears files, peers, CRDT state.
+   * Full reset - clears files, peers, CRDT state, and encryption key.
    */
   async resetAll(): Promise<DeleteAllResult> {
     // Order matters: clear peers first to prevent sync during cleanup
     await this.resetPeers();
+
+    // Clear encryption key so vaults can exchange keys during pairing
+    await this.clearEncryptionKey();
 
     // Then reset CRDT state
     await this.resetCrdtState();
@@ -187,29 +144,25 @@ export class StateManager {
   async getStateSummary(): Promise<{
     fileCount: number;
     peerCount: number;
-    sessionCount: number;
     crdtFileCount: number;
-    pendingPairingCount: number;
   }> {
     return await this.client.evaluate<{
       fileCount: number;
       peerCount: number;
-      sessionCount: number;
       crdtFileCount: number;
-      pendingPairingCount: number;
     }>(`
-      (function() {
+      (async function() {
         const vault = window.app.vault;
         const plugin = window.app?.plugins?.plugins?.["peervault"];
-        const pm = plugin?.peerManager;
-        const dm = plugin?.documentManager;
+        const client = plugin?.client;
+
+        const crdtFiles = client?.listFiles ? await client.listFiles() : [];
+        const peers = client?.getPeers?.() || [];
 
         return {
           fileCount: vault.getFiles().filter(f => !f.path.startsWith('.obsidian/')).length,
-          peerCount: pm?.peers?.size || 0,
-          sessionCount: pm?.sessions?.size || 0,
-          crdtFileCount: dm?.listAllPaths?.()?.length || 0,
-          pendingPairingCount: pm?.pendingPairingRequests?.size || 0,
+          peerCount: peers.length,
+          crdtFileCount: crdtFiles.length,
         };
       })()
     `);
@@ -226,9 +179,7 @@ export class StateManager {
 
       if (
         state.fileCount === 0 &&
-        state.peerCount === 0 &&
-        state.sessionCount === 0 &&
-        state.pendingPairingCount === 0
+        state.peerCount === 0
       ) {
         return;
       }
@@ -240,9 +191,7 @@ export class StateManager {
     throw new Error(
       `Vault not clean after ${timeoutMs}ms. ` +
         `Files: ${finalState.fileCount}, ` +
-        `Peers: ${finalState.peerCount}, ` +
-        `Sessions: ${finalState.sessionCount}, ` +
-        `Pending: ${finalState.pendingPairingCount}`
+        `Peers: ${finalState.peerCount}`
     );
   }
 
@@ -258,7 +207,7 @@ export class StateManager {
    * Verify no peers are configured.
    */
   async verifyNoPeers(): Promise<boolean> {
-    const peers = await this.plugin.getConnectedPeers();
+    const peers = await this.plugin.getPeers();
     return peers.length === 0;
   }
 }

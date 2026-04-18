@@ -54,21 +54,13 @@ if [ -d "/plugin-dist" ]; then
 fi
 
 # Create default plugin settings with relay URL
+# Note: Settings must match PeerVaultSettings interface in main.ts
 cat > "/vault/.obsidian/plugins/peervault/data.json" << EOF
 {
+  "deviceName": "$VAULT_NAME",
   "autoSync": true,
-  "syncInterval": 0,
-  "excludedFolders": [],
-  "excludedExtensions": [],
-  "maxFileSize": 104857600,
-  "showStatusBar": true,
-  "debugMode": true,
-  "deviceNickname": "$VAULT_NAME",
-  "showDeviceList": true,
-  "relayServers": ["$RELAY_URL"],
-  "transportType": "hybrid",
-  "enableWebRTC": true,
-  "autoWebRTCUpgrade": true
+  "autoSyncInterval": 5,
+  "relayUrl": "$RELAY_URL"
 }
 EOF
 chown obsidian:obsidian "/vault/.obsidian/plugins/peervault/data.json"

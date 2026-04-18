@@ -1,0 +1,12 @@
+Test: Reinstall TEST plugin with fresh code
+Suite: 00-setup
+
+Error: Failed to reinstall plugin: Error: EACCES: permission denied, mkdir '/config'
+
+Stack:
+Error: Failed to reinstall plugin: Error: EACCES: permission denied, mkdir '/config'
+    at fn (/home/user/Documents/my-projects/peervault/e2e/tests/00-setup/02-reset-state.test.ts:117:19)
+    at async runTest (/home/user/Documents/my-projects/peervault/e2e/lib/context.ts:439:11)
+    at async runTestWithRetry (/home/user/Documents/my-projects/peervault/e2e/runner.ts:321:26)
+    at async runSuite (/home/user/Documents/my-projects/peervault/e2e/runner.ts:1145:30)
+    at async main (/home/user/Documents/my-projects/peervault/e2e/runner.ts:1430:13)

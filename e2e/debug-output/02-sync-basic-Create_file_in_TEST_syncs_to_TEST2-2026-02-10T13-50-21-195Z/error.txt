@@ -1,0 +1,12 @@
+Test: Create file in TEST syncs to TEST2
+Suite: 02-sync-basic
+
+Error: test2Files.slice(0, 5).join is not a function. (In 'test2Files.slice(0, 5).join(", ")', 'test2Files.slice(0, 5).join' is undefined)
+
+Stack:
+TypeError: test2Files.slice(0, 5).join is not a function. (In 'test2Files.slice(0, 5).join(", ")', 'test2Files.slice(0, 5).join' is undefined)
+    at fn (/home/user/Documents/my-projects/peervault/e2e/tests/02-sync-basic/01-create-sync.test.ts:54:88)
+    at async runTest (/home/user/Documents/my-projects/peervault/e2e/lib/context.ts:408:11)
+    at async runTestWithRetry (/home/user/Documents/my-projects/peervault/e2e/runner.ts:321:26)
+    at async runSuite (/home/user/Documents/my-projects/peervault/e2e/runner.ts:1145:30)
+    at async main (/home/user/Documents/my-projects/peervault/e2e/runner.ts:1430:13)

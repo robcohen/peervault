@@ -1,0 +1,13 @@
+{
+  "total": {
+    "TEST": 4,
+    "TEST2": 2
+  },
+  "TEST": [
+    "[log] [WASM] Registered pairing nonce: cdcdccf1d9d4a770...",
+    "[log] [WASM] Registered pairing nonce: cdcdccf1d9d4a770...",
+    "[log] [PeerVault] Created pairing ticket with nonce cdcdccf1d9d4a770... (expires in 10 min)",
+    "[log] [PeerVault] Created pairing ticket with nonce cdcdccf1d9d4a770... (expires in 10 min)"
+  ],
+  "TEST2": []
+}

@@ -11,8 +11,8 @@ const pluginFiles = ['manifest.json', 'styles.css'];
 
 // Iroh WASM files - now inlined, but still copy for local dev
 const irohWasmFiles = [
-  { src: 'peervault-iroh/pkg/peervault_iroh.js', dest: 'peervault_iroh.js' },
-  { src: 'peervault-iroh/pkg/peervault_iroh_bg.wasm', dest: 'peervault_iroh_bg.wasm' },
+  { src: 'peervault-core/pkg/peervault_core.js', dest: 'peervault_core.js' },
+  { src: 'peervault-core/pkg/peervault_core_bg.wasm', dest: 'peervault_core_bg.wasm' },
 ];
 
 function copyFilesToDist() {
@@ -133,7 +133,7 @@ module.exports.__wasmReady = __wasmReady;
 };
 
 /**
- * Plugin to transform peervault-iroh WASM for bundling.
+ * Plugin to transform peervault-core WASM for bundling.
  *
  * Inlines the WASM as base64 so BRAT can download a single main.js file.
  * Similar to the loro transform but for wasm-bindgen output.
@@ -152,10 +152,10 @@ const irohTransformPlugin = {
       return { contents: 'export default {};', loader: 'js' };
     });
 
-    // Intercept the peervault_iroh.js import
-    build.onResolve({ filter: /peervault_iroh\.js$/ }, (args) => {
+    // Intercept the peervault_core.js import
+    build.onResolve({ filter: /peervault_core\.js$/ }, (args) => {
       // Resolve to the pkg file
-      const pkgPath = path.resolve('peervault-iroh/pkg/peervault_iroh.js');
+      const pkgPath = path.resolve('peervault-core/pkg/peervault_core.js');
       if (fs.existsSync(pkgPath)) {
         return { path: pkgPath, namespace: 'iroh-wasm' };
       }
@@ -168,13 +168,13 @@ const irohTransformPlugin = {
       const dir = path.dirname(args.path);
 
       // Read and inline the WASM file as base64
-      const wasmPath = path.join(dir, 'peervault_iroh_bg.wasm');
+      const wasmPath = path.join(dir, 'peervault_core_bg.wasm');
       const wasmBin = await fs.promises.readFile(wasmPath);
       const wasmBase64 = wasmBin.toString('base64');
 
       // Add the inlined WASM at the top of the file
       const wasmInlineCode = `
-// Iroh WASM inlined as base64 (for BRAT compatibility)
+// PeerVault Core WASM inlined as base64 (for BRAT compatibility)
 const __irohWasmBase64 = "${wasmBase64}";
 
 function __irohDecodeBase64(b64) {
@@ -191,9 +191,9 @@ const __irohWasmBytes = __irohDecodeBase64(__irohWasmBase64);
 `;
 
       // Replace the default URL-based loading with our inlined bytes
-      // Original: module_or_path = new URL('peervault_iroh_bg.wasm', import.meta.url);
+      // Original: module_or_path = new URL('peervault_core_bg.wasm', import.meta.url);
       code = code.replace(
-        /module_or_path = new URL\('peervault_iroh_bg\.wasm', import\.meta\.url\);/,
+        /module_or_path = new URL\('peervault_core_bg\.wasm', import\.meta\.url\);/,
         'module_or_path = __irohWasmBytes;'
       );
 

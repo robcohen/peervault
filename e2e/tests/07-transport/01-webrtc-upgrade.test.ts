@@ -5,6 +5,7 @@
  * This test runs after pairing is complete (depends on 01-pairing).
  */
 
+import { delay } from "../../config";
 import type { TestContext } from "../../lib/context";
 import {
   assert,
@@ -50,7 +51,7 @@ export default [
     name: "Verify peers are connected",
     async fn(ctx: TestContext) {
       // Wait for connections to stabilize
-      await new Promise((r) => setTimeout(r, 2000));
+      await delay(2000);
 
       const test1Peers = await ctx.test.plugin.getConnectedPeers();
       const test2Peers = await ctx.test2.plugin.getConnectedPeers();
@@ -149,7 +150,44 @@ export default [
       // We just log the result here rather than failing the test
       if (!testConnInfo?.webrtcActive && !test2ConnInfo?.webrtcActive) {
         console.log("  WebRTC upgrade did not complete (still using Iroh relay)");
-        console.log("  This is acceptable - WebRTC is opportunistic");
+
+        // Show recent logs to understand what happened
+        console.log("  Recent WebRTC logs from TEST:");
+        const testLogs = await ctx.test.plugin.getRecentLogs(20);
+        for (const log of testLogs.slice(-10)) {
+          console.log(`    ${log}`);
+        }
+
+        console.log("  Recent WebRTC logs from TEST2:");
+        const test2Logs = await ctx.test2.plugin.getRecentLogs(20);
+        for (const log of test2Logs.slice(-10)) {
+          console.log(`    ${log}`);
+        }
+
+        console.log("  Trying explicit upgrade...");
+
+        // Try explicit upgrade from the peer with lower node ID (initiator)
+        const testIsInitiator = testNodeId < test2NodeId;
+        console.log(`  TEST is initiator: ${testIsInitiator}`);
+
+        const upgradeResult = testIsInitiator
+          ? await ctx.test.plugin.forceWebRTCUpgrade(test2NodeId)
+          : await ctx.test2.plugin.forceWebRTCUpgrade(testNodeId);
+
+        console.log(`  Upgrade result: attempted=${upgradeResult.attempted}, success=${upgradeResult.success}`);
+        if (upgradeResult.error) {
+          console.log(`  Upgrade error: ${upgradeResult.error}`);
+        }
+        for (const info of upgradeResult.debugInfo) {
+          console.log(`  Debug: ${info}`);
+        }
+
+        // Check again after explicit upgrade
+        testConnInfo = await ctx.test.plugin.getConnectionInfo(test2NodeId);
+        test2ConnInfo = await ctx.test2.plugin.getConnectionInfo(testNodeId);
+        console.log(`  After explicit upgrade:`);
+        console.log(`    TEST -> TEST2: webrtcActive=${testConnInfo?.webrtcActive}`);
+        console.log(`    TEST2 -> TEST: webrtcActive=${test2ConnInfo?.webrtcActive}`);
       }
     },
   },

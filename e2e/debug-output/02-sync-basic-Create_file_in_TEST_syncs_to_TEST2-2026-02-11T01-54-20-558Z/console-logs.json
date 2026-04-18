@@ -1,0 +1,25 @@
+{
+  "total": {
+    "TEST": 18,
+    "TEST2": 20
+  },
+  "TEST": [],
+  "TEST2": [
+    "[log] [PeerVault] syncAll: CRDT has 0 files before sync",
+    "[log] [PeerVault] syncAll: CRDT has 0 files before sync",
+    "[log] [PeerVault] Syncing with peer TEST (1c46848b)...",
+    "[log] [PeerVault] Syncing with peer TEST (1c46848b)...",
+    "[log] [PeerVault] Using ticket: eyJub2RlX2lkIjoiMWM0Njg0OGJmNmQ0OTdhMjQyNzk1M2U3Nj...",
+    "[log] [PeerVault] Using ticket: eyJub2RlX2lkIjoiMWM0Njg0OGJmNmQ0OTdhMjQyNzk1M2U3Nj...",
+    "[log] [WASM] connectPeerWithPairing: parsing ticket, nonce=none",
+    "[log] [WASM] connectPeerWithPairing: parsing ticket, nonce=none",
+    "[log] [WASM] connectPeer: peer_id=1c46848bf6d497a2",
+    "[log] [WASM] connectPeer: peer_id=1c46848bf6d497a2",
+    "[log] [WASM] connectPeer: connecting...",
+    "[log] [WASM] connectPeer: connecting...",
+    "[log] [PeerVault] Failed to sync with TEST: Error: Sync timeout after 15000ms",
+    "[error] [PeerVault] Failed to sync with TEST:",
+    "[log] [PeerVault] Syncing 0 CRDT files to disk",
+    "[log] [PeerVault] Syncing 0 CRDT files to disk"
+  ]
+}

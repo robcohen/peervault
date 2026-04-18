@@ -1,0 +1,27 @@
+{
+  "total": {
+    "TEST": 0,
+    "TEST2": 22
+  },
+  "TEST": [],
+  "TEST2": [
+    "[log] [PeerVault] Scheduled sync for: sync-test-2.md",
+    "[log] [PeerVault] Scheduled sync for: sync-test-2.md",
+    "[log] [PeerVault] Executing sync for: sync-test-2.md",
+    "[log] [PeerVault] Executing sync for: sync-test-2.md",
+    "[log] [PeerVault] syncAll: CRDT has 1 files before sync",
+    "[log] [PeerVault] syncAll: CRDT has 1 files before sync",
+    "[log] [PeerVault] Syncing with peer TEST (88176f22)...",
+    "[log] [PeerVault] Syncing with peer TEST (88176f22)...",
+    "[log] [PeerVault] Using ticket: eyJub2RlX2lkIjoiODgxNzZmMjJkMDIwNzNlYWY4NTcwNmRiYm...",
+    "[log] [PeerVault] Using ticket: eyJub2RlX2lkIjoiODgxNzZmMjJkMDIwNzNlYWY4NTcwNmRiYm...",
+    "[log] [WASM] connectPeerWithPairing: parsing ticket, nonce=none",
+    "[log] [WASM] connectPeerWithPairing: parsing ticket, nonce=none",
+    "[log] [WASM] connectPeer: peer_id=88176f22d02073ea",
+    "[log] [WASM] connectPeer: peer_id=88176f22d02073ea",
+    "[log] [WASM] connectPeer: connecting...",
+    "[log] [WASM] connectPeer: connecting...",
+    "[log] [PeerVault] Failed to sync with TEST: Error: Sync timeout after 15000ms",
+    "[error] [PeerVault] Failed to sync with TEST:"
+  ]
+}

@@ -2,6 +2,7 @@
  * Setup Tests - State Reset
  *
  * Clears all vault state to prepare for test run.
+ * Simplified for the new WASM-based plugin.
  */
 
 import type { TestContext } from "../../lib/context";
@@ -10,6 +11,7 @@ import {
   assertVaultEmpty,
   assertNoPeers,
 } from "../../lib/assertions";
+import { isDockerMode, getConfig } from "../../config";
 
 export default [
   {
@@ -73,73 +75,80 @@ export default [
   },
 
   {
-    name: "Enable WebRTC for testing",
+    name: "Configure TEST relay URL",
     async fn(ctx: TestContext) {
-      // Enable WebRTC for proper transport testing
-      await ctx.test.client.evaluate(`
-        (async function() {
-          const plugin = window.app?.plugins?.plugins?.["peervault"];
-          if (plugin?.settings) {
-            plugin.settings.enableWebRTC = true;
-            plugin.settings.autoWebRTCUpgrade = true;
-            await plugin.saveSettings?.();
-          }
-        })()
-      `);
-      await ctx.test2.client.evaluate(`
-        (async function() {
-          const plugin = window.app?.plugins?.plugins?.["peervault"];
-          if (plugin?.settings) {
-            plugin.settings.enableWebRTC = true;
-            plugin.settings.autoWebRTCUpgrade = true;
-            await plugin.saveSettings?.();
-          }
-        })()
-      `);
-      console.log("  WebRTC enabled on both vaults");
+      const cfg = getConfig();
+      const relayUrl = cfg.transport.relayUrl;
+
+      // Set relay URL in settings (will be used after plugin reload)
+      await ctx.test.plugin.setRelayUrl(relayUrl);
+      console.log(`  Relay URL set to: ${relayUrl}`);
     },
   },
 
   {
-    name: "Enable protocol tracing for debugging",
+    name: "Configure TEST2 relay URL",
     async fn(ctx: TestContext) {
-      // Enable protocol tracing on both vaults to debug sync issues
-      await ctx.test.plugin.enableProtocolTracing("verbose");
-      await ctx.test2.plugin.enableProtocolTracing("verbose");
-      console.log("  Protocol tracing enabled on both vaults");
+      const cfg = getConfig();
+      const relayUrl = cfg.transport.relayUrl;
+
+      // Set relay URL in settings (will be used after plugin reload)
+      await ctx.test2.plugin.setRelayUrl(relayUrl);
+      console.log(`  Relay URL set to: ${relayUrl}`);
     },
   },
 
   {
-    name: "Configure local relay server",
+    name: "Reinstall TEST plugin with fresh code",
     async fn(ctx: TestContext) {
-      // Use local relay server for faster, more reliable tests
-      const localRelayUrl = "http://localhost:3340";
-      await ctx.test.plugin.setRelayServers([localRelayUrl]);
-      await ctx.test2.plugin.setRelayServers([localRelayUrl]);
-      console.log(`  Local relay configured: ${localRelayUrl}`);
-    },
-  },
+      // Skip in Docker mode - plugin is pre-installed
+      if (isDockerMode) {
+        console.log("  Skipping reinstall in Docker mode (plugin pre-installed)");
+        return;
+      }
 
-  {
-    name: "Reload TEST plugin",
-    async fn(ctx: TestContext) {
-      await ctx.test.lifecycle.reload();
+      // Get dist path relative to project root
+      const distPath = process.cwd() + "/dist";
 
-      // Verify plugin is still enabled after reload
+      console.log(`  Installing from: ${distPath}`);
+      const result = await ctx.test.lifecycle.reinstall(distPath);
+
+      if (!result.success) {
+        throw new Error(`Failed to reinstall plugin: ${result.error}`);
+      }
+
+      // Verify plugin is enabled after reinstall
       const enabled = await ctx.test.plugin.isEnabled();
-      assert(enabled, "Plugin should be enabled after reload");
+      assert(enabled, "Plugin should be enabled after reinstall");
+
+      console.log("  Plugin reinstalled successfully");
     },
   },
 
   {
-    name: "Reload TEST2 plugin",
+    name: "Reinstall TEST2 plugin with fresh code",
     async fn(ctx: TestContext) {
-      await ctx.test2.lifecycle.reload();
+      // Skip in Docker mode - plugin is pre-installed
+      if (isDockerMode) {
+        console.log("  Skipping reinstall in Docker mode (plugin pre-installed)");
+        return;
+      }
 
-      // Verify plugin is still enabled after reload
+      // Get dist path relative to project root
+      const distPath = process.cwd() + "/dist";
+
+      console.log(`  Installing from: ${distPath}`);
+      const result = await ctx.test2.lifecycle.reinstall(distPath);
+
+      if (!result.success) {
+        throw new Error(`Failed to reinstall plugin: ${result.error}`);
+      }
+
+      // Verify plugin is enabled after reinstall
       const enabled = await ctx.test2.plugin.isEnabled();
-      assert(enabled, "Plugin should be enabled after reload");
+      assert(enabled, "Plugin should be enabled after reinstall");
+
+      console.log("  Plugin reinstalled successfully");
     },
   },
 ];

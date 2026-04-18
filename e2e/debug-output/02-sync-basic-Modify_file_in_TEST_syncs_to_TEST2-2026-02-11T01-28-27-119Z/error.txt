@@ -1,0 +1,23 @@
+Test: Modify file in TEST syncs to TEST2
+Suite: 02-sync-basic
+
+Error: File "sync-test-1.md" content mismatch after 20000ms. Expected: "# Sync Test 1 - Modified
+
+This content was updated in TEST.". Got: "# Sync Test 1
+
+Created in TEST, should sync to TEST2."
+
+Stack:
+Error: File "sync-test-1.md" content mismatch after 20000ms. Expected: "# Sync Test 1 - Modified
+
+This content was updated in TEST.". Got: "# Sync Test 1
+
+Created in TEST, should sync to TEST2."
+    at waitForContent (/home/user/Documents/my-projects/peervault/e2e/lib/sync-waiter.ts:133:17)
+    at async fn (/home/user/Documents/my-projects/peervault/e2e/tests/02-sync-basic/02-modify-sync.test.ts:25:28)
+    at async runTest (/home/user/Documents/my-projects/peervault/e2e/lib/context.ts:439:11)
+    at async runTestWithRetry (/home/user/Documents/my-projects/peervault/e2e/runner.ts:321:26)
+    at async <anonymous> (/home/user/Documents/my-projects/peervault/e2e/runner.ts:1097:32)
+    at async <anonymous> (/home/user/Documents/my-projects/peervault/e2e/runner.ts:1101:39)
+    at async runSuite (/home/user/Documents/my-projects/peervault/e2e/runner.ts:1142:20)
+    at async main (/home/user/Documents/my-projects/peervault/e2e/runner.ts:1430:13)

@@ -1,0 +1,52 @@
+{
+  "total": {
+    "TEST": 26,
+    "TEST2": 34
+  },
+  "TEST": [
+    "[log] [WASM] Accept loop: accepted connection from c3dbb9284ad9df24",
+    "[log] [WASM] Accept loop: accepted connection from c3dbb9284ad9df24",
+    "[log] [PeerVault] WASM event: peer_connected [object Object]",
+    "[log] [PeerVault] WASM event: peer_connected",
+    "[log] [WASM] Stream handler started for peer c3dbb9284ad9df24",
+    "[log] [WASM] Stream handler started for peer c3dbb9284ad9df24",
+    "[log] [WASM] Stream handler: waiting for stream from c3dbb9284ad9df24...",
+    "[log] [WASM] Stream handler: waiting for stream from c3dbb9284ad9df24...",
+    "[log] [WASM] Stream handler: accepted stream from c3dbb9284ad9df24",
+    "[log] [WASM] Stream handler: accepted stream from c3dbb9284ad9df24",
+    "[log] [WASM] ACCEPTOR: starting sync protocol for peer c3dbb9284ad9df24",
+    "[log] [WASM] ACCEPTOR: starting sync protocol for peer c3dbb9284ad9df24",
+    "[log] [WASM] ACCEPTOR Step 0: waiting for pairing handshake...",
+    "[log] [WASM] ACCEPTOR Step 0: waiting for pairing handshake...",
+    "[log] [WASM] ACCEPTOR Step 0: received handshake, nonce=none, device=TEST2",
+    "[log] [WASM] ACCEPTOR Step 0: received handshake, nonce=none, device=TEST2",
+    "[log] [WASM] ACCEPTOR Step 0: unknown peer without pairing nonce",
+    "[error] [WASM] ACCEPTOR Step 0: unknown peer without pairing nonce",
+    "[log] [WASM] Stream handler: waiting for stream from c3dbb9284ad9df24...",
+    "[log] [WASM] Stream handler: waiting for stream from c3dbb9284ad9df24..."
+  ],
+  "TEST2": [
+    "[log] [PeerVault] Connecting to peer with nonce: none...",
+    "[log] [PeerVault] Connecting to peer with nonce: none...",
+    "[log] [WASM] connectPeerWithPairing: parsing ticket, nonce=none",
+    "[log] [WASM] connectPeerWithPairing: parsing ticket, nonce=none",
+    "[log] [WASM] connectPeer: peer_id=6f2312e7363f7b3d",
+    "[log] [WASM] connectPeer: peer_id=6f2312e7363f7b3d",
+    "[log] [WASM] connectPeer: connecting...",
+    "[log] [WASM] connectPeer: connecting...",
+    "[log] [WASM] connectPeer: connected!",
+    "[log] [WASM] connectPeer: connected!",
+    "[log] [WASM] connectPeer: storing connection",
+    "[log] [WASM] connectPeer: storing connection",
+    "[log] [WASM] connectPeer: opening stream...",
+    "[log] [WASM] connectPeer: opening stream...",
+    "[log] [WASM] connectPeer: stream opened!",
+    "[log] [WASM] connectPeer: stream opened!",
+    "[log] [WASM] INITIATOR: starting sync protocol",
+    "[log] [WASM] INITIATOR: starting sync protocol",
+    "[log] [WASM] INITIATOR Step 0: sending pairing handshake, nonce=none",
+    "[log] [WASM] INITIATOR Step 0: sending pairing handshake, nonce=none",
+    "[log] [WASM] INITIATOR Step 0: pairing rejected: Pairing required - unknown peer",
+    "[error] [WASM] INITIATOR Step 0: pairing rejected: Pairing required - unknown peer"
+  ]
+}

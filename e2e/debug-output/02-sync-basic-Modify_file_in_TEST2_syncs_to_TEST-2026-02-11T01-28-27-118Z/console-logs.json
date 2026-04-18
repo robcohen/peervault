@@ -1,0 +1,11 @@
+{
+  "total": {
+    "TEST": 2,
+    "TEST2": 0
+  },
+  "TEST": [
+    "[log] [PeerVault] Failed to sync file delete: rapid-modify.md Failed to delete: document not found: rapid-modify.md",
+    "[error] [PeerVault] Failed to sync file delete: rapid-modify.md"
+  ],
+  "TEST2": []
+}

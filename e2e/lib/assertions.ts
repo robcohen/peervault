@@ -2,10 +2,11 @@
  * Custom Assertions
  *
  * Test assertion helpers for E2E tests.
+ * Simplified for the new WASM-based plugin architecture.
  */
 
 import type { VaultController } from "./vault-controller";
-import type { PluginAPI, PeerInfo, SyncStatus } from "./plugin-api";
+import type { PluginAPI, PeerInfo } from "./plugin-api";
 
 export class AssertionError extends Error {
   constructor(message: string) {
@@ -103,34 +104,12 @@ export function assertIncludes(str: string, substring: string, message?: string)
 }
 
 /**
- * Assert that a string matches a regex.
- */
-export function assertMatches(str: string, regex: RegExp, message?: string): void {
-  if (!regex.test(str)) {
-    throw new AssertionError(
-      message || `Expected "${str}" to match ${regex}`
-    );
-  }
-}
-
-/**
  * Assert that a number is greater than a value.
  */
 export function assertGreaterThan(actual: number, expected: number, message?: string): void {
   if (actual <= expected) {
     throw new AssertionError(
       message || `Expected ${actual} to be greater than ${expected}`
-    );
-  }
-}
-
-/**
- * Assert that a number is less than a value.
- */
-export function assertLessThan(actual: number, expected: number, message?: string): void {
-  if (actual >= expected) {
-    throw new AssertionError(
-      message || `Expected ${actual} to be less than ${expected}`
     );
   }
 }
@@ -226,21 +205,6 @@ export async function assertFileContains(
 }
 
 /**
- * Assert that the vault has a specific number of files.
- */
-export async function assertFileCount(
-  vault: VaultController,
-  expectedCount: number
-): Promise<void> {
-  const files = await vault.listFiles();
-  if (files.length !== expectedCount) {
-    throw new AssertionError(
-      `Expected ${expectedCount} files, got ${files.length}`
-    );
-  }
-}
-
-/**
  * Assert that a vault is empty (no user files).
  */
 export async function assertVaultEmpty(vault: VaultController): Promise<void> {
@@ -255,17 +219,22 @@ export async function assertVaultEmpty(vault: VaultController): Promise<void> {
 // ============ Plugin-specific assertions ============
 
 /**
- * Assert that the plugin has a specific status.
+ * Assert that the plugin is enabled.
  */
-export async function assertPluginStatus(
-  plugin: PluginAPI,
-  expectedStatus: SyncStatus
-): Promise<void> {
-  const status = await plugin.getStatus();
-  if (status !== expectedStatus) {
-    throw new AssertionError(
-      `Expected plugin status "${expectedStatus}", got "${status}"`
-    );
+export async function assertPluginEnabled(plugin: PluginAPI): Promise<void> {
+  const enabled = await plugin.isEnabled();
+  if (!enabled) {
+    throw new AssertionError("Plugin is not enabled");
+  }
+}
+
+/**
+ * Assert that the plugin is ready.
+ */
+export async function assertPluginReady(plugin: PluginAPI): Promise<void> {
+  const ready = await plugin.isReady();
+  if (!ready) {
+    throw new AssertionError("Plugin is not ready");
   }
 }
 
@@ -273,10 +242,10 @@ export async function assertPluginStatus(
  * Assert that the plugin has no peers.
  */
 export async function assertNoPeers(plugin: PluginAPI): Promise<void> {
-  const peers = await plugin.getConnectedPeers();
+  const peers = await plugin.getPeers();
   if (peers.length > 0) {
     throw new AssertionError(
-      `Expected no peers, but found ${peers.length}: ${peers.map((p) => p.nodeId.slice(0, 8)).join(", ")}`
+      `Expected no peers, but found ${peers.length}: ${peers.map((p) => p.id.slice(0, 8)).join(", ")}`
     );
   }
 }
@@ -288,7 +257,7 @@ export async function assertPeerCount(
   plugin: PluginAPI,
   expectedCount: number
 ): Promise<void> {
-  const peers = await plugin.getConnectedPeers();
+  const peers = await plugin.getPeers();
   if (peers.length !== expectedCount) {
     throw new AssertionError(
       `Expected ${expectedCount} peers, got ${peers.length}`
@@ -301,45 +270,20 @@ export async function assertPeerCount(
  */
 export async function assertPeerConnected(
   plugin: PluginAPI,
-  nodeId: string
+  peerId: string
 ): Promise<void> {
-  const peers = await plugin.getConnectedPeers();
+  const peers = await plugin.getPeers();
   const peer = peers.find(
-    (p) => p.nodeId === nodeId || p.nodeId.startsWith(nodeId.slice(0, 8))
+    (p) => p.id === peerId || p.id.startsWith(peerId.slice(0, 8))
   );
 
   if (!peer) {
-    throw new AssertionError(`Peer ${nodeId.slice(0, 8)} not found`);
+    throw new AssertionError(`Peer ${peerId.slice(0, 8)} not found`);
   }
 
-  if (peer.connectionState !== "connected") {
+  if (!peer.isConnected) {
     throw new AssertionError(
-      `Peer ${nodeId.slice(0, 8)} is not connected (state: ${peer.connectionState})`
-    );
-  }
-}
-
-/**
- * Assert that the plugin is enabled.
- */
-export async function assertPluginEnabled(plugin: PluginAPI): Promise<void> {
-  const enabled = await plugin.isEnabled();
-  if (!enabled) {
-    throw new AssertionError("Plugin is not enabled");
-  }
-}
-
-/**
- * Assert that plugin version matches expected.
- */
-export async function assertPluginVersion(
-  plugin: PluginAPI,
-  expectedVersion: string
-): Promise<void> {
-  const version = await plugin.getVersion();
-  if (version !== expectedVersion) {
-    throw new AssertionError(
-      `Expected plugin version "${expectedVersion}", got "${version}"`
+      `Peer ${peerId.slice(0, 8)} is not connected`
     );
   }
 }
@@ -351,7 +295,7 @@ export async function assertInCrdt(
   plugin: PluginAPI,
   path: string
 ): Promise<void> {
-  const files = await plugin.getCrdtFiles();
+  const files = await plugin.listFiles();
   if (!files.includes(path)) {
     throw new AssertionError(`File "${path}" not found in CRDT`);
   }
@@ -364,7 +308,7 @@ export async function assertNotInCrdt(
   plugin: PluginAPI,
   path: string
 ): Promise<void> {
-  const files = await plugin.getCrdtFiles();
+  const files = await plugin.listFiles();
   if (files.includes(path)) {
     throw new AssertionError(`File "${path}" should not be in CRDT but is`);
   }
@@ -421,38 +365,79 @@ export async function assertFileInSync(
   }
 }
 
-// ============ Polling assertions ============
+// ============ Retry and Polling assertions ============
+
+/** Options for retry helpers */
+export interface RetryOptions {
+  maxAttempts?: number;
+  delayMs?: number;
+  message?: string;
+}
+
+/**
+ * Retry an async assertion function multiple times until it passes.
+ */
+export async function assertWithRetry(
+  fn: () => Promise<void>,
+  options: RetryOptions = {}
+): Promise<{ attempts: number }> {
+  const { maxAttempts = 3, delayMs = 1000, message } = options;
+
+  let lastError: Error | undefined;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await fn();
+      return { attempts: attempt };
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+
+      if (attempt < maxAttempts) {
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+  }
+
+  const errorMsg = message || `Assertion failed after ${maxAttempts} attempts`;
+  throw new AssertionError(
+    `${errorMsg}: ${lastError?.message || "unknown error"}`
+  );
+}
+
+/**
+ * Retry a check function until it returns true or max attempts reached.
+ */
+export async function retryCheck<T>(
+  check: () => Promise<T>,
+  validate: (result: T) => boolean,
+  options: RetryOptions = {}
+): Promise<T> {
+  const { maxAttempts = 3, delayMs = 1000 } = options;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const result = await check();
+    if (validate(result)) {
+      return result;
+    }
+
+    if (attempt < maxAttempts) {
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+
+  // Return final result even if validation failed
+  return check();
+}
 
 /** Options for assertEventually */
 export interface AssertEventuallyOptions {
-  /** Timeout in milliseconds (default: 10000) */
   timeoutMs?: number;
-  /** Poll interval in milliseconds (default: 200) */
   pollIntervalMs?: number;
-  /** Custom message on failure */
   message?: string;
 }
 
 /**
  * Assert that an async condition becomes true within a timeout.
- * Polls the condition function repeatedly until it returns true or times out.
- *
- * @param condition - Async function that returns true when condition is met
- * @param options - Timeout and polling options
- *
- * @example
- * // Wait for file to exist
- * await assertEventually(
- *   async () => await vault.fileExists("test.md"),
- *   { timeoutMs: 5000, message: "File should exist" }
- * );
- *
- * @example
- * // Wait for peer count
- * await assertEventually(
- *   async () => (await plugin.getConnectedPeers()).length >= 1,
- *   { timeoutMs: 30000 }
- * );
  */
 export async function assertEventually(
   condition: () => Promise<boolean>,
@@ -468,7 +453,6 @@ export async function assertEventually(
       const result = await condition();
       if (result) return;
     } catch (err) {
-      // Store the error for reporting but continue polling
       lastError = err instanceof Error ? err : new Error(String(err));
     }
 
@@ -481,28 +465,121 @@ export async function assertEventually(
 }
 
 /**
- * Assert that an async condition stays true for a duration.
- * Useful for verifying stability (e.g., no unexpected state changes).
- *
- * @param condition - Async function that should remain true
- * @param options - Duration and polling options
+ * Assert that both vaults have the same CRDT file list.
  */
-export async function assertStable(
-  condition: () => Promise<boolean>,
-  options: { durationMs?: number; pollIntervalMs?: number; message?: string } = {}
-): Promise<void> {
-  const { durationMs = 2000, pollIntervalMs = 200, message } = options;
+export async function assertFileListConverges(
+  plugin1: PluginAPI,
+  plugin2: PluginAPI,
+  options: {
+    timeoutMs?: number;
+    stableChecks?: number;
+  } = {}
+): Promise<{ files: string[]; duration: number }> {
+  const { timeoutMs = 20000, stableChecks = 3 } = options;
 
   const startTime = Date.now();
+  const pollIntervalMs = 500;
+  let matchCount = 0;
+  let lastMatchedList: string[] | null = null;
+  let lastFiles1: string[] = [];
+  let lastFiles2: string[] = [];
 
-  while (Date.now() - startTime < durationMs) {
-    const result = await condition();
-    if (!result) {
-      throw new AssertionError(
-        message || `Condition became false after ${Date.now() - startTime}ms`
-      );
+  while (Date.now() - startTime < timeoutMs) {
+    const [files1, files2] = await Promise.all([
+      plugin1.listFiles(),
+      plugin2.listFiles(),
+    ]);
+
+    lastFiles1 = files1.sort();
+    lastFiles2 = files2.sort();
+
+    const list1Str = JSON.stringify(lastFiles1);
+    const list2Str = JSON.stringify(lastFiles2);
+
+    if (list1Str === list2Str) {
+      const currentList = JSON.stringify(lastFiles1);
+      if (lastMatchedList === currentList) {
+        matchCount++;
+      } else {
+        lastMatchedList = currentList;
+        matchCount = 1;
+      }
+
+      if (matchCount >= stableChecks) {
+        return { files: lastFiles1, duration: Date.now() - startTime };
+      }
+    } else {
+      matchCount = 0;
+      lastMatchedList = null;
     }
 
     await new Promise((r) => setTimeout(r, pollIntervalMs));
   }
+
+  const only1 = lastFiles1.filter((f) => !lastFiles2.includes(f));
+  const only2 = lastFiles2.filter((f) => !lastFiles1.includes(f));
+
+  throw new AssertionError(
+    `CRDT file lists did not converge after ${timeoutMs}ms.\n` +
+      `Only in plugin1: [${only1.join(", ")}]\n` +
+      `Only in plugin2: [${only2.join(", ")}]`
+  );
+}
+
+/**
+ * Assert that a file converges to the same content in both vaults.
+ */
+export async function assertConvergesTo(
+  vault1: VaultController,
+  vault2: VaultController,
+  path: string,
+  options: { timeoutMs?: number; stableChecks?: number } = {}
+): Promise<{ content: string; duration: number }> {
+  const { timeoutMs = 30000, stableChecks = 2 } = options;
+
+  const startTime = Date.now();
+  const pollIntervalMs = 500;
+  let matchCount = 0;
+  let lastMatchedContent: string | null = null;
+  let lastContent1 = "";
+  let lastContent2 = "";
+
+  while (Date.now() - startTime < timeoutMs) {
+    try {
+      const [content1, content2] = await Promise.all([
+        vault1.readFile(path),
+        vault2.readFile(path),
+      ]);
+
+      lastContent1 = content1;
+      lastContent2 = content2;
+
+      if (content1 === content2) {
+        if (lastMatchedContent === content1) {
+          matchCount++;
+        } else {
+          lastMatchedContent = content1;
+          matchCount = 1;
+        }
+
+        if (matchCount >= stableChecks) {
+          return { content: content1, duration: Date.now() - startTime };
+        }
+      } else {
+        matchCount = 0;
+        lastMatchedContent = null;
+      }
+    } catch {
+      matchCount = 0;
+      lastMatchedContent = null;
+    }
+
+    await new Promise((r) => setTimeout(r, pollIntervalMs));
+  }
+
+  throw new AssertionError(
+    `File "${path}" did not converge after ${timeoutMs}ms.\n` +
+      `Vault1: "${lastContent1.slice(0, 150)}${lastContent1.length > 150 ? "..." : ""}"\n` +
+      `Vault2: "${lastContent2.slice(0, 150)}${lastContent2.length > 150 ? "..." : ""}"`
+  );
 }

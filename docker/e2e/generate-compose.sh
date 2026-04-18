@@ -79,6 +79,14 @@ HEADER
         CDP_PORT=$((9221 + i))  # 9222, 9223, 9224, ...
         WEB_PORT=$((3000 + i - 1))  # 3000, 3001, 3002, ... (for debugging via browser)
 
+        # Use TEST, TEST2, TEST3 for first 3 clients (matches E2E framework expectations)
+        case $i in
+            1) VAULT="TEST" ;;
+            2) VAULT="TEST2" ;;
+            3) VAULT="TEST3" ;;
+            *) VAULT="client-$i" ;;
+        esac
+
         cat << EOF
   # Client $i (linuxserver/obsidian based)
   client-$i:
@@ -92,7 +100,7 @@ HEADER
       - PUID=1000
       - PGID=1000
       - TZ=Etc/UTC
-      - VAULT_NAME=client-$i
+      - VAULT_NAME=$VAULT
       - CDP_PORT=9222
       - RELAY_URL=http://relay:3340
     volumes:

@@ -1,578 +1,568 @@
 /**
- * PeerVault - P2P sync for Obsidian
+ * PeerVault - P2P Vault Sync for Obsidian
  *
- * Main plugin entry point.
+ * Minimal plugin entry point. All sync logic is in Rust WASM.
  */
 
-import { Plugin, Notice } from "obsidian";
-import { getDeviceHostname, nodeIdToWords } from "./utils/device";
-import type { PeerVaultSettings, SyncStatus, PeerInfo } from "./types";
-import { DEFAULT_SETTINGS, UI_LIMITS, migrateSettings } from "./types";
-import { DocumentManager, waitForLoroWasm } from "./core/document-manager";
-import { ObsidianStorageAdapter } from "./core/storage-adapter";
-import { BlobStore } from "./core/blob-store";
-import { VaultSync } from "./core/vault-sync";
-import { EventEmitter } from "./utils/events";
-import { Logger } from "./utils/logger";
-import {
-  PeerVaultSettingsTab,
-  PeerVaultStatusModal,
-  MergeHistoryModal,
-  recordMerge,
-  ConnectionStatusManager,
-  recordSyncError,
-  updateSyncProgress,
-  FileHistoryModal,
-  ConflictModal,
-  showConfirm,
-} from "./ui";
-import {
-  initConflictTracker,
-  getConflictTracker,
-} from "./core/conflict-tracker";
-import { formatUserError } from "./utils/validation";
-import {
-  IrohTransport,
-  HybridTransport,
-  MockTransport,
-  initIrohWasm,
-  type Transport,
-  type TransportStorage,
-} from "./transport";
-import { PeerManager } from "./peer";
-import { MigrationRunner, MIGRATIONS } from "./core/migration";
-import { GarbageCollector } from "./core/gc";
-import { ConfigErrors } from "./errors";
-import { protocolTracer } from "./utils/protocol-tracer";
-import { VaultKeyManager, deriveDeviceSecret, PairingKeyExchange } from "./crypto";
-import { CloudSync, createCloudSync } from "./cloud";
+import { Plugin, PluginSettingTab, Setting, Notice, TFile, TFolder, TAbstractFile, debounce } from "obsidian";
+import { PeerVaultClient, type ClientConfig, type ClientEvent, type PeerInfo } from "./core/peer-vault-client";
+
+// =============================================================================
+// Settings
+// =============================================================================
+
+interface PeerVaultSettings {
+  deviceName: string;
+  autoSync: boolean;
+  autoSyncInterval: number; // minutes
+  relayUrl: string; // Custom relay URL (empty = use default)
+}
+
+const DEFAULT_SETTINGS: PeerVaultSettings = {
+  deviceName: "",
+  autoSync: true,
+  autoSyncInterval: 5,
+  relayUrl: "",
+};
+
+/** Default relay URL shown in UI */
+const DEFAULT_RELAY_URL = "https://use1-1.relay.n0.computer";
+
+// =============================================================================
+// Plugin
+// =============================================================================
 
 export default class PeerVaultPlugin extends Plugin {
-  settings!: PeerVaultSettings;
-  documentManager!: DocumentManager;
-  storage!: ObsidianStorageAdapter;
-  blobStore!: BlobStore;
-  vaultSync!: VaultSync;
-  transport!: Transport;
-  peerManager!: PeerManager;
-  gc!: GarbageCollector;
-  events = new EventEmitter();
-  logger!: Logger;
-  private vaultKeyManager: VaultKeyManager | null = null;
-  private pairingKeyExchange: PairingKeyExchange | null = null;
-  private cloudSync: CloudSync | null = null;
-
-  private connectionStatus: ConnectionStatusManager | null = null;
-  private syncStatus: SyncStatus = "idle";
-  private peerManagerUnsubscribes: Array<() => void> = [];
+  settings: PeerVaultSettings = DEFAULT_SETTINGS;
+  client: PeerVaultClient | null = null;
+  private autoSyncTimer: number | null = null;
+  // Per-file debounce timers to handle rapid changes to different files
+  private fileChangeTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+  private readonly FILE_CHANGE_DEBOUNCE_MS = 500;
 
   override async onload(): Promise<void> {
-    // Initialize logger
-    this.logger = new Logger(
-      "PeerVault",
-      () => this.settings?.debugMode ?? false,
-    );
-    this.logger.info("Loading PeerVault plugin...");
-
-    // Wait for loro-crdt WASM to initialize (required for mobile compatibility)
-    // On mobile, WASM must be loaded asynchronously due to 4KB sync compilation limit
-    this.logger.debug("Waiting for WASM initialization...");
-    await waitForLoroWasm();
-    this.logger.debug("WASM initialized");
-
-    // Load settings
     await this.loadSettings();
 
-    // Initialize protocol tracer
-    protocolTracer.initialize(this.app);
-    protocolTracer.setEnabled(this.settings.enableProtocolTracing);
-    protocolTracer.setLevel(this.settings.protocolTraceLevel);
-    // Expose for E2E tests
-    (window as unknown as { __protocolTracer: typeof protocolTracer }).__protocolTracer = protocolTracer;
+    // Set device name if not set
+    if (!this.settings.deviceName) {
+      this.settings.deviceName = `Obsidian-${Math.random().toString(36).slice(2, 8)}`;
+      await this.saveSettings();
+    }
 
-    // Debug: log trace to verify tracer is working
-    protocolTracer.trace("", "", "plugin", "initialized", {
-      tracingEnabled: this.settings.enableProtocolTracing,
-      eventCount: (protocolTracer as unknown as { events: unknown[] }).events?.length,
+    // Add settings tab
+    this.addSettingTab(new PeerVaultSettingTab(this.app, this));
+
+    // Add commands
+    this.addCommand({
+      id: "sync-now",
+      name: "Sync now",
+      callback: () => this.syncNow(),
     });
 
-    // Initialize storage adapter
-    this.storage = new ObsidianStorageAdapter(this);
-
-    // Run schema migrations if needed
-    const migrationRunner = new MigrationRunner(
-      this.storage,
-      MIGRATIONS,
-      this.logger,
-    );
-    const migrationResult = await migrationRunner.run((percent, message) => {
-      this.logger.debug(
-        `Migration progress: ${percent.toFixed(0)}% - ${message}`,
-      );
+    this.addCommand({
+      id: "copy-ticket",
+      name: "Copy connection ticket",
+      callback: () => this.copyTicket(),
     });
 
-    if (migrationResult.status === "failed") {
-      this.logger.error("Migration failed:", migrationResult.error);
-      new Notice(
-        `PeerVault: Migration failed - ${migrationResult.error}. Please check the console for details.`,
-      );
-      // Continue loading anyway to allow manual recovery
-    } else if (migrationResult.migrationsRun.length > 0) {
-      this.logger.info(
-        `Migrations completed: ${migrationResult.migrationsRun.join(", ")}`,
-      );
-    }
-
-    // Initialize document manager
-    this.documentManager = new DocumentManager(this.storage, this.logger);
-
-    // Load or create document
-    await this.documentManager.initialize();
-
-    // Initialize blob store for binary files
-    this.blobStore = new BlobStore(this.storage, this.logger);
-
-    // Initialize conflict tracker
-    initConflictTracker(this.logger);
-
-    // Initialize vault sync service
-    this.vaultSync = new VaultSync(
-      this.app,
-      this.documentManager,
-      this.blobStore,
-      this.logger,
-      {
-        maxFileSize: 100 * 1024 * 1024, // 100 MB
-        debounceMs: 500,
-      },
-    );
-
-    // Initialize transport based on settings
-    const transportStorage: TransportStorage = {
-      loadSecretKey: async () => {
-        const data = await this.storage.read("peervault-transport-key");
-        return data;
-      },
-      saveSecretKey: async (key: Uint8Array) => {
-        await this.storage.write("peervault-transport-key", key);
-      },
-    };
-
-    const transportConfig = {
-      storage: transportStorage,
-      logger: this.logger,
-      debug: this.settings.debugMode,
-      relayUrls:
-        this.settings.relayServers.length > 0
-          ? this.settings.relayServers
-          : undefined,
-    };
-
-    // Create transport based on settings
-    if (this.settings.transportType === "mock") {
-      // Mock transport for testing - no WASM needed
-      this.logger.info("Initializing Mock transport (for testing)...");
-      this.transport = new MockTransport({
-        ...transportConfig,
-        crossWindow: true, // Enable cross-window registry for E2E tests
-      });
-    } else {
-      // Initialize Iroh WASM module (bundled inline) - only needed for real transports
-      await initIrohWasm();
-
-      if (this.settings.transportType === "hybrid" && this.settings.enableWebRTC) {
-        // Only use HybridTransport when WebRTC is actually enabled
-        // HybridTransport wraps connections in HybridConnection which adds complexity
-        // for stream detection and can cause race conditions
-        this.logger.info("Initializing Hybrid transport (Iroh + WebRTC)...");
-        this.transport = new HybridTransport({
-          ...transportConfig,
-          enableWebRTC: true,
-          autoUpgradeToWebRTC: this.settings.autoWebRTCUpgrade,
-          webrtcUpgradeTimeout: this.settings.webrtcUpgradeTimeout,
-        });
-      } else {
-        // Use plain IrohTransport when WebRTC is disabled
-        // This avoids the HybridConnection wrapper and its stream detection complexity
-        this.logger.info("Initializing Iroh transport...");
-        this.transport = new IrohTransport(transportConfig);
-      }
-    }
-    this.logger.info("Transport initialized successfully");
-
-    try {
-      await this.transport.initialize();
-    } catch (err) {
-      // Check for WASM memory errors and show user-friendly message
-      const errStr = String(err);
-      if (errStr.includes("Out of memory") || errStr.includes("memory")) {
-        new Notice(
-          "PeerVault: Cannot start - WASM memory exhausted. " +
-          "This can happen after reloading plugins multiple times. " +
-          "Please restart Obsidian to free memory.",
-          15000
-        );
-        this.logger.error("WASM memory exhausted - restart Obsidian to free memory:", err);
-      }
-      throw err;
-    }
-
-    // Initialize vault key manager and pairing key exchange for encryption
-    // Uses the Iroh secret key to derive a device-specific secret
-    const transportSecretKey = await this.getTransportSecretKey();
-    if (transportSecretKey) {
-      const deviceSecret = deriveDeviceSecret(transportSecretKey);
-      this.vaultKeyManager = new VaultKeyManager(this.storage, deviceSecret);
-      // Try to load the vault key into cache
-      const existingKey = await this.vaultKeyManager.getKey();
-      if (existingKey) {
-        this.logger.debug("Vault key loaded from storage");
-      } else {
-        this.logger.debug("No existing vault key found");
-      }
-
-      // Create pairing key exchange handler for vault key sharing during pairing
-      this.pairingKeyExchange = new PairingKeyExchange(this.storage, transportSecretKey);
-      this.logger.debug("Pairing key exchange handler initialized");
-    } else {
-      this.logger.warn("Could not get transport secret key - vault key manager not initialized");
-    }
-
-    // Initialize peer manager with blob store for binary sync
-    // Get hostname - uses os.hostname() on desktop, platform/model detection on mobile
-    const hostname = getDeviceHostname();
-
-    // Use user-defined nickname, or auto-generate from node ID (e.g., "bold-fox-rain")
-    const nodeId = this.transport.getNodeId();
-    const nickname = this.settings.deviceNickname || nodeIdToWords(nodeId);
-
-    this.peerManager = new PeerManager(
-      this.transport,
-      this.documentManager,
-      this.storage,
-      this.logger,
-      {
-        autoSyncInterval: this.settings.syncInterval * 1000,
-        autoReconnect: true,
-        hostname,
-        nickname,
-        pluginVersion: this.manifest.version,
-        enableWebRTC: this.settings.enableWebRTC,
-      },
-      this.blobStore,
-    );
-
-    await this.peerManager.initialize();
-
-    // Set up pairing key exchange on peer manager for vault key sharing
-    if (this.pairingKeyExchange) {
-      this.peerManager.setPairingKeyExchange(this.pairingKeyExchange);
-    }
-
-    // Initialize cloud sync
-    this.cloudSync = createCloudSync(this.documentManager, this.storage, this.logger);
-    this.cloudSync.setBlobStore(this.blobStore);
-    await this.cloudSync.initialize();
-
-    // Set vault key for cloud encryption if available
-    const hasVaultKeyManager = !!this.vaultKeyManager;
-    const hasVaultKey = hasVaultKeyManager && await this.vaultKeyManager!.hasKey();
-    this.logger.info(`Vault key check: manager=${hasVaultKeyManager}, hasKey=${hasVaultKey}`);
-
-    const vaultKey = await this.vaultKeyManager?.getKey();
-    if (vaultKey) {
-      this.logger.info("Vault key loaded, setting on CloudSync");
-      this.cloudSync.setVaultKey(vaultKey);
-      // Re-check CRDT for cloud config now that we have the key to decrypt it
-      // (initialize() couldn't decrypt it because vault key wasn't set yet)
-      await this.cloudSync.checkForConfigUpdate();
-    } else {
-      this.logger.info("No vault key available - cloud config decryption will not work");
-    }
-
-    // Start auto-sync if enabled (check again after potential config update)
-    if (this.settings.cloudAutoSync && this.cloudSync.isConfigured()) {
-      const intervalMs = (this.settings.cloudAutoSyncInterval ?? 5) * 60 * 1000;
-      this.cloudSync.startAutoSync(intervalMs);
-    }
-
-    // Listen for cloud config updates from peers
-    this.cloudSync.on("config:updated", ({ source }) => {
-      if (source === "peer") {
-        new Notice("Cloud sync configured from another device");
-        this.logger.info("Cloud sync auto-configured from peer");
-        // Start auto-sync if enabled in settings
-        if (this.settings.cloudAutoSync && this.cloudSync?.isConfigured()) {
-          const intervalMs = (this.settings.cloudAutoSyncInterval ?? 5) * 60 * 1000;
-          this.cloudSync.startAutoSync(intervalMs);
-        }
-      }
+    this.addCommand({
+      id: "add-peer",
+      name: "Add peer from ticket",
+      callback: () => this.promptAddPeer(),
     });
 
-    // Connect peer manager events to plugin status
-    // Store unsubscribe functions for cleanup on plugin unload
-    this.peerManagerUnsubscribes.push(
-      this.peerManager.on("status:change", (status) => {
-        if (status === "syncing") {
-          this.setSyncStatus("syncing");
-        } else if (status === "idle") {
-          this.setSyncStatus("idle");
-        } else if (status === "error") {
-          this.setSyncStatus("error");
-        } else if (status === "offline") {
-          this.setSyncStatus("offline");
+    // Initialize client
+    await this.initializeClient();
+
+    // Watch for file changes
+    this.registerEvent(
+      this.app.vault.on("modify", (file) => {
+        if (file instanceof TFile) {
+          this.scheduleFileSync(file);
         }
-      }),
+      })
     );
 
-    this.peerManagerUnsubscribes.push(
-      this.peerManager.on("peer:synced", async (nodeId) => {
-      this.logger.info("Synced with peer:", nodeId);
-      updateSyncProgress(null); // Clear progress
-
-      // Get peer info for notification
-      const peer = this.peerManager.getPeers().find((p) => p.nodeId === nodeId);
-      const peerName = peer?.hostname
-        ? (peer.nickname ? `${peer.hostname} (${peer.nickname})` : peer.hostname)
-        : "Unknown Device";
-
-      // Record edits for conflict tracking
-      const tracker = getConflictTracker();
-      const changedPaths = this.documentManager.listAllPaths();
-      for (const path of changedPaths.slice(0, UI_LIMITS.maxTrackedChangedFiles)) {
-        tracker.recordEdit(path, nodeId, peerName);
-      }
-
-      // Check if we need to sync files from document to vault
-      // This happens when a new device joins and receives files from peers
-      if (this.vaultSync.hasDocumentContent()) {
-        this.logger.info("Document has content, syncing to vault...");
-        updateSyncProgress({
-          operation: "Writing files to vault",
-          progress: 0,
-        });
-        try {
-          const stats = await this.vaultSync.syncFromDocument();
-          updateSyncProgress(null);
-
-          // Record merge event
-          if (stats.created > 0 || stats.updated > 0 || stats.failed > 0) {
-            const changedPaths = this.documentManager.listAllPaths();
-            recordMerge(
-              {
-                changedFiles: changedPaths.slice(0, UI_LIMITS.maxMergeNotificationFiles),
-                peerName,
-                peerId: nodeId,
-                timestamp: Date.now(),
-                filesCreated: stats.created,
-                filesUpdated: stats.updated,
-                filesDeleted: 0,
-              },
-              this.app,
-            );
-          }
-        } catch (err) {
-          this.logger.error("Failed to sync from document:", err);
-          updateSyncProgress(null);
+    this.registerEvent(
+      this.app.vault.on("create", (file) => {
+        if (file instanceof TFile) {
+          this.scheduleFileSync(file);
         }
-      }
-
-      // Save document after sync
-      this.documentManager.save().catch((err) => {
-        this.logger.error("Failed to save after sync:", err);
-      });
-
-      // Check if cloud config was received from peer
-      if (this.cloudSync) {
-        this.cloudSync.checkForConfigUpdate().catch((err) => {
-          this.logger.debug("Failed to check cloud config update:", err);
-        });
-      }
-    }),
+      })
     );
 
-    // Handle peer disconnection
-    this.peerManagerUnsubscribes.push(
-      this.peerManager.on("peer:disconnected", ({ nodeId }) => {
-        this.logger.info("Peer disconnected:", nodeId);
-      }),
-    );
-
-    // Handle peer errors
-    this.peerManagerUnsubscribes.push(
-      this.peerManager.on("peer:error", ({ nodeId, error }) => {
-        this.logger.error("Peer error:", nodeId, error);
-        const errorMsg = error.message || String(error);
-
-        // Show user-friendly notification for version mismatch
-        if (errorMsg.includes("protocol v") || errorMsg.includes("upgrade")) {
-          new Notice(errorMsg, 10000); // Show for 10 seconds
+    this.registerEvent(
+      this.app.vault.on("delete", (file) => {
+        if (file instanceof TFile) {
+          this.onFileDelete(file);
+        } else if (file instanceof TFolder) {
+          this.onFolderDelete(file);
         }
-
-        recordSyncError({
-          message: errorMsg,
-          peerId: nodeId,
-          timestamp: Date.now(),
-          retryable: !errorMsg.includes("protocol v"), // Version mismatch is not retryable
-        });
-      }),
+      })
     );
 
-    // Handle vault key received from peer (during pairing)
-    this.peerManagerUnsubscribes.push(
-      this.peerManager.on("vault:key-received", (vaultKey) => {
-        this.logger.info("Vault key received from peer, updating CloudSync");
-        if (this.cloudSync) {
-          this.cloudSync.setVaultKey(vaultKey);
-          // Check if cloud config was synced from peer
-          this.cloudSync.checkForConfigUpdate().catch((err) => {
-            this.logger.debug("Failed to check cloud config after key received:", err);
-          });
+    this.registerEvent(
+      this.app.vault.on("rename", (file, oldPath) => {
+        if (file instanceof TFile) {
+          this.onFileRename(file, oldPath);
+        } else if (file instanceof TFolder) {
+          this.onFolderRename(file, oldPath);
         }
-      }),
+      })
     );
 
-    // Handle blob received - retry syncing binary files that were missing blobs
-    this.peerManagerUnsubscribes.push(
-      this.peerManager.on("blob:received", async (hash) => {
-        this.logger.debug("Blob received:", hash.slice(0, 16) + "...");
-        // Trigger a sync from document to retry writing binary files
-        // that were previously skipped due to missing blobs
-        try {
-          await this.vaultSync.syncFromDocument();
-        } catch (err) {
-          this.logger.error("Failed to sync after blob received:", err);
-        }
-      }),
-    );
-
-    // Handle live updates - track when updates are received for convergence detection
-    // Note: We don't auto-reconcile here because syncFromDocument() can interfere
-    // with incremental updates. Reconciliation happens on peer:synced (initial sync)
-    // and when explicitly triggered by the user or tests.
-    this.peerManagerUnsubscribes.push(
-      this.peerManager.on("live:updates", () => {
-        // Just log for debugging - reconciliation is handled by the event-based system
-        this.logger.debug("Live updates received from peer");
-      }),
-    );
-
-    // Handle vault adoption requests - show confirmation before adopting peer's vault ID
-    this.peerManagerUnsubscribes.push(
-      this.peerManager.on("vault:adoption-request", async ({ nodeId, peerVaultId, ourVaultId, respond }) => {
-      const peer = this.peerManager.getPeers().find(p => p.nodeId === nodeId);
-      const peerName = peer?.hostname || nodeId.slice(0, 8) + "...";
-
-      this.logger.info(`Vault adoption request from ${peerName}: ${peerVaultId.slice(0, 8)}...`);
-
-      const confirmed = await showConfirm(this.app, {
-        title: "Join Sync Network?",
-        message: `The peer "${peerName}" belongs to a different sync network.
-
-To sync with this peer, this vault will join their sync network. This is required for the first connection between devices.
-
-Your vault ID: ${ourVaultId.slice(0, 12)}...
-Peer's network ID: ${peerVaultId.slice(0, 12)}...
-
-Only accept if you trust this peer and want to sync with them.`,
-        confirmText: "Join Network",
-        cancelText: "Deny",
-        isDestructive: false,
-      });
-
-      if (confirmed) {
-        this.logger.info(`User accepted vault adoption from ${peerName}`);
-      } else {
-        this.logger.info(`User denied vault adoption from ${peerName}`);
-      }
-
-      respond(confirmed);
-    }),
-    );
-
-    // Initialize garbage collector
-    this.gc = new GarbageCollector(
-      this.documentManager,
-      this.blobStore,
-      this.storage,
-      this.logger,
-      this.peerManager, // Provides getPeerSyncStates()
-      {
-        enabled: this.settings.gcEnabled,
-        maxDocSizeMB: this.settings.gcMaxDocSizeMB,
-        minHistoryDays: this.settings.gcMinHistoryDays,
-        requirePeerConsensus: this.settings.gcRequirePeerConsensus,
-      },
-    );
-
-    // Set up UI
-    this.setupStatusBar();
-    this.setupCommands();
-    this.setupSettingsTab();
-
-    // Set up file watcher
-    this.setupFileWatcher();
-
-    // Start vault sync service
-    this.vaultSync.start();
-
-    this.logger.info("PeerVault plugin loaded successfully");
-    this.logger.info("Node ID:", this.transport.getNodeId());
+    // Start auto-sync if enabled
+    if (this.settings.autoSync && this.settings.autoSyncInterval > 0) {
+      this.startAutoSync();
+    }
   }
 
-  override onunload(): void {
-    this.logger.info("Unloading PeerVault plugin...");
+  override async onunload(): Promise<void> {
+    this.stopAutoSync();
+    if (this.client) {
+      await this.client.shutdown();
+      this.client = null;
+    }
+  }
 
-    // Unsubscribe from peer manager events (synchronous, prevents listener accumulation)
-    for (const unsubscribe of this.peerManagerUnsubscribes) {
+  // ===========================================================================
+  // Client Management
+  // ===========================================================================
+
+  private async initializeClient(): Promise<void> {
+    try {
+      // Generate vault ID from vault path
+      const vaultId = await this.generateVaultId();
+
+      const config: ClientConfig = {
+        vaultId,
+        deviceName: this.settings.deviceName,
+        relayUrl: this.settings.relayUrl || undefined,
+      };
+
+      this.client = new PeerVaultClient(this.app, config);
+
+      // Listen for events
+      this.client.on((event) => this.handleClientEvent(event));
+
+      await this.client.initialize();
+
+      console.log(`[PeerVault] Initialized with node ID: ${this.client.nodeId}`);
+
+      // Check if we need to do initial vault scan
+      const existingFiles = await this.client.listFiles();
+      if (existingFiles.length === 0) {
+        console.log("[PeerVault] No synced files found, performing initial vault scan...");
+        await this.scanVault();
+      }
+    } catch (e) {
+      console.error("[PeerVault] Failed to initialize:", e);
+      new Notice(`PeerVault: Failed to initialize - ${e}`);
+    }
+  }
+
+  private async scanVault(): Promise<void> {
+    if (!this.client?.isInitialized) return;
+
+    const startTime = Date.now();
+    let fileCount = 0;
+    let errorCount = 0;
+
+    // Get all files in vault
+    const files = this.app.vault.getFiles();
+
+    for (const file of files) {
+      // Skip plugin data
+      if (file.path.startsWith(".obsidian/")) continue;
+
       try {
-        unsubscribe();
-      } catch (err) {
-        this.logger.debug("Error unsubscribing from peer manager:", err);
+        const content = await this.app.vault.readBinary(file);
+        await this.client.setFile(file.path, new Uint8Array(content));
+        fileCount++;
+      } catch (e) {
+        console.error(`[PeerVault] Failed to scan file: ${file.path}`, e);
+        errorCount++;
       }
     }
-    this.peerManagerUnsubscribes = [];
 
-    // Stop cloud sync auto-sync (synchronous)
-    if (this.cloudSync) {
-      this.cloudSync.stopAutoSync();
+    const duration = Date.now() - startTime;
+    console.log(`[PeerVault] Vault scan complete: ${fileCount} files in ${duration}ms (${errorCount} errors)`);
+
+    if (fileCount > 0) {
+      new Notice(`PeerVault: Synced ${fileCount} files from vault`);
+    }
+  }
+
+  private handleClientEvent(event: ClientEvent): void {
+    switch (event.type) {
+      case "initialized":
+        console.log(`[PeerVault] Initialized: ${event.nodeId}`);
+        break;
+
+      case "peer-connected":
+        new Notice(`PeerVault: Connected to ${event.peerName}`);
+        break;
+
+      case "peer-disconnected":
+        console.log(`[PeerVault] Disconnected from ${event.peerId}: ${event.reason}`);
+        break;
+
+      case "sync-started":
+        console.log(`[PeerVault] Sync started with ${event.peerId}`);
+        break;
+
+      case "sync-complete":
+        if (event.result.success) {
+          new Notice(`PeerVault: Synced with ${event.peerId} (${event.result.updatesReceived} received, ${event.result.updatesSent} sent)`);
+          // Apply all CRDT files to disk after sync
+          if (event.result.updatesReceived > 0) {
+            this.syncCrdtToDisk();
+          }
+        }
+        break;
+
+      case "sync-error":
+        console.error(`[PeerVault] Sync error with ${event.peerId}: ${event.error}`);
+        break;
+
+      case "file-changed":
+        if (event.source === "remote") {
+          this.applyRemoteChange(event.path);
+        }
+        break;
+
+      case "pairing-request":
+        // For now, auto-accept known peers, show notice for unknown
+        new Notice(`PeerVault: Connection request from ${event.peerName}. Add them as a peer to sync.`);
+        break;
+
+      case "error":
+        console.error(`[PeerVault] Error: ${event.message}`);
+        break;
+    }
+  }
+
+  private async generateVaultId(): Promise<string> {
+    // Use vault path to generate consistent ID
+    const vaultPath = (this.app.vault.adapter as any).basePath || this.app.vault.getName();
+    const encoder = new TextEncoder();
+    const data = encoder.encode(vaultPath);
+    const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  // ===========================================================================
+  // File Sync
+  // ===========================================================================
+
+  private scheduleFileSync(file: TFile): void {
+    // Cancel any pending sync for this file
+    const existing = this.fileChangeTimers.get(file.path);
+    if (existing) {
+      clearTimeout(existing);
     }
 
-    // Stop vault sync (synchronous)
-    if (this.vaultSync) {
-      this.vaultSync.stop();
+    // Schedule new sync with debounce
+    const timer = setTimeout(() => {
+      this.fileChangeTimers.delete(file.path);
+      this.onFileChange(file);
+    }, this.FILE_CHANGE_DEBOUNCE_MS);
+
+    this.fileChangeTimers.set(file.path, timer);
+  }
+
+  private async onFileChange(file: TFile): Promise<void> {
+    if (!this.client?.isInitialized) return;
+
+    // Skip plugin data
+    if (file.path.startsWith(".obsidian/")) return;
+
+    try {
+      const content = await this.app.vault.readBinary(file);
+      await this.client.setFile(file.path, new Uint8Array(content));
+    } catch (e) {
+      console.error(`[PeerVault] Failed to sync file change: ${file.path}`, e);
     }
+  }
 
-    // Clean up UI (synchronous)
-    this.connectionStatus?.destroy();
+  private async onFileDelete(file: TFile): Promise<void> {
+    if (!this.client?.isInitialized) return;
+    if (file.path.startsWith(".obsidian/")) return;
 
-    // Fire-and-forget async cleanup
-    // Obsidian's onunload() is synchronous, so we can't await
-    void (async () => {
+    try {
+      await this.client.deleteFile(file.path);
+    } catch (e) {
+      console.error(`[PeerVault] Failed to sync file delete: ${file.path}`, e);
+    }
+  }
+
+  private async onFileRename(file: TFile, oldPath: string): Promise<void> {
+    if (!this.client?.isInitialized) return;
+
+    // Skip plugin data
+    const isOldPluginData = oldPath.startsWith(".obsidian/");
+    const isNewPluginData = file.path.startsWith(".obsidian/");
+
+    // If moved into .obsidian, delete from sync
+    if (!isOldPluginData && isNewPluginData) {
       try {
-        // Shut down peer manager
-        if (this.peerManager) {
-          await this.peerManager.shutdown();
-        }
-
-        // Shut down transport
-        if (this.transport) {
-          await this.transport.shutdown();
-        }
-
-        // Save and destroy document manager
-        if (this.documentManager) {
-          await this.documentManager.save();
-          this.documentManager.destroy();
-        }
-
-        this.logger.info("PeerVault async cleanup complete");
-      } catch (err) {
-        this.logger.error("Error during async cleanup:", err);
+        await this.client.deleteFile(oldPath);
+      } catch (e) {
+        console.error(`[PeerVault] Failed to sync file move to .obsidian: ${oldPath}`, e);
       }
-    })();
+      return;
+    }
 
-    this.logger.info("PeerVault plugin unloaded");
+    // If moved out of .obsidian, treat as new file
+    if (isOldPluginData && !isNewPluginData) {
+      try {
+        const content = await this.app.vault.readBinary(file);
+        await this.client.setFile(file.path, new Uint8Array(content));
+      } catch (e) {
+        console.error(`[PeerVault] Failed to sync file move from .obsidian: ${file.path}`, e);
+      }
+      return;
+    }
+
+    // Skip if both in .obsidian
+    if (isOldPluginData && isNewPluginData) return;
+
+    // Normal rename: delete old, create new
+    try {
+      await this.client.deleteFile(oldPath);
+      const content = await this.app.vault.readBinary(file);
+      await this.client.setFile(file.path, new Uint8Array(content));
+    } catch (e) {
+      console.error(`[PeerVault] Failed to sync file rename: ${oldPath} -> ${file.path}`, e);
+    }
+  }
+
+  private async onFolderDelete(folder: TFolder): Promise<void> {
+    if (!this.client?.isInitialized) return;
+    if (folder.path.startsWith(".obsidian/")) return;
+
+    try {
+      // Get all files with this folder prefix and delete them
+      const prefix = folder.path + "/";
+      const files = await this.client.listFiles(prefix);
+
+      for (const filePath of files) {
+        await this.client.deleteFile(filePath);
+      }
+
+      console.log(`[PeerVault] Deleted ${files.length} files from folder: ${folder.path}`);
+    } catch (e) {
+      console.error(`[PeerVault] Failed to sync folder delete: ${folder.path}`, e);
+    }
+  }
+
+  private async onFolderRename(folder: TFolder, oldPath: string): Promise<void> {
+    if (!this.client?.isInitialized) return;
+
+    // Skip plugin data
+    const isOldPluginData = oldPath.startsWith(".obsidian/");
+    const isNewPluginData = folder.path.startsWith(".obsidian/");
+
+    // If moved into .obsidian, delete all files from sync
+    if (!isOldPluginData && isNewPluginData) {
+      try {
+        const prefix = oldPath + "/";
+        const files = await this.client.listFiles(prefix);
+        for (const filePath of files) {
+          await this.client.deleteFile(filePath);
+        }
+      } catch (e) {
+        console.error(`[PeerVault] Failed to sync folder move to .obsidian: ${oldPath}`, e);
+      }
+      return;
+    }
+
+    // If moved out of .obsidian, add all files to sync
+    if (isOldPluginData && !isNewPluginData) {
+      try {
+        const files = this.getAllFilesInFolder(folder);
+        for (const file of files) {
+          const content = await this.app.vault.readBinary(file);
+          await this.client.setFile(file.path, new Uint8Array(content));
+        }
+      } catch (e) {
+        console.error(`[PeerVault] Failed to sync folder move from .obsidian: ${folder.path}`, e);
+      }
+      return;
+    }
+
+    // Skip if both in .obsidian
+    if (isOldPluginData && isNewPluginData) return;
+
+    // Normal rename: update all file paths
+    try {
+      const oldPrefix = oldPath + "/";
+      const newPrefix = folder.path + "/";
+      const files = await this.client.listFiles(oldPrefix);
+
+      for (const oldFilePath of files) {
+        const newFilePath = newPrefix + oldFilePath.slice(oldPrefix.length);
+        const content = await this.client.getFile(oldFilePath);
+        if (content) {
+          await this.client.deleteFile(oldFilePath);
+          await this.client.setFile(newFilePath, content);
+        }
+      }
+
+      console.log(`[PeerVault] Renamed ${files.length} files in folder: ${oldPath} -> ${folder.path}`);
+    } catch (e) {
+      console.error(`[PeerVault] Failed to sync folder rename: ${oldPath} -> ${folder.path}`, e);
+    }
+  }
+
+  private getAllFilesInFolder(folder: TFolder): TFile[] {
+    const files: TFile[] = [];
+    for (const child of folder.children) {
+      if (child instanceof TFile) {
+        files.push(child);
+      } else if (child instanceof TFolder) {
+        files.push(...this.getAllFilesInFolder(child));
+      }
+    }
+    return files;
+  }
+
+  private async applyRemoteChange(path: string): Promise<void> {
+    if (!this.client?.isInitialized) return;
+
+    try {
+      const content = await this.client.getFile(path);
+      if (content) {
+        // Ensure parent directory exists
+        const dir = path.substring(0, path.lastIndexOf("/"));
+        if (dir) {
+          try {
+            await this.app.vault.adapter.mkdir(dir);
+          } catch {
+            // Directory might already exist
+          }
+        }
+        await this.app.vault.adapter.writeBinary(path, content.buffer as ArrayBuffer);
+      } else {
+        // File was deleted remotely
+        try {
+          await this.app.vault.adapter.remove(path);
+        } catch {
+          // May not exist locally
+        }
+      }
+    } catch (e) {
+      console.error(`[PeerVault] Failed to apply remote change: ${path}`, e);
+    }
+  }
+
+  /**
+   * Sync all CRDT files to disk.
+   * Called after receiving updates to ensure all files are written.
+   */
+  private async syncCrdtToDisk(): Promise<void> {
+    if (!this.client?.isInitialized) return;
+
+    try {
+      const crdtFiles = await this.client.listFiles();
+      console.log(`[PeerVault] Syncing ${crdtFiles.length} CRDT files to disk`);
+
+      for (const path of crdtFiles) {
+        // Skip internal CRDT metadata
+        if (path.startsWith("_crdt/")) continue;
+
+        await this.applyRemoteChange(path);
+      }
+    } catch (e) {
+      console.error("[PeerVault] Failed to sync CRDT to disk:", e);
+    }
+  }
+
+  // ===========================================================================
+  // Commands
+  // ===========================================================================
+
+  async syncNow(): Promise<void> {
+    if (!this.client?.isInitialized) {
+      new Notice("PeerVault: Not initialized");
+      return;
+    }
+
+    new Notice("PeerVault: Syncing...");
+    await this.client.syncAll();
+  }
+
+  async copyTicket(): Promise<void> {
+    if (!this.client?.isInitialized) {
+      new Notice("PeerVault: Not initialized");
+      return;
+    }
+
+    try {
+      // Use pairing ticket which includes transport + encryption key
+      const ticket = await this.client.getPairingTicket();
+      await navigator.clipboard.writeText(ticket);
+      new Notice("PeerVault: Pairing ticket copied to clipboard");
+    } catch (e) {
+      new Notice(`PeerVault: Failed to copy ticket - ${e}`);
+    }
+  }
+
+  async promptAddPeer(): Promise<void> {
+    if (!this.client?.isInitialized) {
+      new Notice("PeerVault: Not initialized");
+      return;
+    }
+
+    // Use Obsidian's prompt (simple text input)
+    const ticket = await this.promptForText("Paste peer ticket:");
+    if (!ticket) return;
+
+    try {
+      const peerId = await this.client.addPeer(ticket.trim());
+      new Notice(`PeerVault: Connected to peer ${peerId.slice(0, 8)}`);
+    } catch (e) {
+      new Notice(`PeerVault: Failed to add peer - ${e}`);
+    }
+  }
+
+  promptForText(message: string): Promise<string | null> {
+    return new Promise((resolve) => {
+      const modal = new TextInputModal(this.app, message, resolve);
+      modal.open();
+    });
+  }
+
+  confirm(message: string, confirmText = "Confirm"): Promise<boolean> {
+    return new Promise((resolve) => {
+      const modal = new ConfirmModal(this.app, message, confirmText, resolve);
+      modal.open();
+    });
+  }
+
+  // ===========================================================================
+  // Auto Sync
+  // ===========================================================================
+
+  private startAutoSync(): void {
+    if (this.autoSyncTimer) return;
+
+    const interval = this.settings.autoSyncInterval * 60 * 1000;
+    this.autoSyncTimer = window.setInterval(() => {
+      if (this.client?.isInitialized) {
+        this.client.syncAll().catch((e) => {
+          console.error("[PeerVault] Auto-sync error:", e);
+        });
+      }
+    }, interval);
+  }
+
+  private stopAutoSync(): void {
+    if (this.autoSyncTimer) {
+      clearInterval(this.autoSyncTimer);
+      this.autoSyncTimer = null;
+    }
   }
 
   // ===========================================================================
@@ -580,469 +570,346 @@ Only accept if you trust this peer and want to sync with them.`,
   // ===========================================================================
 
   async loadSettings(): Promise<void> {
-    const savedData = await this.loadData();
-    const { settings, migrated } = migrateSettings(savedData || {});
-    this.settings = settings;
-
-    // Save migrated settings if migration occurred
-    if (migrated) {
-      this.logger?.info("Settings migrated to new version");
-      await this.saveSettings();
-    }
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
   }
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
   }
+}
 
-  // ===========================================================================
-  // UI Setup
-  // ===========================================================================
+// =============================================================================
+// Simple Text Input Modal
+// =============================================================================
 
-  private setupStatusBar(): void {
-    if (!this.settings.showStatusBar) return;
+import { Modal, TextComponent } from "obsidian";
 
-    // Use the new ConnectionStatusManager for real-time updates
-    this.connectionStatus = new ConnectionStatusManager(this, this.app);
-    this.connectionStatus.initialize();
+class TextInputModal extends Modal {
+  private result: string = "";
+  private onSubmit: (result: string | null) => void;
+  private message: string;
+
+  constructor(app: any, message: string, onSubmit: (result: string | null) => void) {
+    super(app);
+    this.message = message;
+    this.onSubmit = onSubmit;
   }
 
-  private setSyncStatus(status: SyncStatus): void {
-    this.syncStatus = status;
-    this.connectionStatus?.update();
-    this.events.emit("status:change", { status });
-  }
+  override onOpen(): void {
+    const { contentEl } = this;
 
-  private setupCommands(): void {
-    // Force sync command
-    this.addCommand({
-      id: "force-sync",
-      name: "Force sync now",
-      callback: async () => {
-        await this.sync();
-      },
+    contentEl.createEl("p", { text: this.message });
+
+    const input = new TextComponent(contentEl);
+    input.inputEl.style.width = "100%";
+    input.onChange((value) => {
+      this.result = value;
     });
-
-    // Device management command - opens settings
-    this.addCommand({
-      id: "pair-device",
-      name: "Manage devices (add/remove)",
-      callback: () => {
-        // Open settings tab
-        this.app.setting.open();
-        this.app.setting.openTabById("peervault");
-      },
-    });
-
-    // Show status command
-    this.addCommand({
-      id: "show-status",
-      name: "Show sync status",
-      callback: () => {
-        new PeerVaultStatusModal(this.app, this).open();
-      },
-    });
-
-    // Show sync history command
-    this.addCommand({
-      id: "show-sync-history",
-      name: "Show sync history",
-      callback: () => {
-        new MergeHistoryModal(this.app).open();
-      },
-    });
-
-    // Show file history command
-    this.addCommand({
-      id: "show-history",
-      name: "Show file history",
-      callback: () => {
-        new FileHistoryModal(this.app, this).open();
-      },
-    });
-
-
-    // View conflicts command
-    this.addCommand({
-      id: "view-conflicts",
-      name: "View concurrent edits",
-      callback: () => {
-        new ConflictModal(this.app, this).open();
-      },
-    });
-
-    // Run garbage collection command
-    this.addCommand({
-      id: "run-gc",
-      name: "Run garbage collection",
-      callback: async () => {
-        new Notice("PeerVault: Running garbage collection...");
-        try {
-          const stats = await this.gc.run((percent, message) => {
-            this.logger.debug(
-              `GC progress: ${percent.toFixed(0)}% - ${message}`,
-            );
-          });
-          const savedMB = (
-            (stats.beforeSize - stats.afterSize) /
-            (1024 * 1024)
-          ).toFixed(2);
-          new Notice(
-            `PeerVault: GC complete - saved ${savedMB} MB, removed ${stats.blobsRemoved} orphaned blobs`,
-          );
-        } catch (error) {
-          this.logger.error("GC failed:", error);
-          new Notice(`PeerVault: GC failed - ${formatUserError(error)}`);
-        }
-      },
-    });
-  }
-
-  private setupSettingsTab(): void {
-    this.addSettingTab(new PeerVaultSettingsTab(this.app, this));
-  }
-
-  // ===========================================================================
-  // File Watching
-  // ===========================================================================
-
-  private setupFileWatcher(): void {
-    // Watch for file changes - route through VaultSync for content syncing
-    this.registerEvent(
-      this.app.vault.on("create", async (file) => {
-        this.logger.debug("File created:", file.path);
-        await this.vaultSync.handleFileCreate(file);
-      }),
-    );
-
-    this.registerEvent(
-      this.app.vault.on("modify", async (file) => {
-        this.logger.debug("File modified:", file.path);
-        await this.vaultSync.handleFileModify(file);
-      }),
-    );
-
-    this.registerEvent(
-      this.app.vault.on("delete", async (file) => {
-        this.logger.debug("File deleted:", file.path);
-        await this.vaultSync.handleFileDelete(file);
-      }),
-    );
-
-    this.registerEvent(
-      this.app.vault.on("rename", async (file, oldPath) => {
-        this.logger.debug("File renamed:", oldPath, "->", file.path);
-        await this.vaultSync.handleFileRename(file, oldPath);
-      }),
-    );
-  }
-
-  // ===========================================================================
-  // Public API
-  // ===========================================================================
-
-  /**
-   * Get the current sync status.
-   */
-  getStatus(): SyncStatus {
-    return this.syncStatus;
-  }
-
-  /**
-   * Get connected peers.
-   */
-  getConnectedPeers(): PeerInfo[] {
-    if (!this.peerManager) return [];
-
-    // Convert peer manager PeerInfo to types.ts PeerInfo
-    return this.peerManager.getPeers().map((p) => ({
-      nodeId: p.nodeId,
-      hostname: p.hostname,
-      nickname: p.nickname,
-      deviceType: "unknown" as const,
-      lastSeen: p.lastSeen ?? p.firstSeen,
-      connectionState:
-        p.state === "synced"
-          ? "connected"
-          : p.state === "syncing"
-            ? "syncing"
-            : p.state === "connecting"
-              ? "connecting"
-              : p.state === "error"
-                ? "error"
-                : "disconnected",
-    }));
-  }
-
-  /**
-   * Manually trigger a sync.
-   */
-  async sync(): Promise<void> {
-    if (!this.peerManager) {
-      this.logger.warn("Peer manager not initialized");
-      return;
-    }
-
-    this.setSyncStatus("syncing");
-    new Notice("PeerVault: Syncing...");
-
-    try {
-      await this.peerManager.syncAll();
-      this.setSyncStatus("idle");
-      new Notice("PeerVault: Sync complete");
-    } catch (error) {
-      this.logger.error("Sync failed:", error);
-      this.setSyncStatus("error");
-      new Notice(`PeerVault: Sync failed - ${formatUserError(error)}`);
-    }
-  }
-
-  /**
-   * Add a peer using a connection ticket.
-   */
-  async addPeer(ticket: string): Promise<void> {
-    if (!this.peerManager) {
-      throw ConfigErrors.invalid("peerManager", "Peer manager not initialized");
-    }
-
-    await this.peerManager.addPeer(ticket);
-  }
-
-  /**
-   * Generate a connection ticket for this device.
-   */
-  async generateInvite(): Promise<string> {
-    if (!this.peerManager) {
-      throw ConfigErrors.invalid("peerManager", "Peer manager not initialized");
-    }
-
-    return this.peerManager.generateInvite();
-  }
-
-  /**
-   * Get this device's node ID.
-   */
-  getNodeId(): string {
-    if (!this.transport) {
-      return "Not initialized";
-    }
-    return this.transport.getNodeId();
-  }
-
-  /**
-   * Get the transport's secret key.
-   * Used to derive the device secret for vault key encryption.
-   */
-  private async getTransportSecretKey(): Promise<Uint8Array | null> {
-    try {
-      const key = await this.storage.read("peervault-transport-key");
-      return key;
-    } catch {
-      return null;
-    }
-  }
-
-  // ============================================================================
-  // Vault Key Management
-  // ============================================================================
-
-  /**
-   * Check if we have a vault encryption key.
-   */
-  hasVaultKey(): boolean {
-    if (!this.vaultKeyManager) {
-      return false;
-    }
-    // Note: This is a sync check that returns cached state
-    // The actual async check happens during initialization
-    return (this.vaultKeyManager as unknown as { cachedKey: Uint8Array | null }).cachedKey !== null;
-  }
-
-  /**
-   * Get the vault encryption key.
-   */
-  async getVaultKey(): Promise<Uint8Array | null> {
-    if (!this.vaultKeyManager) {
-      return null;
-    }
-    return this.vaultKeyManager.getKey();
-  }
-
-  /**
-   * Create a new vault encryption key.
-   */
-  async createVaultKey(): Promise<Uint8Array> {
-    if (!this.vaultKeyManager) {
-      throw new Error("Vault key manager not initialized");
-    }
-    return this.vaultKeyManager.generateAndStoreKey();
-  }
-
-  /**
-   * Import a vault encryption key (e.g., from a passphrase backup).
-   */
-  async importVaultKey(key: Uint8Array): Promise<void> {
-    if (!this.vaultKeyManager) {
-      throw new Error("Vault key manager not initialized");
-    }
-    // Clear existing key first if present
-    if (await this.vaultKeyManager.hasKey()) {
-      await this.vaultKeyManager.clearKey();
-    }
-    await this.vaultKeyManager.storeKey(key);
-  }
-
-  /**
-   * Get the VaultKeyManager instance.
-   * Used by PairingKeyExchange for key sharing during pairing.
-   */
-  getVaultKeyManager(): VaultKeyManager | null {
-    return this.vaultKeyManager;
-  }
-
-  /**
-   * Get the CloudSync instance.
-   * Used by settings UI for cloud storage configuration.
-   */
-  getCloudSync(): CloudSync | null {
-    return this.cloudSync;
-  }
-
-  /**
-   * Get connection info for a peer, including WebRTC status.
-   * Used by E2E tests to verify transport upgrades.
-   */
-  getConnectionInfo(peerId: string): {
-    connected: boolean;
-    transportType: "iroh" | "hybrid";
-    webrtcActive: boolean;
-    webrtcDirect: boolean;
-    rttMs?: number;
-  } | null {
-    if (!this.transport) return null;
-
-    const conn = this.transport.getConnection(peerId);
-    if (!conn) return null;
-
-    // Check if this is a HybridConnection with WebRTC info
-    const hybridConn = conn as {
-      isWebRTCActive?: () => boolean;
-      isDirectConnection?: () => boolean;
-    };
-
-    const isHybrid = typeof hybridConn.isWebRTCActive === "function";
-
-    return {
-      connected: conn.isConnected(),
-      transportType: isHybrid ? "hybrid" : "iroh",
-      webrtcActive: isHybrid ? hybridConn.isWebRTCActive!() : false,
-      webrtcDirect: isHybrid ? hybridConn.isDirectConnection!() : false,
-      rttMs: conn.getRttMs(),
-    };
-  }
-
-  /**
-   * Check if WebRTC is available in this environment.
-   */
-  isWebRTCAvailable(): boolean {
-    return typeof RTCPeerConnection !== "undefined";
-  }
-
-  /**
-   * Get recent plugin logs (for debugging).
-   * Filters to only include WebRTC/Hybrid related logs.
-   */
-  getRecentLogs(count: number = 50): string[] {
-    // Import dynamically to avoid circular deps
-    const { getLogsAsJson } = require("./utils/logger");
-    const logs = getLogsAsJson(count * 2) as Array<{
-      timestamp: string;
-      level: string;
-      prefix: string;
-      message: string;
-    }>;
-
-    return logs
-      .filter((log) => {
-        const fullMsg = `${log.prefix} ${log.message}`;
-        return (
-          fullMsg.includes("Hybrid") ||
-          fullMsg.includes("WebRTC") ||
-          fullMsg.includes("webrtc") ||
-          fullMsg.includes("upgrade")
-        );
-      })
-      .slice(-count)
-      .map((log) => `[${log.level}] ${log.prefix} ${log.message}`);
-  }
-
-  /**
-   * Force attempt WebRTC upgrade for a peer.
-   * Returns debug info about the attempt.
-   */
-  async forceWebRTCUpgrade(peerId: string): Promise<{
-    attempted: boolean;
-    success: boolean;
-    error?: string;
-    debugInfo: string[];
-  }> {
-    const debugInfo: string[] = [];
-
-    if (!this.transport) {
-      return { attempted: false, success: false, error: "No transport", debugInfo };
-    }
-
-    const conn = this.transport.getConnection(peerId);
-    if (!conn) {
-      return { attempted: false, success: false, error: "No connection for peer", debugInfo };
-    }
-
-    // Check if this is a HybridConnection
-    const hybridConn = conn as {
-      isWebRTCActive?: () => boolean;
-      attemptWebRTCUpgrade?: (isInitiator: boolean) => Promise<boolean>;
-    };
-
-    if (!hybridConn.attemptWebRTCUpgrade) {
-      return { attempted: false, success: false, error: "Not a hybrid connection", debugInfo };
-    }
-
-    if (hybridConn.isWebRTCActive?.()) {
-      debugInfo.push("WebRTC already active");
-      return { attempted: false, success: true, debugInfo };
-    }
-
-    // Determine if we should be initiator
-    const myNodeId = this.transport.getNodeId();
-    const shouldInitiate = myNodeId < peerId;
-    debugInfo.push(`myNodeId: ${myNodeId.slice(0, 8)}, peerId: ${peerId.slice(0, 8)}`);
-    debugInfo.push(`shouldInitiate: ${shouldInitiate}`);
-
-    try {
-      debugInfo.push("Attempting WebRTC upgrade...");
-      debugInfo.push(`WebRTC enabled in conn: ${(hybridConn as any).webrtcEnabled}`);
-      debugInfo.push(`Iroh connected: ${(hybridConn as any).irohConn?.isConnected?.()}`);
-      const success = await hybridConn.attemptWebRTCUpgrade(shouldInitiate);
-      debugInfo.push(`Result: ${success}`);
-
-      // Get internal debug info from the connection
-      const connDebug = (hybridConn as any).lastAttemptDebug as string[] | undefined;
-      if (connDebug) {
-        debugInfo.push("--- Connection internal debug ---");
-        for (const line of connDebug) {
-          debugInfo.push(`  ${line}`);
-        }
+    input.inputEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        this.close();
+        this.onSubmit(this.result);
       }
+    });
 
-      // After attempt, check connection state
-      const isActive = hybridConn.isWebRTCActive?.() ?? false;
-      debugInfo.push(`WebRTC active after attempt: ${isActive}`);
+    const buttonDiv = contentEl.createDiv({ cls: "modal-button-container" });
+    buttonDiv.createEl("button", { text: "Cancel" }).addEventListener("click", () => {
+      this.close();
+      this.onSubmit(null);
+    });
+    buttonDiv.createEl("button", { text: "Add", cls: "mod-cta" }).addEventListener("click", () => {
+      this.close();
+      this.onSubmit(this.result);
+    });
 
-      return { attempted: true, success, debugInfo };
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      debugInfo.push(`Error: ${errMsg}`);
-      return { attempted: true, success: false, error: errMsg, debugInfo };
+    input.inputEl.focus();
+  }
+
+  override onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
+// =============================================================================
+// Confirm Modal
+// =============================================================================
+
+class ConfirmModal extends Modal {
+  private onSubmit: (confirmed: boolean) => void;
+  private message: string;
+  private confirmText: string;
+
+  constructor(app: any, message: string, confirmText: string, onSubmit: (confirmed: boolean) => void) {
+    super(app);
+    this.message = message;
+    this.confirmText = confirmText;
+    this.onSubmit = onSubmit;
+  }
+
+  override onOpen(): void {
+    const { contentEl } = this;
+
+    contentEl.createEl("p", { text: this.message });
+
+    const buttonDiv = contentEl.createDiv({ cls: "modal-button-container" });
+    buttonDiv.createEl("button", { text: "Cancel" }).addEventListener("click", () => {
+      this.close();
+      this.onSubmit(false);
+    });
+    buttonDiv.createEl("button", { text: this.confirmText, cls: "mod-warning" }).addEventListener("click", () => {
+      this.close();
+      this.onSubmit(true);
+    });
+  }
+
+  override onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
+// =============================================================================
+// Settings Tab
+// =============================================================================
+
+class PeerVaultSettingTab extends PluginSettingTab {
+  plugin: PeerVaultPlugin;
+  private hasEncryptionKey = false;
+
+  constructor(app: any, plugin: PeerVaultPlugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+
+  override async display(): Promise<void> {
+    const { containerEl } = this;
+    containerEl.empty();
+
+    // Check encryption status
+    this.hasEncryptionKey = (await this.plugin.client?.hasEncryptionKey()) ?? false;
+
+    containerEl.createEl("h2", { text: "PeerVault Settings" });
+
+    // Device name
+    new Setting(containerEl)
+      .setName("Device name")
+      .setDesc("Friendly name for this device")
+      .addText((text) =>
+        text
+          .setPlaceholder("My Laptop")
+          .setValue(this.plugin.settings.deviceName)
+          .onChange(async (value) => {
+            this.plugin.settings.deviceName = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    // Encryption section
+    containerEl.createEl("h3", { text: "Encryption" });
+
+    // Encryption status
+    const statusSetting = new Setting(containerEl)
+      .setName("Encryption key")
+      .setDesc(this.hasEncryptionKey
+        ? "✓ Vault is encrypted"
+        : "⚠ No encryption key set - data will not be encrypted");
+
+    if (!this.hasEncryptionKey) {
+      // Generate key button
+      statusSetting.addButton((btn) =>
+        btn
+          .setButtonText("Generate Key")
+          .setCta()
+          .onClick(async () => {
+            try {
+              await this.plugin.client?.generateEncryptionKey();
+              new Notice("PeerVault: Encryption key generated");
+              this.display();
+            } catch (e) {
+              new Notice(`PeerVault: Failed to generate key - ${e}`);
+            }
+          })
+      );
     }
+
+    // Backup key button
+    if (this.hasEncryptionKey) {
+      new Setting(containerEl)
+        .setName("Backup encryption key")
+        .setDesc("Copy key to clipboard for safekeeping")
+        .addButton((btn) =>
+          btn.setButtonText("Copy Key").onClick(async () => {
+            try {
+              const key = await this.plugin.client?.getEncryptionKey();
+              if (key) {
+                await navigator.clipboard.writeText(key);
+                new Notice("PeerVault: Encryption key copied to clipboard");
+              }
+            } catch (e) {
+              new Notice(`PeerVault: Failed to copy key - ${e}`);
+            }
+          })
+        );
+    }
+
+    // Set from passphrase
+    new Setting(containerEl)
+      .setName("Set key from passphrase")
+      .setDesc("Derive encryption key from a memorable passphrase")
+      .addButton((btn) =>
+        btn.setButtonText("Set Passphrase").onClick(async () => {
+          // Confirm if replacing existing key
+          if (this.hasEncryptionKey) {
+            const confirmed = await this.plugin.confirm(
+              "This will replace your current encryption key. Make sure you have a backup! Continue?",
+              "Replace Key"
+            );
+            if (!confirmed) return;
+          }
+
+          const passphrase = await this.plugin.promptForText("Enter passphrase (min 8 characters):");
+          if (!passphrase) return;
+          if (passphrase.length < 8) {
+            new Notice("PeerVault: Passphrase must be at least 8 characters");
+            return;
+          }
+          try {
+            await this.plugin.client?.deriveEncryptionKey(passphrase);
+            new Notice("PeerVault: Encryption key set from passphrase");
+            this.display();
+          } catch (e) {
+            new Notice(`PeerVault: Failed to set key - ${e}`);
+          }
+        })
+      );
+
+    // Import raw key (advanced)
+    new Setting(containerEl)
+      .setName("Import raw key")
+      .setDesc("Restore a previously backed up hex key (advanced)")
+      .addButton((btn) =>
+        btn.setButtonText("Import").onClick(async () => {
+          // Confirm if replacing existing key
+          if (this.hasEncryptionKey) {
+            const confirmed = await this.plugin.confirm(
+              "This will replace your current encryption key. Make sure you have a backup! Continue?",
+              "Replace Key"
+            );
+            if (!confirmed) return;
+          }
+
+          const key = await this.plugin.promptForText("Paste encryption key (hex):");
+          if (!key) return;
+          try {
+            await this.plugin.client?.setEncryptionKey(key.trim());
+            new Notice("PeerVault: Encryption key imported");
+            this.display();
+          } catch (e) {
+            new Notice(`PeerVault: Invalid key - ${e}`);
+          }
+        })
+      );
+
+    // Auto sync
+    new Setting(containerEl)
+      .setName("Auto sync")
+      .setDesc("Automatically sync with peers")
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.autoSync).onChange(async (value) => {
+          this.plugin.settings.autoSync = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    // Auto sync interval
+    new Setting(containerEl)
+      .setName("Sync interval")
+      .setDesc("Minutes between auto syncs")
+      .addSlider((slider) =>
+        slider
+          .setLimits(1, 60, 1)
+          .setValue(this.plugin.settings.autoSyncInterval)
+          .setDynamicTooltip()
+          .onChange(async (value) => {
+            this.plugin.settings.autoSyncInterval = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    // Connection section
+    containerEl.createEl("h3", { text: "Connection" });
+
+    // Relay URL
+    new Setting(containerEl)
+      .setName("Relay server")
+      .setDesc(`Custom relay URL (leave empty to use default: ${DEFAULT_RELAY_URL}). Requires plugin reload to take effect.`)
+      .addText((text) =>
+        text
+          .setPlaceholder(DEFAULT_RELAY_URL)
+          .setValue(this.plugin.settings.relayUrl)
+          .onChange(async (value) => {
+            this.plugin.settings.relayUrl = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    // Node ID
+    if (this.plugin.client?.nodeId) {
+      new Setting(containerEl)
+        .setName("Node ID")
+        .setDesc(this.plugin.client.nodeId.slice(0, 16) + "...");
+    }
+
+    // Copy ticket button
+    new Setting(containerEl)
+      .setName("Share connection ticket")
+      .setDesc("Copy ticket to share with other devices")
+      .addButton((btn) =>
+        btn.setButtonText("Copy Ticket").onClick(async () => {
+          await this.plugin.copyTicket();
+        })
+      );
+
+    // Add peer button
+    new Setting(containerEl)
+      .setName("Add peer")
+      .setDesc("Connect to another device using their ticket")
+      .addButton((btn) =>
+        btn.setButtonText("Add Peer").onClick(async () => {
+          await this.plugin.promptAddPeer();
+        })
+      );
+
+    // Peers section
+    containerEl.createEl("h3", { text: "Connected Peers" });
+
+    const peers = this.plugin.client?.getPeers() ?? [];
+    if (peers.length === 0) {
+      containerEl.createEl("p", { text: "No peers connected", cls: "setting-item-description" });
+    } else {
+      for (const peer of peers) {
+        new Setting(containerEl)
+          .setName(peer.name)
+          .setDesc(`${peer.isConnected ? "🟢 Connected" : "⚪ Disconnected"} • Last seen: ${new Date(peer.lastSeen).toLocaleString()}`)
+          .addButton((btn) =>
+            btn
+              .setButtonText("Remove")
+              .setWarning()
+              .onClick(async () => {
+                await this.plugin.client?.removePeer(peer.id);
+                this.display(); // Refresh
+              })
+          );
+      }
+    }
+
+    // Sync now button
+    new Setting(containerEl).addButton((btn) =>
+      btn
+        .setButtonText("Sync Now")
+        .setCta()
+        .onClick(async () => {
+          await this.plugin.syncNow();
+        })
+    );
   }
 }

@@ -69,6 +69,10 @@
 
             # Android debugging
             android-tools  # adb, fastboot
+
+            # Formal verification / TLA+
+            tlaplus
+            openjdk  # Required for TLC model checker
           ];
 
           shellHook = ''

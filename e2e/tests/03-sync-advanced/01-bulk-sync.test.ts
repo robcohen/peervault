@@ -47,6 +47,7 @@ export default [
 
   {
     name: "Sync standard test fixture set",
+    tags: ["slow"], // Consistently times out with mock transport
     async fn(ctx: TestContext) {
       const fixtures = createStandardTestSet();
       const count = await loadInlineFixtures(ctx.test2.vault, fixtures);

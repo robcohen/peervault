@@ -5,7 +5,7 @@
  * No hardcoded page IDs - discovers vaults by their window titles.
  */
 
-import { config } from "../config";
+import { config, getCDPEndpoints, isScaledMode } from "../config";
 
 /** CDP target information from /json endpoint */
 export interface CDPTarget {
@@ -27,8 +27,11 @@ export interface VaultPage {
 /**
  * Query the CDP endpoint for available targets.
  */
-async function getTargets(port: number = config.cdp.port): Promise<CDPTarget[]> {
-  const url = `http://127.0.0.1:${port}/json`;
+async function getTargets(
+  host: string = config.cdp.host,
+  port: number = config.cdp.port
+): Promise<CDPTarget[]> {
+  const url = `http://${host}:${port}/json`;
 
   try {
     const response = await fetch(url);
@@ -63,9 +66,10 @@ function extractVaultName(title: string): string | null {
  * Discover all Obsidian vault pages.
  */
 export async function discoverVaults(
+  host: string = config.cdp.host,
   port: number = config.cdp.port
 ): Promise<Map<string, VaultPage>> {
-  const targets = await getTargets(port);
+  const targets = await getTargets(host, port);
   const vaults = new Map<string, VaultPage>();
 
   for (const target of targets) {
@@ -92,24 +96,50 @@ export async function discoverVaults(
  */
 export async function discoverVault(
   vaultName: string,
+  host: string = config.cdp.host,
   port: number = config.cdp.port
 ): Promise<VaultPage | null> {
-  const vaults = await discoverVaults(port);
+  const vaults = await discoverVaults(host, port);
   return vaults.get(vaultName) || null;
 }
 
 /**
+ * Discover vaults across multiple CDP endpoints (for scaled/Docker mode).
+ */
+async function discoverVaultsMultiEndpoint(): Promise<Map<string, VaultPage>> {
+  const endpoints = getCDPEndpoints();
+  const allVaults = new Map<string, VaultPage>();
+
+  for (const endpoint of endpoints) {
+    try {
+      const vaults = await discoverVaults(endpoint.host, endpoint.port);
+      for (const [name, page] of vaults) {
+        allVaults.set(name, page);
+      }
+    } catch (err) {
+      // Endpoint might not be ready yet, continue to others
+      console.warn(`Failed to query ${endpoint.host}:${endpoint.port}: ${err}`);
+    }
+  }
+
+  return allVaults;
+}
+
+/**
  * Wait for specific vaults to be available.
+ * In scaled mode (E2E_CDP_ENDPOINTS set), queries multiple endpoints.
  */
 export async function waitForVaults(
   vaultNames: string[],
   options: {
+    host?: string;
     port?: number;
     timeoutMs?: number;
     pollIntervalMs?: number;
   } = {}
 ): Promise<Map<string, VaultPage>> {
   const {
+    host = config.cdp.host,
     port = config.cdp.port,
     timeoutMs = 60000,
     pollIntervalMs = 1000,
@@ -118,7 +148,10 @@ export async function waitForVaults(
   const startTime = Date.now();
 
   while (Date.now() - startTime < timeoutMs) {
-    const vaults = await discoverVaults(port);
+    // In scaled mode, query multiple endpoints
+    const vaults = isScaledMode
+      ? await discoverVaultsMultiEndpoint()
+      : await discoverVaults(host, port);
 
     const allFound = vaultNames.every((name) => vaults.has(name));
     if (allFound) {
@@ -135,7 +168,9 @@ export async function waitForVaults(
   }
 
   // Timeout - report which vaults are missing
-  const vaults = await discoverVaults(port);
+  const vaults = isScaledMode
+    ? await discoverVaultsMultiEndpoint()
+    : await discoverVaults(host, port);
   const missing = vaultNames.filter((name) => !vaults.has(name));
   const found = vaultNames.filter((name) => vaults.has(name));
 
@@ -151,12 +186,13 @@ export async function waitForVaults(
  * Print discovered vaults for debugging.
  */
 export async function printDiscoveredVaults(
+  host: string = config.cdp.host,
   port: number = config.cdp.port
 ): Promise<void> {
-  console.log(`Discovering vaults on port ${port}...`);
+  console.log(`Discovering vaults at ${host}:${port}...`);
 
   try {
-    const vaults = await discoverVaults(port);
+    const vaults = await discoverVaults(host, port);
 
     if (vaults.size === 0) {
       console.log("No Obsidian vaults found.");

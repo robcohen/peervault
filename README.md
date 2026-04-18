@@ -10,6 +10,7 @@ P2P sync for Obsidian using Loro CRDT and Iroh transport. Sync your vaults direc
 - **End-to-end encrypted** - All data encrypted in transit
 - **Full history** - Edit history preserved; deletions are recoverable
 - **Device groups** - Organize devices with per-group sync policies
+- **Cloud backup** - Optional S3-compatible cloud sync with encryption
 
 ## Installation
 
@@ -52,6 +53,65 @@ Sync happens automatically when devices are connected. You can also:
 - Use Command Palette: "PeerVault: Sync now"
 - Configure auto-sync interval in settings
 
+### Cloud Sync (Optional)
+
+PeerVault supports optional cloud backup to any S3-compatible storage (AWS S3, MinIO, Backblaze B2, etc.). All data is encrypted before upload.
+
+#### Setup
+
+1. Open PeerVault settings > Cloud Sync
+2. Enter your S3 credentials:
+   - **Endpoint**: S3 API URL (e.g., `https://s3.amazonaws.com` or `http://localhost:9000` for MinIO)
+   - **Bucket**: Your bucket name
+   - **Access Key**: S3 access key ID
+   - **Secret Key**: S3 secret access key
+   - **Region**: AWS region (e.g., `us-east-1`)
+3. Set a vault encryption key (passphrase-derived)
+4. Click "Save & Test Connection"
+
+#### Features
+
+- **Encrypted uploads**: All CRDT deltas and blobs are encrypted with XSalsa20-Poly1305 before upload
+- **Auto-sync**: Configure automatic cloud sync interval (e.g., every 5 minutes)
+- **Commit history**: Browse and restore from previous snapshots
+- **Conflict resolution**: Automatic CRDT merge with configurable strategies
+- **Progress tracking**: Real-time progress for large syncs
+- **Backup & restore**: Export all cloud data as an encrypted `.pvbackup` file
+
+#### Backup & Restore
+
+PeerVault supports full cloud backup export and import:
+
+- **Export Backup**: Download all cloud data (deltas, blobs, commits) as a single encrypted `.pvbackup` file
+- **Import Backup**: Restore from a backup file to your cloud storage
+- **Download from Cloud**: Pull all cloud data to restore a fresh device
+
+All backups are encrypted with your vault key, so keep your passphrase safe!
+
+#### Using MinIO for Local Testing
+
+[MinIO](https://min.io) is a lightweight S3-compatible server for local development:
+
+```bash
+# Install and start MinIO (from project root)
+just minio-start
+
+# Configuration for PeerVault:
+# Endpoint:   http://localhost:9000
+# Bucket:     peervault-test
+# Access Key: minioadmin
+# Secret Key: minioadmin
+# Region:     us-east-1
+
+# Stop MinIO
+just minio-stop
+
+# View status
+just minio-status
+```
+
+MinIO also provides a web console at http://localhost:9001.
+
 ## Architecture
 
 ```
@@ -85,6 +145,7 @@ Sync happens automatically when devices are connected. You can also:
 | `PeerManager` | `src/peer/peer-manager.ts` | Peer connections, pairing |
 | `SyncSession` | `src/sync/sync-session.ts` | Sync protocol implementation |
 | `IrohTransport` | `src/transport/iroh-transport.ts` | P2P networking via WASM |
+| `CloudSync` | `src/cloud/cloud-sync.ts` | S3 cloud backup, encryption |
 
 ### Technology Stack
 
@@ -148,6 +209,7 @@ just wasm-check
 ```
 peervault/
 ├── src/
+│   ├── cloud/          # Cloud sync (S3 client, encryption)
 │   ├── core/           # Document management, vault sync
 │   ├── peer/           # Peer management, groups
 │   ├── sync/           # Sync protocol, messages
@@ -155,8 +217,9 @@ peervault/
 │   ├── ui/             # Settings, modals, status bar
 │   └── utils/          # Shared utilities
 ├── peervault-iroh/     # Rust WASM bindings for Iroh
+├── e2e/                # End-to-end test suite
 ├── spec/               # Design specifications
-└── tests/              # Test suites
+└── tests/              # Unit test suites
 ```
 
 ### Testing
