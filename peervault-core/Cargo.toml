@@ -1,0 +1,114 @@
+[package]
+name = "peervault-core"
+version = "0.1.0"
+edition = "2021"
+description = "Portable P2P document sync core - embeddable in any host application"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/robcohen/peervault"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[features]
+default = ["native"]
+native = ["tokio/rt-multi-thread", "reqwest/rustls-tls"]
+# Note: In WASM, reqwest uses browser fetch API automatically
+# WASM target for browser/JS embedding
+wasm = [
+    "wasm-bindgen",
+    "wasm-bindgen-futures",
+    "js-sys",
+    "web-sys",
+    "getrandom_02",
+    "getrandom",
+    "console_error_panic_hook",
+    "n0-future",
+    "tracing-subscriber",
+    "tracing-subscriber-wasm",
+    "serde-wasm-bindgen",
+]
+
+[dependencies]
+# Async runtime - minimal features for WASM compatibility
+tokio = { version = "1", default-features = false, features = ["sync"] }
+
+# Iroh networking (P2P transport)
+# Use default-features = false for WASM compatibility
+iroh = { version = "0.95", default-features = false }
+iroh-tickets = { version = "0.2", default-features = false }
+iroh-blobs = { version = "0.97", default-features = false }
+
+# Loro CRDT - high-performance collaborative data structures
+loro = "1.10"
+
+# Crypto
+chacha20poly1305 = "0.10"
+xsalsa20poly1305 = "0.9"   # NaCl secretbox compatible
+sha2 = "0.10"
+hmac = "0.12"  # For AWS Signature V4
+hkdf = "0.12"
+rand = "0.9"
+
+# ECIES for key exchange (replaces manual x25519 + HKDF + encrypt)
+# Uses x25519 curve with XChaCha20-Poly1305, pure Rust for WASM
+ecies = { version = "0.2", default-features = false, features = ["x25519", "xchacha20"] }
+
+# HTTP client (for S3) - works in both native and WASM
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+
+# Hex encoding
+hex = "0.4"
+
+# URL encoding (for S3 queries)
+urlencoding = "2"
+
+# Base64 encoding (for tickets)
+base64 = "0.22"
+
+# Async utilities
+futures = "0.3"
+
+# Time - web-time works in both native and WASM
+web-time = "1"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+
+# WASM bindings (optional) - pin exact version to match iroh-examples
+wasm-bindgen = { version = "=0.2.105", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
+web-sys = { version = "0.3", optional = true, features = [
+    "Crypto",
+    "Window",
+    "console",
+] }
+# getrandom 0.2 for our code
+getrandom_02 = { package = "getrandom", version = "0.2", optional = true, features = ["js"] }
+# getrandom 0.3 for dependencies (iroh etc)
+getrandom = { version = "0.3", optional = true, features = ["wasm_js"] }
+# Better panic messages in WASM
+console_error_panic_hook = { version = "0.1", optional = true }
+# Async utilities for WASM
+n0-future = { version = "0.3", optional = true }
+# Logging for WASM
+tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter"] }
+tracing-subscriber-wasm = { version = "0.1", optional = true }
+# WASM serialization helpers
+serde-wasm-bindgen = { version = "0.6", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+wasm-bindgen-test = "0.3"
