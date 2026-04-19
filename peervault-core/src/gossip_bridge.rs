@@ -75,47 +75,6 @@ impl GossipBridge {
         GOSSIP_ALPN
     }
 
-    /// Subscribe to the vault topic with bootstrap peers.
-    /// Called after initial sync with a peer completes.
-    /// Safe to call multiple times — only subscribes once, adds new peers.
-    pub async fn subscribe(
-        &self,
-        bootstrap_peers: Vec<iroh::EndpointId>,
-    ) -> Result<(), CoreError> {
-        let already = *self.subscribed.read().await;
-
-        if already {
-            // Already subscribed — just add the new peers
-            if let Some(sender) = self.sender.read().await.as_ref() {
-                if !bootstrap_peers.is_empty() {
-                    sender.join_peers(bootstrap_peers).await
-                        .map_err(|e| CoreError::Internal(format!("Gossip join_peers: {}", e)))?;
-                }
-            }
-            return Ok(());
-        }
-
-        info!("Subscribing to vault gossip topic with {} bootstrap peers", bootstrap_peers.len());
-
-        let topic = self.gossip.subscribe_and_join(self.vault_topic, bootstrap_peers).await
-            .map_err(|e| CoreError::Internal(format!("Gossip subscribe: {}", e)))?;
-
-        let (sender, receiver) = topic.split();
-
-        *self.sender.write().await = Some(sender);
-        *self.subscribed.write().await = true;
-
-        info!("Subscribed to vault gossip topic");
-
-        // Return the receiver — caller is responsible for spawning the receive loop
-        // We store it via spawn_receiver() below
-        // For now, just drop the receiver — it will be handled by the caller
-        // TODO: The receiver needs to be passed to spawn_receiver
-        drop(receiver);
-
-        Ok(())
-    }
-
     /// Subscribe and return the receiver for the caller to spawn a receive loop.
     /// Serialized via mutex to prevent double-subscribe race.
     pub async fn subscribe_with_receiver(
@@ -206,6 +165,7 @@ impl GossipBridge {
         &self,
         bootstrap_peers: Vec<iroh::EndpointId>,
     ) -> Result<iroh_gossip::api::GossipReceiver, CoreError> {
+        let _guard = self.subscribe_mutex.lock().await;
         // Reset state
         *self.sender.write().await = None;
         *self.subscribed.write().await = false;

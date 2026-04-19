@@ -42,6 +42,8 @@ export default class PeerVaultPlugin extends Plugin {
   // Debounce timer for CRDT-to-disk sync (triggered by gossip updates)
   private crdtSyncTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly CRDT_SYNC_DEBOUNCE_MS = 500;
+  // Guard against concurrent syncCrdtToDisk calls
+  private crdtSyncRunning = false;
 
   override async onload(): Promise<void> {
     await this.loadSettings();
@@ -122,6 +124,15 @@ export default class PeerVaultPlugin extends Plugin {
 
   override async onunload(): Promise<void> {
     this.stopAutoSync();
+    // Clear debounce timers
+    if (this.crdtSyncTimer) {
+      clearTimeout(this.crdtSyncTimer);
+      this.crdtSyncTimer = null;
+    }
+    for (const timer of this.fileChangeTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.fileChangeTimers.clear();
     if (this.client) {
       await this.client.shutdown();
       this.client = null;
@@ -235,7 +246,9 @@ export default class PeerVaultPlugin extends Plugin {
 
       case "file-changed":
         if (event.source === "remote") {
-          this.applyRemoteChange(event.path);
+          this.applyRemoteChange(event.path).catch((e) => {
+            console.error(`[PeerVault] Failed to apply remote change for ${event.path}:`, e);
+          });
         }
         break;
 
@@ -485,6 +498,8 @@ export default class PeerVaultPlugin extends Plugin {
 
   private async syncCrdtToDisk(): Promise<void> {
     if (!this.client?.isInitialized) return;
+    if (this.crdtSyncRunning) return; // Prevent concurrent runs
+    this.crdtSyncRunning = true;
 
     try {
       const crdtFiles = await this.client.listFiles();
@@ -498,6 +513,8 @@ export default class PeerVaultPlugin extends Plugin {
       }
     } catch (e) {
       console.error("[PeerVault] Failed to sync CRDT to disk:", e);
+    } finally {
+      this.crdtSyncRunning = false;
     }
   }
 

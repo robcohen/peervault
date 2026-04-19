@@ -868,7 +868,8 @@ impl WasmPeerVault {
                     RelayMode::Custom(RelayMap::from_iter(vec![relay]))
                 }
                 None => {
-                    let relay: RelayUrl = "https://use1-1.relay.n0.computer".parse().unwrap();
+                    let relay: RelayUrl = "https://use1-1.relay.n0.computer".parse()
+                        .map_err(|e| JsValue::from_str(&format!("Default relay URL parse failed: {}", e)))?;
                     RelayMode::Custom(RelayMap::from_iter(vec![relay]))
                 }
             };
@@ -964,7 +965,8 @@ impl WasmPeerVault {
                     RelayMode::Custom(RelayMap::from_iter(vec![relay]))
                 }
                 None => {
-                    let relay: RelayUrl = "https://use1-1.relay.n0.computer".parse().unwrap();
+                    let relay: RelayUrl = "https://use1-1.relay.n0.computer".parse()
+                        .map_err(|e| JsValue::from_str(&format!("Default relay URL parse failed: {}", e)))?;
                     RelayMode::Custom(RelayMap::from_iter(vec![relay]))
                 }
             };
@@ -1968,15 +1970,19 @@ async fn run_initiator_sync_v3(
                 blob_count: 0,
             })).await.map_err(map_err)?;
 
-            // Wait for peer's blob sync completion (with message limit to prevent infinite loop)
+            // Wait for peer's blob sync completion (with message limit)
+            let mut blob_sync_done = false;
             for _ in 0..100 {
                 match recv_sync_msg(stream).await.map_err(map_err)? {
-                    SyncMessage::BlobSyncComplete(_) => break,
+                    SyncMessage::BlobSyncComplete(_) => { blob_sync_done = true; break; }
                     SyncMessage::Error(e) => {
                         return Err(JsValue::from_str(&format!("Blob sync error: {}", e.message)));
                     }
                     _ => continue,
                 }
+            }
+            if !blob_sync_done {
+                warn!("Blob sync completion not received after 100 messages");
             }
         }
     }
@@ -2136,7 +2142,7 @@ async fn handle_incoming_streams_v3_inner(
         protocol_version: PROTOCOL_VERSION,
         vault_id: *engine.vault_id(),
         version_bytes: engine.version_vector(),
-        hostname: "PeerVault".to_string(), // TODO: use device_name from WasmPeerVault
+        hostname: format!("PeerVault-{}", &hex::encode(engine.vault_id())[..8]),
         nickname: None,
         has_vault_key: true,
         plugin_version: None,
@@ -2349,21 +2355,21 @@ async fn run_gossip_receiver(
                     }
                 }
                 Ok(Event::NeighborUp(peer)) => {
-                    info!("Gossip: neighbor joined: {:?}", peer);
+                    info!("Gossip: neighbor joined: {}", peer);
                     if let Some(ref callback) = on_event {
                         let event = serde_json::json!({
                             "type": "gossip_neighbor_up",
-                            "peer_id": format!("{:?}", peer),
+                            "peer_id": peer.to_string(),
                         });
                         let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(&event.to_string()));
                     }
                 }
                 Ok(Event::NeighborDown(peer)) => {
-                    info!("Gossip: neighbor left: {:?}", peer);
+                    info!("Gossip: neighbor left: {}", peer);
                     if let Some(ref callback) = on_event {
                         let event = serde_json::json!({
                             "type": "gossip_neighbor_down",
-                            "peer_id": format!("{:?}", peer),
+                            "peer_id": peer.to_string(),
                         });
                         let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(&event.to_string()));
                     }
@@ -2569,8 +2575,11 @@ async fn run_accept_loop(
                 warn!(error = %e, "Failed to accept connection");
                 // Small delay before retrying on error
                 let promise = js_sys::Promise::new(&mut |resolve, _| {
-                    let window = web_sys::window().expect("no window");
-                    window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 100).ok();
+                    if let Some(window) = web_sys::window() {
+                        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 100);
+                    } else {
+                        let _ = resolve.call0(&JsValue::NULL);
+                    }
                 });
                 let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
             }

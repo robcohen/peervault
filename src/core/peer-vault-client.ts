@@ -600,9 +600,8 @@ export class PeerVaultClient {
 
         case "gossip_neighbor_up":
           console.log(`[PeerVault] Gossip neighbor joined: ${event.peer_id}`);
-          // Update peer connection status
           for (const peer of this.peers) {
-            if (event.peer_id.includes(peer.id.slice(0, 16))) {
+            if (peer.id === event.peer_id) {
               peer.isConnected = true;
               peer.lastSeen = Date.now();
             }
@@ -612,7 +611,7 @@ export class PeerVaultClient {
         case "gossip_neighbor_down":
           console.log(`[PeerVault] Gossip neighbor left: ${event.peer_id}`);
           for (const peer of this.peers) {
-            if (event.peer_id.includes(peer.id.slice(0, 16))) {
+            if (peer.id === event.peer_id) {
               peer.isConnected = false;
             }
           }
