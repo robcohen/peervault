@@ -26,14 +26,12 @@ impl SyncHandler {
 
 impl ProtocolHandler for SyncHandler {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        // Connection is Clone — the channel receiver gets a clone.
+        // We can return immediately; the clone in the channel keeps the connection alive.
         self.incoming_tx
             .send(connection)
             .await
             .map_err(|e| AcceptError::from_err(e))?;
-        // Don't return — keep this task alive so the connection isn't dropped.
-        // The receiver will handle the connection and eventually close it.
-        // We use a future that never resolves; the Router will abort it on shutdown.
-        std::future::pending::<()>().await;
         Ok(())
     }
 }

@@ -12,7 +12,7 @@ use iroh::Endpoint;
 use iroh_gossip::net::{Gossip, GOSSIP_ALPN};
 use iroh_gossip::proto::TopicId;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::crypto::VaultKey;
@@ -37,6 +37,8 @@ pub struct GossipBridge {
     sender: Arc<RwLock<Option<iroh_gossip::api::GossipSender>>>,
     /// Whether we've subscribed to the topic
     subscribed: Arc<RwLock<bool>>,
+    /// Serializes subscription attempts to prevent double-subscribe race
+    subscribe_mutex: Arc<Mutex<()>>,
     /// Version vector captured before first pending change (for delta export)
     pending_vv: Arc<RwLock<Option<Vec<u8>>>>,
     /// Notify channel to signal the debounce timer
@@ -57,6 +59,7 @@ impl GossipBridge {
             vault_topic,
             sender: Arc::new(RwLock::new(None)),
             subscribed: Arc::new(RwLock::new(false)),
+            subscribe_mutex: Arc::new(Mutex::new(())),
             pending_vv: Arc::new(RwLock::new(None)),
             change_notify: Arc::new(tokio::sync::Notify::new()),
         }
@@ -114,10 +117,14 @@ impl GossipBridge {
     }
 
     /// Subscribe and return the receiver for the caller to spawn a receive loop.
+    /// Serialized via mutex to prevent double-subscribe race.
     pub async fn subscribe_with_receiver(
         &self,
         bootstrap_peers: Vec<iroh::EndpointId>,
     ) -> Result<Option<iroh_gossip::api::GossipReceiver>, CoreError> {
+        // Serialize subscription attempts
+        let _guard = self.subscribe_mutex.lock().await;
+
         let already = *self.subscribed.read().await;
 
         if already {

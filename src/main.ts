@@ -39,6 +39,9 @@ export default class PeerVaultPlugin extends Plugin {
   // Per-file debounce timers to handle rapid changes to different files
   private fileChangeTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private readonly FILE_CHANGE_DEBOUNCE_MS = 500;
+  // Debounce timer for CRDT-to-disk sync (triggered by gossip updates)
+  private crdtSyncTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly CRDT_SYNC_DEBOUNCE_MS = 500;
 
   override async onload(): Promise<void> {
     await this.loadSettings();
@@ -223,7 +226,7 @@ export default class PeerVaultPlugin extends Plugin {
 
       case "gossip-update":
         console.log(`[PeerVault] Gossip update received (${event.bytes} bytes)`);
-        this.syncCrdtToDisk();
+        this.scheduleCrdtSync();
         break;
 
       case "sync-error":
@@ -466,6 +469,20 @@ export default class PeerVaultPlugin extends Plugin {
    * Sync all CRDT files to disk.
    * Called after receiving updates to ensure all files are written.
    */
+  /**
+   * Schedule a debounced CRDT-to-disk sync.
+   * Coalesces rapid gossip updates into a single disk write.
+   */
+  private scheduleCrdtSync(): void {
+    if (this.crdtSyncTimer) {
+      clearTimeout(this.crdtSyncTimer);
+    }
+    this.crdtSyncTimer = setTimeout(() => {
+      this.crdtSyncTimer = null;
+      this.syncCrdtToDisk();
+    }, this.CRDT_SYNC_DEBOUNCE_MS);
+  }
+
   private async syncCrdtToDisk(): Promise<void> {
     if (!this.client?.isInitialized) return;
 

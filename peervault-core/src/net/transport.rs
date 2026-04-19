@@ -71,7 +71,8 @@ impl IrohTransport {
         Self::with_secret_key_relay_and_blobs(secret_key, relay_url, mem_store).await
     }
 
-    /// Create a new transport with iroh-blobs MemStore (no gossip)
+    /// Create a new transport with iroh-blobs MemStore (no gossip).
+    /// For gossip support, use `from_endpoint` with a pre-created Gossip instance.
     pub async fn with_secret_key_relay_and_blobs(
         secret_key: SecretKey,
         relay_url: Option<&str>,
@@ -96,16 +97,13 @@ impl IrohTransport {
             .bind()
             .await?;
 
-        // Create a default gossip for backward compat
-        let gossip = Gossip::builder().spawn(endpoint.clone());
-
         let (sync_handler, incoming_rx) = SyncHandler::new(32);
         let blobs_protocol = BlobsProtocol::new(&mem_store, None);
 
+        // No gossip — only sync + blobs
         let router = Router::builder(endpoint.clone())
             .accept(PEERVAULT_SYNC_ALPN, sync_handler)
             .accept(iroh_blobs::ALPN, blobs_protocol)
-            .accept(iroh_gossip::net::GOSSIP_ALPN, gossip)
             .spawn();
 
         Ok(Self {

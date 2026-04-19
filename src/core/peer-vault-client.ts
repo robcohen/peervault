@@ -161,6 +161,7 @@ export class PeerVaultClient {
   private vault: WasmPeerVault | null = null;
   private _nodeId: string | null = null;
   private _initialized = false;
+  private _syncInProgress = false;
 
   // Peer tracking (persisted separately since WASM doesn't expose peer list)
   private peers: PeerInfo[] = [];
@@ -587,20 +588,34 @@ export class PeerVaultClient {
           break;
 
         case "sync_needed":
-          // Delta too large for gossip — trigger point-to-point sync
+          // Delta too large for gossip — trigger point-to-point sync (with guard)
           console.log(`[PeerVault] Sync needed: ${event.reason} (${event.size} bytes > ${event.max})`);
-          // Trigger syncAll to push the large change via point-to-point
-          this.syncAll().catch((e) => {
-            console.error("[PeerVault] Auto sync after large delta failed:", e);
-          });
+          if (!this._syncInProgress) {
+            this._syncInProgress = true;
+            this.syncAll()
+              .catch((e) => console.error("[PeerVault] Auto sync after large delta failed:", e))
+              .finally(() => { this._syncInProgress = false; });
+          }
           break;
 
         case "gossip_neighbor_up":
           console.log(`[PeerVault] Gossip neighbor joined: ${event.peer_id}`);
+          // Update peer connection status
+          for (const peer of this.peers) {
+            if (event.peer_id.includes(peer.id.slice(0, 16))) {
+              peer.isConnected = true;
+              peer.lastSeen = Date.now();
+            }
+          }
           break;
 
         case "gossip_neighbor_down":
           console.log(`[PeerVault] Gossip neighbor left: ${event.peer_id}`);
+          for (const peer of this.peers) {
+            if (event.peer_id.includes(peer.id.slice(0, 16))) {
+              peer.isConnected = false;
+            }
+          }
           break;
 
         case "error":

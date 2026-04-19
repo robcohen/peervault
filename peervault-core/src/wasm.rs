@@ -1968,10 +1968,13 @@ async fn run_initiator_sync_v3(
                 blob_count: 0,
             })).await.map_err(map_err)?;
 
-            // Wait for peer's completion
-            loop {
+            // Wait for peer's blob sync completion (with message limit to prevent infinite loop)
+            for _ in 0..100 {
                 match recv_sync_msg(stream).await.map_err(map_err)? {
                     SyncMessage::BlobSyncComplete(_) => break,
+                    SyncMessage::Error(e) => {
+                        return Err(JsValue::from_str(&format!("Blob sync error: {}", e.message)));
+                    }
                     _ => continue,
                 }
             }
@@ -2103,16 +2106,18 @@ async fn handle_incoming_streams_v3_inner(
         .ok_or_else(|| JsValue::from_str("No encryption key"))?;
     drop(key_guard);
 
-    let store_guard = store.read().await;
-    let loro_store = store_guard.as_ref()
-        .ok_or_else(|| JsValue::from_str("Store not initialized"))?;
-
-    // Create SyncEngine for this sync session
+    // Create SyncEngine — snapshot store briefly, then release lock
+    let snapshot = {
+        let store_guard = store.read().await;
+        let loro_store = store_guard.as_ref()
+            .ok_or_else(|| JsValue::from_str("Store not initialized"))?;
+        loro_store.export_snapshot()
+            .map_err(|e| JsValue::from_str(&format!("Export snapshot failed: {}", e)))?
+        // store_guard dropped here
+    };
     let host = Arc::new(crate::host::mock::MockHost::new());
     let engine = SyncEngine::new_with_key(host, vault_key)
         .map_err(|e| JsValue::from_str(&format!("SyncEngine failed: {}", e)))?;
-    let snapshot = loro_store.export_snapshot()
-        .map_err(|e| JsValue::from_str(&format!("Export snapshot failed: {}", e)))?;
     engine.import_snapshot_raw(&snapshot)
         .map_err(|e| JsValue::from_str(&format!("Import snapshot failed: {}", e)))?;
 
@@ -2217,12 +2222,16 @@ async fn handle_incoming_streams_v3_inner(
         }
     }
 
-    // Import updated state back to LoroStore
-    let updated_snapshot = engine.export_snapshot_raw()
-        .map_err(|e| JsValue::from_str(&format!("Export snapshot: {}", e)))?;
-    loro_store.import_snapshot(&updated_snapshot)
-        .map_err(|e| JsValue::from_str(&format!("Import snapshot: {}", e)))?;
-    drop(store_guard);
+    // Import updated state back to LoroStore (briefly acquire lock)
+    {
+        let updated_snapshot = engine.export_snapshot_raw()
+            .map_err(|e| JsValue::from_str(&format!("Export snapshot: {}", e)))?;
+        let store_guard = store.read().await;
+        let loro_store = store_guard.as_ref()
+            .ok_or_else(|| JsValue::from_str("Store not initialized"))?;
+        loro_store.import_snapshot(&updated_snapshot)
+            .map_err(|e| JsValue::from_str(&format!("Import snapshot: {}", e)))?;
+    }
 
     // Emit sync_complete event
     if let Some(ref callback) = on_event {
@@ -2397,8 +2406,15 @@ async fn run_gossip_debounce(
 
         // Debounce: wait 200ms for more changes to accumulate
         let promise = js_sys::Promise::new(&mut |resolve, _| {
-            let window = web_sys::window().expect("no window");
-            window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 200).ok();
+            if let Some(window) = web_sys::window() {
+                if window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 200).is_err() {
+                    // If setTimeout fails, resolve immediately (broadcast without delay)
+                    let _ = resolve.call0(&JsValue::NULL);
+                }
+            } else {
+                // No window (e.g., worker context) — resolve immediately
+                let _ = resolve.call0(&JsValue::NULL);
+            }
         });
         let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
 
