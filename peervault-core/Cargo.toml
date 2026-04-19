@@ -40,6 +40,7 @@ tokio = { version = "1", default-features = false, features = ["sync"] }
 iroh = { version = "0.95", default-features = false }
 iroh-tickets = { version = "0.2", default-features = false }
 iroh-blobs = { version = "0.97", default-features = false }
+iroh-gossip = { version = "0.95", default-features = false, features = ["net"] }
 
 # Loro CRDT - high-performance collaborative data structures
 loro = "1.10"

@@ -11,6 +11,7 @@ use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, RelayMap, RelayMode, RelayUrl, SecretKey};
 use iroh_blobs::store::mem::MemStore;
 use iroh_blobs::BlobsProtocol;
+use iroh_gossip::net::Gossip;
 use tokio::sync::Mutex;
 use std::sync::Arc;
 use tracing::{debug, info, warn, error, trace};
@@ -61,10 +62,16 @@ impl IrohTransport {
 
     /// Create a new transport with a specific secret key and relay URL
     pub async fn with_secret_key_and_relay(secret_key: SecretKey, relay_url: Option<&str>) -> Result<Self> {
-        Self::with_secret_key_relay_and_blobs(secret_key, relay_url, MemStore::new()).await
+        // Create a temporary endpoint to get the gossip instance
+        // Note: for full functionality, use with_all_protocols() directly
+        let mem_store = MemStore::new();
+        // We need the endpoint to create Gossip, but the endpoint is created inside
+        // with_all_protocols. Create a placeholder Gossip with a temporary endpoint.
+        // This is only used for backward-compat constructors that don't need gossip.
+        Self::with_secret_key_relay_and_blobs(secret_key, relay_url, mem_store).await
     }
 
-    /// Create a new transport with iroh-blobs MemStore for blob transfer
+    /// Create a new transport with iroh-blobs MemStore (no gossip)
     pub async fn with_secret_key_relay_and_blobs(
         secret_key: SecretKey,
         relay_url: Option<&str>,
@@ -74,35 +81,31 @@ impl IrohTransport {
             Some(url) => {
                 let relay: RelayUrl = url.parse()
                     .map_err(|e| anyhow!("Invalid relay URL '{}': {}", url, e))?;
-                info!(relay_url = %url, "Using custom relay server");
                 RelayMode::Custom(RelayMap::from_iter(vec![relay]))
             }
             None => {
-                // Use the default relay
                 let relay: RelayUrl = DEFAULT_RELAY_URL.parse()
                     .map_err(|e| anyhow!("Invalid default relay URL: {}", e))?;
-                info!(relay_url = %DEFAULT_RELAY_URL, "Using default relay server");
                 RelayMode::Custom(RelayMap::from_iter(vec![relay]))
             }
         };
 
-        // Build endpoint without ALPNs — Router handles ALPN registration
         let endpoint = Endpoint::builder()
             .secret_key(secret_key.clone())
             .relay_mode(relay_mode)
             .bind()
             .await?;
 
-        info!(node_id = %endpoint.id(), "Transport started");
+        // Create a default gossip for backward compat
+        let gossip = Gossip::builder().spawn(endpoint.clone());
 
-        // Create protocol handlers
         let (sync_handler, incoming_rx) = SyncHandler::new(32);
         let blobs_protocol = BlobsProtocol::new(&mem_store, None);
 
-        // Build and spawn Router
         let router = Router::builder(endpoint.clone())
             .accept(PEERVAULT_SYNC_ALPN, sync_handler)
             .accept(iroh_blobs::ALPN, blobs_protocol)
+            .accept(iroh_gossip::net::GOSSIP_ALPN, gossip)
             .spawn();
 
         Ok(Self {
@@ -111,6 +114,33 @@ impl IrohTransport {
             _router: router,
             incoming_rx: Arc::new(Mutex::new(incoming_rx)),
         })
+    }
+
+    /// Create transport from a pre-built endpoint with all protocols.
+    /// Use this when you need to share the Endpoint with GossipBridge.
+    pub fn from_endpoint(
+        endpoint: Endpoint,
+        secret_key: SecretKey,
+        mem_store: MemStore,
+        gossip: Gossip,
+    ) -> Self {
+        info!(node_id = %endpoint.id(), "Transport started (from_endpoint)");
+
+        let (sync_handler, incoming_rx) = SyncHandler::new(32);
+        let blobs_protocol = BlobsProtocol::new(&mem_store, None);
+
+        let router = Router::builder(endpoint.clone())
+            .accept(PEERVAULT_SYNC_ALPN, sync_handler)
+            .accept(iroh_blobs::ALPN, blobs_protocol)
+            .accept(iroh_gossip::net::GOSSIP_ALPN, gossip)
+            .spawn();
+
+        Self {
+            endpoint,
+            secret_key,
+            _router: router,
+            incoming_rx: Arc::new(Mutex::new(incoming_rx)),
+        }
     }
 
     /// Get the endpoint (for Downloader creation)

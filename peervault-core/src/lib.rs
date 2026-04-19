@@ -41,6 +41,7 @@ pub mod session;
 pub mod runner;
 pub mod blob;
 pub mod blobs_bridge;
+pub mod gossip_bridge;
 pub mod sync_handler;
 pub mod keys;
 pub mod peer;

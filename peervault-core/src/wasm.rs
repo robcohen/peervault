@@ -466,6 +466,8 @@ pub struct WasmPeerVault {
     known_peers: Arc<RwLock<HashMap<String, u64>>>,
     /// iroh-blobs bridge for V3 blob transfer
     blobs_bridge: Arc<RwLock<Option<crate::blobs_bridge::BlobsBridge>>>,
+    /// iroh-gossip bridge for real-time CRDT delta broadcast
+    gossip_bridge: Arc<RwLock<Option<crate::gossip_bridge::GossipBridge>>>,
 }
 
 #[wasm_bindgen]
@@ -501,6 +503,7 @@ impl WasmPeerVault {
             pending_pairings: Arc::new(RwLock::new(HashMap::new())),
             known_peers: Arc::new(RwLock::new(HashMap::new())),
             blobs_bridge: Arc::new(RwLock::new(None)),
+            gossip_bridge: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -844,23 +847,48 @@ impl WasmPeerVault {
         let pending_pairings = self.pending_pairings.clone();
         let known_peers = self.known_peers.clone();
         let blobs_bridge = self.blobs_bridge.clone();
+        let gossip_bridge_arc = self.gossip_bridge.clone();
         let encryption_key = self.encryption_key.clone();
 
         future_to_promise(async move {
-            // Create BlobsBridge with a MemStore for iroh-blobs transfer
+            // Create BlobsBridge
             let host = Arc::new(crate::host::mock::MockHost::new());
-            let bridge = crate::blobs_bridge::BlobsBridge::new(host)
+            let blob_bridge = crate::blobs_bridge::BlobsBridge::new(host)
                 .map_err(|e| JsValue::from_str(&format!("Failed to create blobs bridge: {}", e)))?;
-            let mem_store = bridge.mem_store().clone();
+            let mem_store = blob_bridge.mem_store().clone();
 
-            // Create the transport with Router (sync ALPN + iroh-blobs ALPN)
-            let iroh_transport = IrohTransport::with_secret_key_relay_and_blobs(
-                SecretKey::generate(&mut rand::rng()),
-                relay_url.as_deref(),
-                mem_store,
-            )
+            // Build endpoint, then create GossipBridge (needs endpoint for Gossip),
+            // then create transport (registers Gossip on Router)
+            use iroh::{RelayMap, RelayMode, RelayUrl};
+            let secret_key = SecretKey::generate(&mut rand::rng());
+            let relay_mode = match relay_url.as_deref() {
+                Some(url) => {
+                    let relay: RelayUrl = url.parse()
+                        .map_err(|e| JsValue::from_str(&format!("Invalid relay URL: {}", e)))?;
+                    RelayMode::Custom(RelayMap::from_iter(vec![relay]))
+                }
+                None => {
+                    let relay: RelayUrl = "https://use1-1.relay.n0.computer".parse().unwrap();
+                    RelayMode::Custom(RelayMap::from_iter(vec![relay]))
+                }
+            };
+            let endpoint = iroh::Endpoint::builder()
+                .secret_key(secret_key.clone())
+                .relay_mode(relay_mode)
+                .bind()
                 .await
-                .map_err(|e| JsValue::from_str(&format!("Failed to create transport: {}", e)))?;
+                .map_err(|e| JsValue::from_str(&format!("Endpoint bind failed: {}", e)))?;
+
+            // GossipBridge creates Gossip bound to this endpoint
+            let gossip_br = crate::gossip_bridge::GossipBridge::new(&endpoint, vault_id);
+
+            // Transport registers the same Gossip on its Router
+            let iroh_transport = IrohTransport::from_endpoint(
+                endpoint,
+                secret_key,
+                mem_store,
+                gossip_br.gossip().clone(),
+            );
 
             // Create the store
             let loro_store = LoroStore::new(vault_id);
@@ -868,7 +896,8 @@ impl WasmPeerVault {
             // Store them
             *transport.write().await = Some(iroh_transport);
             *store.write().await = Some(loro_store);
-            *blobs_bridge.write().await = Some(bridge);
+            *blobs_bridge.write().await = Some(blob_bridge);
+            *gossip_bridge_arc.write().await = Some(gossip_br);
 
             // Start accept loop in background
             let transport_for_accept = transport.clone();
@@ -913,6 +942,7 @@ impl WasmPeerVault {
         let pending_pairings = self.pending_pairings.clone();
         let known_peers = self.known_peers.clone();
         let blobs_bridge = self.blobs_bridge.clone();
+        let gossip_bridge_arc = self.gossip_bridge.clone();
         let encryption_key = self.encryption_key.clone();
 
         future_to_promise(async move {
@@ -922,14 +952,31 @@ impl WasmPeerVault {
                 .map_err(|e| JsValue::from_str(&format!("Failed to create blobs bridge: {}", e)))?;
             let mem_store = bridge.mem_store().clone();
 
-            // Create the transport with Router (sync ALPN + iroh-blobs ALPN)
-            let iroh_transport = IrohTransport::with_secret_key_relay_and_blobs(
-                SecretKey::generate(&mut rand::rng()),
-                relay_url.as_deref(),
-                mem_store,
-            )
+            // Build endpoint, GossipBridge, then transport (same as start())
+            use iroh::{RelayMap, RelayMode, RelayUrl};
+            let secret_key = SecretKey::generate(&mut rand::rng());
+            let relay_mode = match relay_url.as_deref() {
+                Some(url) => {
+                    let relay: RelayUrl = url.parse()
+                        .map_err(|e| JsValue::from_str(&format!("Invalid relay URL: {}", e)))?;
+                    RelayMode::Custom(RelayMap::from_iter(vec![relay]))
+                }
+                None => {
+                    let relay: RelayUrl = "https://use1-1.relay.n0.computer".parse().unwrap();
+                    RelayMode::Custom(RelayMap::from_iter(vec![relay]))
+                }
+            };
+            let endpoint = iroh::Endpoint::builder()
+                .secret_key(secret_key.clone())
+                .relay_mode(relay_mode)
+                .bind()
                 .await
-                .map_err(|e| JsValue::from_str(&format!("Failed to create transport: {}", e)))?;
+                .map_err(|e| JsValue::from_str(&format!("Endpoint bind failed: {}", e)))?;
+
+            let gossip_br = crate::gossip_bridge::GossipBridge::new(&endpoint, vault_id);
+            let iroh_transport = IrohTransport::from_endpoint(
+                endpoint, secret_key, mem_store, gossip_br.gossip().clone(),
+            );
 
             // Create the store and import saved state
             let loro_store = LoroStore::new(vault_id);
@@ -940,6 +987,7 @@ impl WasmPeerVault {
             *transport.write().await = Some(iroh_transport);
             *store.write().await = Some(loro_store);
             *blobs_bridge.write().await = Some(bridge);
+            *gossip_bridge_arc.write().await = Some(gossip_br);
 
             // Start accept loop in background
             let transport_for_accept = transport.clone();
@@ -1132,6 +1180,7 @@ impl WasmPeerVault {
         let on_event = self.on_event.clone();
         let encryption_key = self.encryption_key.clone();
         let blobs_bridge = self.blobs_bridge.clone();
+        let gossip_bridge = self.gossip_bridge.clone();
         let ticket_str = ticket_str.to_string();
 
         // Convert JsValue to Option<String>
@@ -1263,6 +1312,34 @@ impl WasmPeerVault {
 
             import_engine_results(&engine, &store).await?;
 
+            // Subscribe to gossip for real-time updates with this peer
+            let gossip_guard = gossip_bridge.read().await;
+            if let Some(ref gb) = *gossip_guard {
+                let peer_endpoint_id: iroh::EndpointId = peer_id.parse()
+                    .map_err(|e| JsValue::from_str(&format!("Invalid peer ID: {}", e)))?;
+                match gb.subscribe_with_receiver(vec![peer_endpoint_id]).await {
+                    Ok(Some(receiver)) => {
+                        // First subscription — spawn receiver task
+                        let store_for_gossip = store.clone();
+                        let enc_key_for_gossip = encryption_key.clone();
+                        let on_event_for_gossip = on_event.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            run_gossip_receiver(
+                                receiver,
+                                store_for_gossip,
+                                enc_key_for_gossip,
+                                on_event_for_gossip,
+                            ).await;
+                        });
+                    }
+                    Ok(None) => {} // Already subscribed, peers added
+                    Err(e) => {
+                        warn!("Failed to subscribe to gossip: {}", e);
+                    }
+                }
+            }
+            drop(gossip_guard);
+
             Ok(JsValue::from_str(&peer_id))
         })
     }
@@ -1274,6 +1351,7 @@ impl WasmPeerVault {
     pub fn set(&self, key: &str, content: &Uint8Array) -> Promise {
         let store = self.store.clone();
         let encryption_key = self.encryption_key.clone();
+        let gossip_bridge = self.gossip_bridge.clone();
         let key = key.to_string();
         let content = content.to_vec();
 
@@ -1281,6 +1359,9 @@ impl WasmPeerVault {
             let guard = store.read().await;
             let s = guard.as_ref()
                 .ok_or_else(|| JsValue::from_str("Store not started"))?;
+
+            // Capture version vector before write (for delta export)
+            let vv_before = s.version_vector();
 
             // Encrypt content if key is available
             let content_to_store = match encryption_key.read().await.as_ref() {
@@ -1301,6 +1382,30 @@ impl WasmPeerVault {
 
             s.set_text(&key, &content_str)
                 .map_err(|e| JsValue::from_str(&format!("Failed to set: {}", e)))?;
+
+            // Broadcast CRDT delta via gossip (if subscribed)
+            let gossip_guard = gossip_bridge.read().await;
+            if let Some(ref gb) = *gossip_guard {
+                if gb.is_subscribed().await {
+                    // Export delta since before the write
+                    if let Ok(delta) = s.export_updates(Some(&vv_before)) {
+                        if !delta.is_empty() {
+                            // Encrypt the delta with vault key
+                            let enc_key_guard = encryption_key.read().await;
+                            let encrypted = match enc_key_guard.as_ref() {
+                                Some(key) => key.encrypt(&delta)
+                                    .unwrap_or_else(|_| delta.clone()),
+                                None => delta,
+                            };
+                            drop(enc_key_guard);
+
+                            if let Err(e) = gb.broadcast_delta(&encrypted).await {
+                                warn!("Gossip broadcast failed: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
 
             Ok(JsValue::TRUE)
         })
@@ -2113,6 +2218,80 @@ async fn handle_incoming_streams_v3_inner(
     }
 
     Ok(())
+}
+
+/// Background task that receives gossip messages and applies CRDT deltas.
+async fn run_gossip_receiver(
+    mut receiver: iroh_gossip::api::GossipReceiver,
+    store: Arc<RwLock<Option<LoroStore>>>,
+    encryption_key: Arc<RwLock<Option<VaultKey>>>,
+    on_event: Option<Function>,
+) {
+    use futures::StreamExt;
+    use iroh_gossip::api::Event;
+
+    info!("Gossip receiver started");
+
+    while let Some(event) = receiver.next().await {
+        match event {
+            Ok(Event::Received(msg)) => {
+                let data = msg.content.to_vec();
+                debug!("Gossip: received {} bytes from {:?}", data.len(), msg.delivered_from);
+
+                // Decrypt the delta
+                let plaintext = {
+                    let key_guard = encryption_key.read().await;
+                    match key_guard.as_ref() {
+                        Some(key) => match key.decrypt(&data) {
+                            Ok(pt) => pt,
+                            Err(e) => {
+                                warn!("Gossip: failed to decrypt delta: {}", e);
+                                continue;
+                            }
+                        },
+                        None => data,
+                    }
+                };
+
+                // Import into LoroStore
+                let store_guard = store.read().await;
+                if let Some(ref s) = *store_guard {
+                    if let Err(e) = s.import_updates(&plaintext) {
+                        warn!("Gossip: failed to import delta: {}", e);
+                        continue;
+                    }
+
+                    // Emit document_changed event
+                    if let Some(ref callback) = on_event {
+                        let event = serde_json::json!({
+                            "type": "document_changed",
+                            "source": "gossip",
+                            "bytes": plaintext.len(),
+                        });
+                        let _ = callback.call1(
+                            &JsValue::NULL,
+                            &JsValue::from_str(&event.to_string()),
+                        );
+                    }
+                }
+            }
+            Ok(Event::NeighborUp(peer)) => {
+                info!("Gossip: neighbor joined: {:?}", peer);
+            }
+            Ok(Event::NeighborDown(peer)) => {
+                info!("Gossip: neighbor left: {:?}", peer);
+            }
+            Ok(Event::Lagged) => {
+                warn!("Gossip: receiver lagged, messages may have been dropped");
+            }
+            Err(e) => {
+                warn!("Gossip receiver error: {}", e);
+                break;
+            }
+        }
+    }
+
+    info!("Gossip receiver stopped");
 }
 
 // =============================================================================
