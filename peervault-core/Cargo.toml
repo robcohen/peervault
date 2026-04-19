@@ -15,6 +15,7 @@ wasm-opt = false
 [features]
 default = ["native"]
 native = ["tokio/rt-multi-thread", "reqwest/rustls-tls"]
+test-utils = []  # Exposes MockHost for integration tests
 # Note: In WASM, reqwest uses browser fetch API automatically
 # WASM target for browser/JS embedding
 wasm = [

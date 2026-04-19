@@ -359,7 +359,7 @@ pub trait HostInterface: Send + Sync + 'static {
 // Mock Implementation (for tests and WASM)
 // ============================================================================
 
-#[cfg(any(test, feature = "wasm"))]
+#[cfg(any(test, feature = "wasm", feature = "test-utils"))]
 pub mod mock {
     use super::*;
     use std::collections::HashMap;

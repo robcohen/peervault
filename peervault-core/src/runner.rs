@@ -169,6 +169,8 @@ pub struct SyncRunner<'a, V: PairingValidator = AcceptAllValidator> {
     validator: V,
     /// Whether the peer supports iroh-blobs transfer (determined during version exchange)
     peer_supports_iroh_blobs: bool,
+    /// Peer's version vector (captured during version exchange)
+    peer_vv: Vec<u8>,
 }
 
 impl<'a> SyncRunner<'a, AcceptAllValidator> {
@@ -207,6 +209,7 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
             peer_node_id: peer_id,
             validator,
             peer_supports_iroh_blobs: false,
+            peer_vv: Vec::new(),
         }
     }
 
@@ -514,6 +517,7 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
         self.result.peer_hostname = peer_info.hostname;
         self.result.peer_nickname = peer_info.nickname;
         self.peer_supports_iroh_blobs = peer_info.supports_iroh_blobs;
+        self.peer_vv = peer_info.version_bytes.clone();
 
         // Transition to syncing updates
         self.session.begin_version_exchange()
@@ -526,18 +530,24 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
         self.session.begin_update_sync()
             .map_err(|e| CoreError::Protocol(e.to_string()))?;
 
-        // Export our updates (encrypted)
-        let our_updates = self.engine.export_updates_since(&[])?;
+        // Export updates since peer's version (encrypted)
+        let our_updates = self.engine.export_updates_since(&self.peer_vv)?;
 
         // Send our updates
         if !our_updates.is_empty() {
             let msg = Message::Updates(Updates {
                 data: our_updates.clone(),
-                op_count: 1, // We don't track op count precisely
+                op_count: 1,
             });
             self.send_message(stream, &msg)?;
             self.result.updates_sent += 1;
         }
+
+        // Signal end of updates with SyncComplete
+        let complete_msg = Message::SyncComplete(SyncComplete {
+            version_bytes: self.engine.version_vector(),
+        });
+        self.send_message(stream, &complete_msg)?;
 
         // Receive peer's updates
         loop {
