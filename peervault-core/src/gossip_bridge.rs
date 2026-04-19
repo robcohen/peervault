@@ -162,4 +162,28 @@ impl GossipBridge {
     pub async fn is_subscribed(&self) -> bool {
         *self.subscribed.read().await
     }
+
+    /// Re-subscribe after a connection drop. Resets state and subscribes again.
+    /// Returns a new receiver if successful.
+    pub async fn resubscribe(
+        &self,
+        bootstrap_peers: Vec<iroh::EndpointId>,
+    ) -> Result<iroh_gossip::api::GossipReceiver, CoreError> {
+        // Reset state
+        *self.sender.write().await = None;
+        *self.subscribed.write().await = false;
+
+        info!("Re-subscribing to vault gossip topic with {} peers", bootstrap_peers.len());
+
+        let topic = self.gossip.subscribe_and_join(self.vault_topic, bootstrap_peers).await
+            .map_err(|e| CoreError::Internal(format!("Gossip resubscribe: {}", e)))?;
+
+        let (sender, receiver) = topic.split();
+
+        *self.sender.write().await = Some(sender);
+        *self.subscribed.write().await = true;
+
+        info!("Re-subscribed to vault gossip topic");
+        Ok(receiver)
+    }
 }

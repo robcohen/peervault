@@ -221,6 +221,11 @@ export default class PeerVaultPlugin extends Plugin {
         }
         break;
 
+      case "gossip-update":
+        console.log(`[PeerVault] Gossip update received (${event.bytes} bytes)`);
+        this.syncCrdtToDisk();
+        break;
+
       case "sync-error":
         console.error(`[PeerVault] Sync error with ${event.peerId}: ${event.error}`);
         break;

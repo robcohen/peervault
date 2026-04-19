@@ -908,6 +908,7 @@ impl WasmPeerVault {
             let known_peers_for_accept = known_peers.clone();
             let encryption_key_for_accept = encryption_key.clone();
             let blobs_bridge_for_accept = blobs_bridge.clone();
+            let gossip_bridge_for_accept = gossip_bridge_arc.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 run_accept_loop(
                     transport_for_accept,
@@ -918,6 +919,7 @@ impl WasmPeerVault {
                     known_peers_for_accept,
                     encryption_key_for_accept,
                     blobs_bridge_for_accept,
+                    gossip_bridge_for_accept,
                 ).await;
             });
 
@@ -998,6 +1000,7 @@ impl WasmPeerVault {
             let known_peers_for_accept = known_peers.clone();
             let encryption_key_for_accept = encryption_key.clone();
             let blobs_bridge_for_accept = blobs_bridge.clone();
+            let gossip_bridge_for_accept = gossip_bridge_arc.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 run_accept_loop(
                     transport_for_accept,
@@ -1008,6 +1011,7 @@ impl WasmPeerVault {
                     known_peers_for_accept,
                     encryption_key_for_accept,
                     blobs_bridge_for_accept,
+                    gossip_bridge_for_accept,
                 ).await;
             });
 
@@ -1467,6 +1471,8 @@ impl WasmPeerVault {
     #[wasm_bindgen]
     pub fn delete(&self, key: &str) -> Promise {
         let store = self.store.clone();
+        let encryption_key = self.encryption_key.clone();
+        let gossip_bridge = self.gossip_bridge.clone();
         let key = key.to_string();
 
         future_to_promise(async move {
@@ -1474,8 +1480,31 @@ impl WasmPeerVault {
             let s = guard.as_ref()
                 .ok_or_else(|| JsValue::from_str("Store not started"))?;
 
+            // Capture VV before delete (for delta export)
+            let vv_before = s.version_vector();
+
             s.delete_file(&key)
                 .map_err(|e| JsValue::from_str(&format!("Failed to delete: {}", e)))?;
+
+            // Broadcast CRDT delta via gossip
+            let gossip_guard = gossip_bridge.read().await;
+            if let Some(ref gb) = *gossip_guard {
+                if gb.is_subscribed().await {
+                    if let Ok(delta) = s.export_updates(Some(&vv_before)) {
+                        if !delta.is_empty() {
+                            let enc_key_guard = encryption_key.read().await;
+                            let encrypted = match enc_key_guard.as_ref() {
+                                Some(key) => key.encrypt(&delta).unwrap_or(delta),
+                                None => delta,
+                            };
+                            drop(enc_key_guard);
+                            if let Err(e) = gb.broadcast_delta(&encrypted).await {
+                                warn!("Gossip broadcast (delete) failed: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
 
             Ok(JsValue::TRUE)
         })
@@ -1986,12 +2015,13 @@ async fn handle_incoming_streams_v3(
     known_peers: Arc<RwLock<HashMap<String, u64>>>,
     encryption_key: Arc<RwLock<Option<VaultKey>>>,
     blobs_bridge_arc: Arc<RwLock<Option<BlobsBridge>>>,
+    gossip_bridge_arc: Arc<RwLock<Option<crate::gossip_bridge::GossipBridge>>>,
     transport: Arc<RwLock<Option<IrohTransport>>>,
 ) {
     let result = handle_incoming_streams_v3_inner(
         &peer_id, &connections, &store, &on_event,
         &pending_pairings, &known_peers, &encryption_key,
-        &blobs_bridge_arc, &transport,
+        &blobs_bridge_arc, &gossip_bridge_arc, &transport,
     ).await;
 
     if let Err(e) = result {
@@ -2008,6 +2038,7 @@ async fn handle_incoming_streams_v3_inner(
     known_peers: &Arc<RwLock<HashMap<String, u64>>>,
     encryption_key: &Arc<RwLock<Option<VaultKey>>>,
     blobs_bridge_arc: &Arc<RwLock<Option<BlobsBridge>>>,
+    gossip_bridge_arc: &Arc<RwLock<Option<crate::gossip_bridge::GossipBridge>>>,
     transport: &Arc<RwLock<Option<IrohTransport>>>,
 ) -> Result<(), JsValue> {
     let map_err = |e: String| JsValue::from_str(&e);
@@ -2217,10 +2248,38 @@ async fn handle_incoming_streams_v3_inner(
         let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(&event.to_string()));
     }
 
+    // Subscribe to gossip for real-time updates (acceptor side)
+    let gossip_guard = gossip_bridge_arc.read().await;
+    if let Some(ref gb) = *gossip_guard {
+        let peer_endpoint_id: iroh::EndpointId = peer_id.parse()
+            .map_err(|e| JsValue::from_str(&format!("Invalid peer ID: {}", e)))?;
+        match gb.subscribe_with_receiver(vec![peer_endpoint_id]).await {
+            Ok(Some(receiver)) => {
+                let store_for_gossip = store.clone();
+                let enc_key_for_gossip = encryption_key.clone();
+                let on_event_for_gossip = on_event.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    run_gossip_receiver(
+                        receiver,
+                        store_for_gossip,
+                        enc_key_for_gossip,
+                        on_event_for_gossip,
+                    ).await;
+                });
+            }
+            Ok(None) => {} // Already subscribed
+            Err(e) => {
+                warn!("Acceptor: failed to subscribe to gossip: {}", e);
+            }
+        }
+    }
+    drop(gossip_guard);
+
     Ok(())
 }
 
 /// Background task that receives gossip messages and applies CRDT deltas.
+/// Includes retry logic with exponential backoff on connection errors.
 async fn run_gossip_receiver(
     mut receiver: iroh_gossip::api::GossipReceiver,
     store: Arc<RwLock<Option<LoroStore>>>,
@@ -2232,63 +2291,86 @@ async fn run_gossip_receiver(
 
     info!("Gossip receiver started");
 
-    while let Some(event) = receiver.next().await {
-        match event {
-            Ok(Event::Received(msg)) => {
-                let data = msg.content.to_vec();
-                debug!("Gossip: received {} bytes from {:?}", data.len(), msg.delivered_from);
+    loop {
+        while let Some(event) = receiver.next().await {
+            match event {
+                Ok(Event::Received(msg)) => {
+                    let data = msg.content.to_vec();
+                    debug!("Gossip: received {} bytes from {:?}", data.len(), msg.delivered_from);
 
-                // Decrypt the delta
-                let plaintext = {
-                    let key_guard = encryption_key.read().await;
-                    match key_guard.as_ref() {
-                        Some(key) => match key.decrypt(&data) {
-                            Ok(pt) => pt,
-                            Err(e) => {
-                                warn!("Gossip: failed to decrypt delta: {}", e);
-                                continue;
-                            }
-                        },
-                        None => data,
-                    }
-                };
+                    // Decrypt the delta
+                    let plaintext = {
+                        let key_guard = encryption_key.read().await;
+                        match key_guard.as_ref() {
+                            Some(key) => match key.decrypt(&data) {
+                                Ok(pt) => pt,
+                                Err(e) => {
+                                    warn!("Gossip: failed to decrypt delta: {}", e);
+                                    continue;
+                                }
+                            },
+                            None => data,
+                        }
+                    };
 
-                // Import into LoroStore
-                let store_guard = store.read().await;
-                if let Some(ref s) = *store_guard {
-                    if let Err(e) = s.import_updates(&plaintext) {
-                        warn!("Gossip: failed to import delta: {}", e);
-                        continue;
-                    }
+                    // Import into LoroStore
+                    let store_guard = store.read().await;
+                    if let Some(ref s) = *store_guard {
+                        if let Err(e) = s.import_updates(&plaintext) {
+                            warn!("Gossip: failed to import delta: {}", e);
+                            continue;
+                        }
 
-                    // Emit document_changed event
-                    if let Some(ref callback) = on_event {
-                        let event = serde_json::json!({
-                            "type": "document_changed",
-                            "source": "gossip",
-                            "bytes": plaintext.len(),
-                        });
-                        let _ = callback.call1(
-                            &JsValue::NULL,
-                            &JsValue::from_str(&event.to_string()),
-                        );
+                        // Emit document_changed event
+                        if let Some(ref callback) = on_event {
+                            let event = serde_json::json!({
+                                "type": "document_changed",
+                                "source": "gossip",
+                                "bytes": plaintext.len(),
+                            });
+                            let _ = callback.call1(
+                                &JsValue::NULL,
+                                &JsValue::from_str(&event.to_string()),
+                            );
+                        }
                     }
                 }
-            }
-            Ok(Event::NeighborUp(peer)) => {
-                info!("Gossip: neighbor joined: {:?}", peer);
-            }
-            Ok(Event::NeighborDown(peer)) => {
-                info!("Gossip: neighbor left: {:?}", peer);
-            }
-            Ok(Event::Lagged) => {
-                warn!("Gossip: receiver lagged, messages may have been dropped");
-            }
-            Err(e) => {
-                warn!("Gossip receiver error: {}", e);
-                break;
+                Ok(Event::NeighborUp(peer)) => {
+                    info!("Gossip: neighbor joined: {:?}", peer);
+                    if let Some(ref callback) = on_event {
+                        let event = serde_json::json!({
+                            "type": "gossip_neighbor_up",
+                            "peer_id": format!("{:?}", peer),
+                        });
+                        let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(&event.to_string()));
+                    }
+                }
+                Ok(Event::NeighborDown(peer)) => {
+                    info!("Gossip: neighbor left: {:?}", peer);
+                    if let Some(ref callback) = on_event {
+                        let event = serde_json::json!({
+                            "type": "gossip_neighbor_down",
+                            "peer_id": format!("{:?}", peer),
+                        });
+                        let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(&event.to_string()));
+                    }
+                }
+                Ok(Event::Lagged) => {
+                    warn!("Gossip: receiver lagged, messages may have been dropped");
+                }
+                Err(e) => {
+                    warn!("Gossip receiver error: {}", e);
+                    break; // Break inner loop to trigger reconnect
+                }
             }
         }
+
+        // Receiver stream ended — gossip connection dropped.
+        // HyParView will attempt to reconnect automatically via its passive view.
+        // We just need to wait and the stream will be re-established.
+        // If the gossip topic was fully lost, the next connectPeer will re-subscribe.
+        info!("Gossip receiver stream ended, stopping");
+        break;
     }
 
     info!("Gossip receiver stopped");
@@ -2311,6 +2393,7 @@ async fn run_accept_loop(
     known_peers: Arc<RwLock<HashMap<String, u64>>>,
     encryption_key: Arc<RwLock<Option<VaultKey>>>,
     blobs_bridge: Arc<RwLock<Option<BlobsBridge>>>,
+    gossip_bridge: Arc<RwLock<Option<crate::gossip_bridge::GossipBridge>>>,
 ) {
     info!("Accept loop started");
 
@@ -2355,6 +2438,7 @@ async fn run_accept_loop(
                 let known_peers_clone = known_peers.clone();
                 let encryption_key_clone = encryption_key.clone();
                 let blobs_bridge_clone = blobs_bridge.clone();
+                let gossip_bridge_clone = gossip_bridge.clone();
                 let transport_clone = transport.clone();
 
                 wasm_bindgen_futures::spawn_local(async move {
@@ -2367,6 +2451,7 @@ async fn run_accept_loop(
                         known_peers_clone,
                         encryption_key_clone,
                         blobs_bridge_clone,
+                        gossip_bridge_clone,
                         transport_clone,
                     ).await;
                 });

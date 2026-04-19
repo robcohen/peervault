@@ -44,6 +44,7 @@ export type ClientEvent =
   | { type: "sync-complete"; peerId: string; result: SyncResult }
   | { type: "sync-error"; peerId: string; error: string }
   | { type: "file-changed"; path: string; source: "local" | "remote" }
+  | { type: "gossip-update"; bytes: number }
   | { type: "pairing-request"; peerId: string; peerName: string }
   | { type: "error"; message: string };
 
@@ -556,11 +557,20 @@ export class PeerVaultClient {
           break;
 
         case "document_changed":
-          this.emit({
-            type: "file-changed",
-            path: event.key,
-            source: "remote",
-          });
+          if (event.source === "gossip") {
+            // CRDT delta received via gossip — trigger full disk sync
+            this.emit({
+              type: "gossip-update",
+              bytes: event.bytes ?? 0,
+            });
+          } else {
+            // Per-file change from sync engine
+            this.emit({
+              type: "file-changed",
+              path: event.key,
+              source: "remote",
+            });
+          }
           break;
 
         case "pairing_request":
@@ -574,6 +584,14 @@ export class PeerVaultClient {
         case "pairing_complete":
           // A peer connected with a valid one-time pairing nonce - auto-add them
           this.handlePairingComplete(event.peer_id, event.device_name);
+          break;
+
+        case "gossip_neighbor_up":
+          console.log(`[PeerVault] Gossip neighbor joined: ${event.peer_id}`);
+          break;
+
+        case "gossip_neighbor_down":
+          console.log(`[PeerVault] Gossip neighbor left: ${event.peer_id}`);
           break;
 
         case "error":
