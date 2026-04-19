@@ -2219,11 +2219,18 @@ async fn handle_incoming_streams_v3_inner(
                 blob_count: 0,
             })).await.map_err(map_err)?;
 
-            loop {
+            let mut blob_sync_done = false;
+            for _ in 0..100 {
                 match recv_sync_msg(&mut stream).await.map_err(map_err)? {
-                    SyncMessage::BlobSyncComplete(_) => break,
+                    SyncMessage::BlobSyncComplete(_) => { blob_sync_done = true; break; }
+                    SyncMessage::Error(e) => {
+                        return Err(JsValue::from_str(&format!("Blob sync error: {}", e.message)));
+                    }
                     _ => continue,
                 }
+            }
+            if !blob_sync_done {
+                warn!("Acceptor: blob sync completion not received after 100 messages");
             }
         }
     }
