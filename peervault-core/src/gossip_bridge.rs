@@ -24,6 +24,9 @@ const MAX_GOSSIP_MESSAGE_SIZE: usize = 65536;
 /// Re-export for Router registration
 pub use iroh_gossip::net::GOSSIP_ALPN as GOSSIP_PROTOCOL_ALPN;
 
+/// Debounce window for batching gossip broadcasts (milliseconds)
+const GOSSIP_DEBOUNCE_MS: u64 = 200;
+
 /// Bridge between iroh-gossip and PeerVault's CRDT sync
 pub struct GossipBridge {
     /// The gossip protocol instance (registered on Router)
@@ -34,6 +37,10 @@ pub struct GossipBridge {
     sender: Arc<RwLock<Option<iroh_gossip::api::GossipSender>>>,
     /// Whether we've subscribed to the topic
     subscribed: Arc<RwLock<bool>>,
+    /// Version vector captured before first pending change (for delta export)
+    pending_vv: Arc<RwLock<Option<Vec<u8>>>>,
+    /// Notify channel to signal the debounce timer
+    change_notify: Arc<tokio::sync::Notify>,
 }
 
 impl GossipBridge {
@@ -50,6 +57,8 @@ impl GossipBridge {
             vault_topic,
             sender: Arc::new(RwLock::new(None)),
             subscribed: Arc::new(RwLock::new(false)),
+            pending_vv: Arc::new(RwLock::new(None)),
+            change_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -138,13 +147,13 @@ impl GossipBridge {
     }
 
     /// Broadcast an encrypted CRDT delta to all peers.
+    /// Returns Err with "too_large" if delta exceeds gossip max message size.
     pub async fn broadcast_delta(&self, encrypted_delta: &[u8]) -> Result<(), CoreError> {
         if encrypted_delta.len() > MAX_GOSSIP_MESSAGE_SIZE {
-            return Err(CoreError::Internal(format!(
-                "CRDT delta too large for gossip: {} bytes (max {})",
-                encrypted_delta.len(),
-                MAX_GOSSIP_MESSAGE_SIZE
-            )));
+            return Err(CoreError::DeltaTooLarge {
+                size: encrypted_delta.len(),
+                max: MAX_GOSSIP_MESSAGE_SIZE,
+            });
         }
 
         let sender_guard = self.sender.read().await;
@@ -161,6 +170,27 @@ impl GossipBridge {
     /// Check if we're subscribed to the gossip topic
     pub async fn is_subscribed(&self) -> bool {
         *self.subscribed.read().await
+    }
+
+    /// Mark that a local change happened. Stores the VV if not already pending.
+    /// The debounce timer will export and broadcast the delta.
+    pub async fn notify_change(&self, version_vector_before: Vec<u8>) {
+        let mut vv = self.pending_vv.write().await;
+        if vv.is_none() {
+            *vv = Some(version_vector_before);
+        }
+        drop(vv);
+        self.change_notify.notify_one();
+    }
+
+    /// Get the pending VV and clear it (used by the debounce flush).
+    pub async fn take_pending_vv(&self) -> Option<Vec<u8>> {
+        self.pending_vv.write().await.take()
+    }
+
+    /// Get the change notify handle (for spawning the debounce task).
+    pub fn change_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.change_notify.clone()
     }
 
     /// Re-subscribe after a connection drop. Resets state and subscribes again.

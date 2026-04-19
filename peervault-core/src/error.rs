@@ -26,12 +26,14 @@ pub enum CoreError {
     /// Timeout error
     Timeout(String),
     /// Key conflict - both peers have different vault keys
-    /// This happens when two devices independently created the same vault
     KeyConflict {
-        /// Our device name
         our_device: String,
-        /// Peer's device name
         peer_device: String,
+    },
+    /// CRDT delta too large for gossip broadcast
+    DeltaTooLarge {
+        size: usize,
+        max: usize,
     },
 }
 
@@ -49,11 +51,13 @@ impl std::fmt::Display for CoreError {
             Self::Timeout(s) => write!(f, "timeout: {}", s),
             Self::KeyConflict { our_device, peer_device } => write!(
                 f,
-                "Key conflict: '{}' and '{}' have different vault keys. \
-                 Both devices independently created this vault with different encryption keys. \
-                 To resolve: export data from one device, delete the vault on the other, \
-                 then re-sync from the device with the exported data.",
+                "Key conflict: '{}' and '{}' have different vault keys",
                 our_device, peer_device
+            ),
+            Self::DeltaTooLarge { size, max } => write!(
+                f,
+                "CRDT delta too large for gossip: {} bytes (max {})",
+                size, max
             ),
         }
     }

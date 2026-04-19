@@ -1323,7 +1323,7 @@ impl WasmPeerVault {
                     .map_err(|e| JsValue::from_str(&format!("Invalid peer ID: {}", e)))?;
                 match gb.subscribe_with_receiver(vec![peer_endpoint_id]).await {
                     Ok(Some(receiver)) => {
-                        // First subscription — spawn receiver task
+                        // First subscription — spawn receiver + debounce tasks
                         let store_for_gossip = store.clone();
                         let enc_key_for_gossip = encryption_key.clone();
                         let on_event_for_gossip = on_event.clone();
@@ -1333,6 +1333,22 @@ impl WasmPeerVault {
                                 store_for_gossip,
                                 enc_key_for_gossip,
                                 on_event_for_gossip,
+                            ).await;
+                        });
+
+                        // Spawn debounce task
+                        let gb_for_debounce = gossip_bridge.clone();
+                        let store_for_debounce = store.clone();
+                        let enc_for_debounce = encryption_key.clone();
+                        let notify = gb.change_notify();
+                        let on_event_for_debounce = on_event.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            run_gossip_debounce(
+                                gb_for_debounce,
+                                store_for_debounce,
+                                enc_for_debounce,
+                                notify,
+                                on_event_for_debounce,
                             ).await;
                         });
                     }
@@ -1387,27 +1403,11 @@ impl WasmPeerVault {
             s.set_text(&key, &content_str)
                 .map_err(|e| JsValue::from_str(&format!("Failed to set: {}", e)))?;
 
-            // Broadcast CRDT delta via gossip (if subscribed)
+            // Notify gossip of change (debounced — will batch and broadcast)
             let gossip_guard = gossip_bridge.read().await;
             if let Some(ref gb) = *gossip_guard {
                 if gb.is_subscribed().await {
-                    // Export delta since before the write
-                    if let Ok(delta) = s.export_updates(Some(&vv_before)) {
-                        if !delta.is_empty() {
-                            // Encrypt the delta with vault key
-                            let enc_key_guard = encryption_key.read().await;
-                            let encrypted = match enc_key_guard.as_ref() {
-                                Some(key) => key.encrypt(&delta)
-                                    .unwrap_or_else(|_| delta.clone()),
-                                None => delta,
-                            };
-                            drop(enc_key_guard);
-
-                            if let Err(e) = gb.broadcast_delta(&encrypted).await {
-                                warn!("Gossip broadcast failed: {}", e);
-                            }
-                        }
-                    }
+                    gb.notify_change(vv_before).await;
                 }
             }
 
@@ -1486,23 +1486,11 @@ impl WasmPeerVault {
             s.delete_file(&key)
                 .map_err(|e| JsValue::from_str(&format!("Failed to delete: {}", e)))?;
 
-            // Broadcast CRDT delta via gossip
+            // Notify gossip of change (debounced)
             let gossip_guard = gossip_bridge.read().await;
             if let Some(ref gb) = *gossip_guard {
                 if gb.is_subscribed().await {
-                    if let Ok(delta) = s.export_updates(Some(&vv_before)) {
-                        if !delta.is_empty() {
-                            let enc_key_guard = encryption_key.read().await;
-                            let encrypted = match enc_key_guard.as_ref() {
-                                Some(key) => key.encrypt(&delta).unwrap_or(delta),
-                                None => delta,
-                            };
-                            drop(enc_key_guard);
-                            if let Err(e) = gb.broadcast_delta(&encrypted).await {
-                                warn!("Gossip broadcast (delete) failed: {}", e);
-                            }
-                        }
-                    }
+                    gb.notify_change(vv_before).await;
                 }
             }
 
@@ -2266,6 +2254,22 @@ async fn handle_incoming_streams_v3_inner(
                         on_event_for_gossip,
                     ).await;
                 });
+
+                // Spawn debounce task (acceptor side)
+                let gb_for_debounce = gossip_bridge_arc.clone();
+                let store_for_debounce = store.clone();
+                let enc_for_debounce = encryption_key.clone();
+                let notify = gb.change_notify();
+                let on_event_for_debounce = on_event.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    run_gossip_debounce(
+                        gb_for_debounce,
+                        store_for_debounce,
+                        enc_for_debounce,
+                        notify,
+                        on_event_for_debounce,
+                    ).await;
+                });
             }
             Ok(None) => {} // Already subscribed
             Err(e) => {
@@ -2374,6 +2378,90 @@ async fn run_gossip_receiver(
     }
 
     info!("Gossip receiver stopped");
+}
+
+/// Background task that debounces gossip broadcasts.
+/// Waits for change notifications, batches over a short window, then broadcasts.
+async fn run_gossip_debounce(
+    gossip_bridge: Arc<RwLock<Option<crate::gossip_bridge::GossipBridge>>>,
+    store: Arc<RwLock<Option<LoroStore>>>,
+    encryption_key: Arc<RwLock<Option<VaultKey>>>,
+    change_notify: Arc<tokio::sync::Notify>,
+    on_event: Option<Function>,
+) {
+    info!("Gossip debounce task started");
+
+    loop {
+        // Wait for a change notification
+        change_notify.notified().await;
+
+        // Debounce: wait 200ms for more changes to accumulate
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            let window = web_sys::window().expect("no window");
+            window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 200).ok();
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+
+        // Drain all pending notifications (coalesce rapid changes)
+        // Notify is edge-triggered, so this clears any accumulated signals
+
+        // Take the pending VV
+        let gossip_guard = gossip_bridge.read().await;
+        let gb = match gossip_guard.as_ref() {
+            Some(gb) => gb,
+            None => continue,
+        };
+
+        let pending_vv = match gb.take_pending_vv().await {
+            Some(vv) => vv,
+            None => continue,
+        };
+
+        if !gb.is_subscribed().await {
+            continue;
+        }
+
+        // Export delta since the captured VV
+        let store_guard = store.read().await;
+        let delta = match store_guard.as_ref() {
+            Some(s) => match s.export_updates(Some(&pending_vv)) {
+                Ok(d) if !d.is_empty() => d,
+                _ => continue,
+            },
+            None => continue,
+        };
+        drop(store_guard);
+
+        // Encrypt
+        let enc_key_guard = encryption_key.read().await;
+        let encrypted = match enc_key_guard.as_ref() {
+            Some(key) => key.encrypt(&delta).unwrap_or(delta),
+            None => delta,
+        };
+        drop(enc_key_guard);
+
+        // Broadcast (or emit sync_needed if too large)
+        match gb.broadcast_delta(&encrypted).await {
+            Ok(()) => {
+                debug!("Gossip: broadcast {} bytes (debounced)", encrypted.len());
+            }
+            Err(crate::error::CoreError::DeltaTooLarge { size, max }) => {
+                warn!("Delta too large for gossip ({} > {}), peers need point-to-point sync", size, max);
+                if let Some(ref callback) = on_event {
+                    let event = serde_json::json!({
+                        "type": "sync_needed",
+                        "reason": "delta_too_large",
+                        "size": size,
+                        "max": max,
+                    });
+                    let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(&event.to_string()));
+                }
+            }
+            Err(e) => {
+                warn!("Gossip broadcast failed: {}", e);
+            }
+        }
+    }
 }
 
 // =============================================================================

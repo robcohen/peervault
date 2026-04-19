@@ -21,77 +21,110 @@ just wasm         # Rebuild Iroh WASM (if needed)
 just wasm-check   # Verify WASM has no native imports
 ```
 
-## WASM Build (peervault-iroh)
+## WASM Build (peervault-core)
 
-The Iroh networking layer is a Rust crate compiled to WASM. **Requires NixOS/nix develop shell.**
-
-### Why Nix is Required
-The `ring` crate (cryptography) contains C code that must be cross-compiled to WASM. On NixOS, the standard clang wrapper adds incompatible flags. The solution:
-
-1. Use `llvmPackages.clang-unwrapped` (no wrapper)
-2. Set `CC_wasm32_unknown_unknown=clang` for the `cc` crate
-
-This is configured in `flake.nix` shellHook.
+The core is a Rust crate (`peervault-core/`) compiled to WASM. **Requires nix develop shell.**
 
 ### Building WASM
 ```sh
-nix develop                    # Enter dev shell (sets CC_wasm32_unknown_unknown)
-just wasm                      # Build with wasm-pack
-just wasm-check                # Verify no "env" imports
+nix develop                    # Enter dev shell
+cd peervault-core
+cargo build --target wasm32-unknown-unknown --features wasm --no-default-features
+# Or for release:
+cargo build --target wasm32-unknown-unknown --features wasm --no-default-features --release
 ```
 
-### Troubleshooting
-- **"env" imports in WASM**: Ring compiled native code instead of WASM. Ensure `CC_wasm32_unknown_unknown=clang` is set.
-- **wasm-opt errors**: Disabled via `Cargo.toml` metadata (`wasm-opt = false`).
-- **LinkError at runtime**: Check WASM with `just wasm-check`. Should show "0 env imports".
+### Verifying WASM
+```sh
+# Must show "0" — any env imports means native code leaked through
+wasm-tools print target/wasm32-unknown-unknown/release/peervault_core.wasm | grep '"env"' | wc -l
+```
 
-See `docs/wasm-build.md` for detailed documentation.
+### Key Dependencies (Cargo.toml)
+- `iroh = "0.95"` — QUIC transport via relay
+- `iroh-blobs = "0.97"` — Bao-verified blob transfer (MemStore for WASM)
+- `iroh-gossip = "0.95"` — Epidemic broadcast (HyParView + PlumTree)
+- `loro = "1.10"` — CRDT (LoroTree + LoroText)
+- `chacha20poly1305` / `ecies` — Encryption
+- `wasm-bindgen = "=0.2.105"` — Pinned for iroh compatibility
+
+### Troubleshooting
+- **"env" imports in WASM**: A dependency compiled native code. Check with `wasm-tools print`.
+- **wasm-opt errors**: Disabled via `Cargo.toml` metadata (`wasm-opt = false`).
+- **Rust version**: Some deps require Rust 1.95+. Pin `constant_time_eq` if needed: `cargo update constant_time_eq@0.4.3 --precise 0.4.2`
 
 ## Architecture
 
+### Overview
+
+The plugin has two layers:
+1. **Rust WASM core** (`peervault-core/`) — all sync, transport, encryption, and CRDT logic
+2. **TypeScript wrapper** (`src/`) — thin Obsidian plugin that calls the WASM module
+
 ### Key Directories
-- `src/peer/` - Peer management, pairing, groups
-- `src/sync/` - Sync protocol (version exchange, CRDT merge, blob sync)
-- `src/transport/` - Iroh WASM transport layer (QUIC over relay)
-- `src/core/` - Document manager, vault sync, storage adapters
-- `src/ui/` - Obsidian UI (settings tab, status modal, modals)
-- `src/crypto/` - Encryption services
-- `src/utils/` - Logger, events
-- `peervault-iroh/` - Rust/WASM crate for Iroh networking
+- `src/main.ts` - Obsidian plugin entry point, file watching, settings UI
+- `src/core/peer-vault-client.ts` - TypeScript wrapper around WASM module
+- `peervault-core/` - Rust WASM crate (the actual sync engine)
+- `peervault-core/src/wasm.rs` - WASM bindings (WasmPeerVault, sync protocol)
+- `peervault-core/src/store/` - Loro CRDT document store
+- `peervault-core/src/net/` - Iroh transport layer
+- `peervault-core/src/sync.rs` - SyncEngine (encrypted CRDT sync)
+- `peervault-core/src/runner.rs` - SyncRunner (structured sync protocol)
+- `peervault-core/src/blobs_bridge.rs` - iroh-blobs MemStore ↔ HostInterface bridge
+- `peervault-core/src/gossip_bridge.rs` - iroh-gossip real-time CRDT broadcast
+- `peervault-core/src/sync_handler.rs` - ProtocolHandler for sync ALPN
+- `peervault-core/src/protocol.rs` - Wire format (V3 binary protocol)
 - `e2e/` - End-to-end testing framework (CDP-based)
 
-### Sync Protocol
-1. Initiator opens a QUIC stream and sends `VERSION_INFO`
-2. Acceptor receives `VERSION_INFO`, validates vault ID, sends its own
-3. Both exchange CRDT updates and blobs
-4. Enter live mode with ping keepalives
+### Networking Stack (iroh Router)
+
+Three protocols registered on a single iroh Endpoint via `iroh::protocol::Router`:
+
+```
+Router
+  ├── SyncHandler     (ALPN: peervault/sync/1)  — initial full sync + pairing
+  ├── BlobsProtocol   (ALPN: iroh-blobs)        — Bao-verified blob transfer
+  └── Gossip          (ALPN: /iroh-gossip/1)    — real-time CRDT delta broadcast
+```
+
+- **Initial sync**: V3 binary protocol (VersionInfo → Updates → BlobHashes → BlobTransfer → SyncComplete)
+- **Live sync**: iroh-gossip broadcasts encrypted Loro deltas on local changes (debounced 200ms)
+- **Blob transfer**: iroh-blobs with MemStore, Bao-verified 16KB chunk streaming
+- **Pairing**: One-time nonce in VersionInfo.pairing_nonce, validated by acceptor
+
+### Sync Protocol (V3)
+1. Initiator sends `VersionInfo` with `pairing_nonce` and `supports_iroh_blobs: true`
+2. Acceptor validates pairing (known peer or valid nonce), sends its `VersionInfo`
+3. Both exchange encrypted CRDT updates via `Updates` messages
+4. If both support iroh-blobs: exchange `BlobHashes`, transfer via iroh-blobs ALPN
+5. Exchange `SyncComplete`, sync done
+6. After sync: both subscribe to gossip topic (TopicId = vault_id)
+7. Subsequent changes broadcast via gossip (encrypted, debounced, max 64KB)
+8. Deltas >64KB trigger `sync_needed` event → fallback to point-to-point sync
 
 ### Pairing Flow
-1. Device A shows QR/ticket in Settings > Devices > Add Device
-2. Device B pastes ticket and connects (becomes initiator)
-3. Device A sees unknown peer, shows pairing request in Settings
-4. User accepts on Device A - peer is saved, stale connection closed
-5. Device B reconnects (via retry cycle), Device A accepts as known peer
-6. Sync completes with proper initiator/acceptor roles
-
-**Critical**: The acceptor must NOT initiate sync after accepting pairing. Both sides being initiators causes a deadlock (both send VERSION_INFO on separate streams, neither reads the other's).
+1. Device A generates pairing ticket (transport ticket + encryption key + vault ID + nonce)
+2. Device B pastes ticket, calls `connectPeer` (becomes initiator)
+3. Initiator sends `VersionInfo` with the one-time nonce
+4. Acceptor validates nonce against `pending_pairings`, adds to `known_peers`
+5. Sync completes, both subscribe to gossip for live updates
 
 ### Connection Model
-- Iroh QUIC connections via relay servers (e.g., `use1-1.relay.n0.iroh-canary.iroh.link`)
+- Iroh QUIC connections via relay servers (default: `use1-1.relay.n0.computer`)
 - `iroh::endpoint::Connection` is Clone + Send + Sync (no Mutex needed)
-- Transport auto-runs a stream accept loop per connection
-- Reconnect: exponential backoff, 10 attempts max, capped at 30s
+- Router dispatches incoming connections by ALPN
+- Gossip uses HyParView (5 active + 30 passive peers) for topology management
 
 ## Key Files
 
-- `src/main.ts` - Plugin entry point, commands
-- `src/peer/peer-manager.ts` - Core peer/pairing logic
-- `src/sync/sync-session.ts` - Sync protocol implementation
-- `src/transport/iroh-transport.ts` - WASM Iroh transport
-- `src/ui/settings-tab.ts` - Settings with integrated pairing UI
-- `src/ui/status-modal.ts` - Sync status display
-- `src/utils/logger.ts` - Logger with buffer for "Copy Logs" feature
-- `peervault-iroh/src/lib.rs` - Rust WASM bindings for Iroh
+- `src/main.ts` - Plugin entry point, commands, file watching, settings UI
+- `src/core/peer-vault-client.ts` - TypeScript WASM wrapper, event handling
+- `peervault-core/src/wasm.rs` - Main WASM entry point (WasmPeerVault)
+- `peervault-core/src/net/transport.rs` - IrohTransport with Router
+- `peervault-core/src/protocol.rs` - V3 binary wire format
+- `peervault-core/src/gossip_bridge.rs` - Gossip subscription and broadcast
+- `peervault-core/src/blobs_bridge.rs` - Blob transfer bridge
+- `peervault-core/Cargo.toml` - Rust dependencies (iroh, iroh-blobs, iroh-gossip, loro)
 - `esbuild.config.mjs` - Build config with WASM inlining
 
 ## Debugging
@@ -155,84 +188,22 @@ See `e2e/README.md` for full documentation including:
 
 ## Cloud Sync
 
-Cloud sync provides S3-compatible backup to complement P2P sync. Supports AWS S3, MinIO, Cloudflare R2, Backblaze B2, DigitalOcean Spaces.
+Cloud sync (S3-compatible backup) is implemented in the Rust core at `peervault-core/src/cloud/`. Supports AWS S3, MinIO, Cloudflare R2, Backblaze B2.
 
 ### Key Files
-- `src/cloud/cloud-sync.ts` - Main sync service (upload/download deltas, retry logic)
-- `src/cloud/s3-client.ts` - S3-compatible client with AWS Signature V4
-- `src/cloud/types.ts` - Cloud sync types (config, deltas, commits, progress)
-- `src/ui/settings/cloud-section.ts` - Settings UI for cloud sync
-
-### Storage Structure
-```
-/{pathPrefix}/{vaultId}/
-  deltas/{timestamp}-{hash}.enc    # Encrypted CRDT deltas
-  blobs/{hash}.enc                 # Encrypted binary attachments
-  index.json                       # Delta index (for listing)
-  blob-index.json                  # Blob index
-  manifest.json                    # Vault metadata
-```
+- `peervault-core/src/cloud/sync.rs` - Upload/download deltas, retry logic
+- `peervault-core/src/cloud/s3_client.rs` - S3-compatible client with AWS Signature V4
+- `peervault-core/src/cloud/types.rs` - Cloud sync types
 
 ### Encryption
-- **Key derivation**: PBKDF2 with 100,000 iterations from user passphrase
-- **Encryption**: XSalsa20-Poly1305 (TweetNaCl secretbox)
-- **Key storage**: VaultKeyManager stores encrypted key locally (device-derived protection)
-
-### Debugging Cloud Sync
-
-**Check cloud state:**
-```typescript
-// In Obsidian console
-const plugin = app.plugins.plugins["peervault"];
-plugin.cloudSync.getState();  // {status, pendingUploads, pendingDownloads, error}
-```
-
-**Force cloud sync:**
-```typescript
-await plugin.cloudSync.sync();
-```
-
-**Common S3 error codes:**
-- `InvalidAccessKeyId` - Wrong access key
-- `SignatureDoesNotMatch` - Wrong secret key or clock skew
-- `NoSuchBucket` - Bucket doesn't exist or wrong endpoint
-- `AccessDenied` - Missing bucket permissions
-- `SlowDown` / `ServiceUnavailable` - Transient, will auto-retry
-
-**Retry behavior:**
-- Retryable errors: 5xx, 429, network errors, SlowDown, ServiceUnavailable
-- Non-retryable: 4xx auth errors, bucket not found
-- Exponential backoff: 1s → 2s → 4s (max 30s), 3 retries
-
-### MinIO Local Testing
-
-```sh
-# Start MinIO (using just command)
-just minio-start
-
-# Default credentials:
-# Endpoint: http://localhost:9000
-# Access Key: minioadmin
-# Secret Key: minioadmin
-
-# Create bucket via MinIO console: http://localhost:9001
-# Or via mc CLI:
-mc alias set local http://localhost:9000 minioadmin minioadmin
-mc mb local/peervault-test
-```
-
-### Cloud Sync Settings
-- `cloudAutoSyncInterval`: Auto-sync interval in minutes (0 = disabled)
-- `cloudStorageConfig`: S3 credentials and endpoint
-- Encryption key persists across reloads (stored via VaultKeyManager)
+- **Content encryption**: XChaCha20-Poly1305 (vault key)
+- **Key exchange**: ECIES (x25519 + XChaCha20-Poly1305) during pairing
 
 ## Known Issues & Gotchas
 
-- **Ring crate WASM**: Must use clang cross-compiler. See "WASM Build" section above. Pin `wasm-bindgen = "=0.2.105"`.
-- **WASM Connection**: `iroh::endpoint::Connection` is Clone - do NOT wrap in Mutex (causes deadlock on accept_bi/open_bi).
+- **wasm-bindgen pinned**: `wasm-bindgen = "=0.2.105"` — must match iroh's version exactly.
+- **iroh Connection is Clone**: Do NOT wrap in Mutex (causes deadlock on accept_bi/open_bi).
+- **constant_time_eq**: May need pinning (`cargo update constant_time_eq@0.4.3 --precise 0.4.2`) if Rust version < 1.95.
+- **Gossip max message size**: 64KB. CRDT deltas larger than this trigger `sync_needed` event for point-to-point fallback.
 - **versions.json**: Must be updated with every release for BRAT compatibility.
 - **dist/manifest.json**: Auto-copied by build from root `manifest.json`.
-
-## Known Bug: WebRTC HybridConnection Instability (Resolved 2026-02-08)
-
-HybridConnection wrapper caused sync failures by reading the first message from every stream to detect WebRTC signaling, creating double-buffering and race conditions. **Fix**: When WebRTC is disabled (now the default), use `IrohTransport` directly. WebRTC is opt-in and still has stability issues.

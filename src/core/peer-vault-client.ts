@@ -586,6 +586,15 @@ export class PeerVaultClient {
           this.handlePairingComplete(event.peer_id, event.device_name);
           break;
 
+        case "sync_needed":
+          // Delta too large for gossip — trigger point-to-point sync
+          console.log(`[PeerVault] Sync needed: ${event.reason} (${event.size} bytes > ${event.max})`);
+          // Trigger syncAll to push the large change via point-to-point
+          this.syncAll().catch((e) => {
+            console.error("[PeerVault] Auto sync after large delta failed:", e);
+          });
+          break;
+
         case "gossip_neighbor_up":
           console.log(`[PeerVault] Gossip neighbor joined: ${event.peer_id}`);
           break;
