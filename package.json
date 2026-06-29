@@ -18,10 +18,10 @@
   },
   "devDependencies": {
     "@types/bun": "latest",
-    "@types/node": "^25.0.0",
-    "esbuild": "^0.27.2",
-    "obsidian": "^1.11.4",
-    "typescript": "^5.9.3"
+    "@types/node": "^25.9.0",
+    "esbuild": "^0.28.0",
+    "obsidian": "^1.13.1",
+    "typescript": "^6.0.0"
   },
   "dependencies": {}
 }

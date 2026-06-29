@@ -10,9 +10,11 @@ jobs:
     name: Rust core (test + WASM)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      # Magic Nix Cache (hosted) was sunset in 2025. To re-enable cross-run
+      # caching, add `permissions: id-token: write` and
+      # `DeterminateSystems/flakehub-cache-action@main` here.
 
       - name: cargo test (native)
         # test-utils exposes MockHost for the integration test crates.
@@ -36,9 +38,11 @@ jobs:
     name: TypeScript plugin (typecheck)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      # Magic Nix Cache (hosted) was sunset in 2025. To re-enable cross-run
+      # caching, add `permissions: id-token: write` and
+      # `DeterminateSystems/flakehub-cache-action@main` here.
 
       - name: Install deps and typecheck
         run: nix develop --command bash -c 'bun install && bun run check'

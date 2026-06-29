@@ -50,7 +50,7 @@ const DEFAULT_RELAY_URL = "https://use1-1.relay.n0.computer";
 // =============================================================================
 
 export default class PeerVaultPlugin extends Plugin {
-  settings: PeerVaultSettings = DEFAULT_SETTINGS;
+  override settings: PeerVaultSettings = DEFAULT_SETTINGS;
   client: PeerVaultClient | null = null;
   private autoSyncTimer: number | null = null;
   // Per-file debounce timers to handle rapid changes to different files
