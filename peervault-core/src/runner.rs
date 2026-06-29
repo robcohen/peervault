@@ -474,15 +474,31 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
         // Receive peer's VERSION_INFO
         let peer_info = self.recv_version_info(stream)?;
 
+        // Validate basic handshake invariants (vault id, protocol version) BEFORE
+        // consuming any one-time pairing nonce. Otherwise a peer presenting a valid
+        // nonce but a mismatched vault/version could burn the legitimate pairing nonce.
+        if peer_info.vault_id != *self.engine.vault_id() {
+            self.send_error(stream, error_codes::VAULT_MISMATCH, "Vault ID mismatch")?;
+            return Err(CoreError::Protocol("Vault ID mismatch".into()));
+        }
+        if peer_info.protocol_version < 2 {
+            self.send_error(stream, error_codes::VERSION_MISMATCH, "Protocol version too old")?;
+            return Err(CoreError::Protocol(format!(
+                "Protocol version too old: {} (minimum 2)",
+                peer_info.protocol_version,
+            )));
+        }
+
         // Acceptor validates pairing (before sending our VERSION_INFO)
         // This allows us to reject unknown peers with invalid nonces
         if !self.is_initiator {
             match self.validator.validate(&self.peer_node_id, peer_info.pairing_nonce.as_deref()) {
                 Ok(_is_new) => {
-                    // Pairing validated - proceed with sync
+                    // Pairing validated - proceed with sync.
+                    // `get(..16)` avoids panicking on a non-UTF-8-boundary nonce.
                     tracing::info!(
                         peer_id = %self.peer_node_id,
-                        nonce = peer_info.pairing_nonce.as_deref().map(|n| &n[..16.min(n.len())]),
+                        nonce = peer_info.pairing_nonce.as_deref().map(|n| n.get(..16).unwrap_or(n)),
                         "Pairing validated for peer"
                     );
                 }
@@ -496,21 +512,6 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
         // Acceptor sends after receiving (and validating)
         if !self.is_initiator {
             self.send_message(stream, &Message::VersionInfo(our_info))?;
-        }
-
-        // Validate vault ID matches
-        if peer_info.vault_id != *self.engine.vault_id() {
-            self.send_error(stream, error_codes::VAULT_MISMATCH, "Vault ID mismatch")?;
-            return Err(CoreError::Protocol("Vault ID mismatch".into()));
-        }
-
-        // Check protocol version (accept v2+ for backward compatibility)
-        if peer_info.protocol_version < 2 {
-            self.send_error(stream, error_codes::VERSION_MISMATCH, "Protocol version too old")?;
-            return Err(CoreError::Protocol(format!(
-                "Protocol version too old: {} (minimum 2)",
-                peer_info.protocol_version,
-            )));
         }
 
         // Store peer info
@@ -658,14 +659,36 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
             self.send_message(stream, &msg)?;
         }
 
-        // Handle blob exchange (send and receive interleaved)
+        // Handle blob exchange (send and receive interleaved).
+        //
+        // The loop is bounded on three axes so a malicious or buggy peer cannot
+        // hang the sync forever:
+        //   * `idle_timeouts` — consecutive receive timeouts with nothing left to
+        //     send (peer advertised a blob but never sends it).
+        //   * `messages` — total messages processed (peer floods unexpected msgs).
+        //   * progress on send — if we cannot satisfy a blob locally we still
+        //     advance `sent`, instead of retrying the same missing hash forever.
         let mut received = 0;
         let mut sent = 0;
+        let mut idle_timeouts: u32 = 0;
+        let mut messages: usize = 0;
+        const MAX_IDLE_TIMEOUTS: u32 = 30;
+        let max_messages = need_from_peer
+            .len()
+            .saturating_add(send_to_peer.len())
+            .saturating_mul(4)
+            .saturating_add(64);
 
         while received < need_from_peer.len() || sent < send_to_peer.len() {
             // Try to receive
             match stream.recv(1000) {
                 Ok(data) => {
+                    messages += 1;
+                    if messages > max_messages {
+                        tracing::warn!(messages, "Blob exchange exceeded message budget, aborting");
+                        break;
+                    }
+                    idle_timeouts = 0;
                     self.result.bytes_received += data.len() as u64;
                     let msg = Message::decode(&data)
                         .map_err(|e| CoreError::Protocol(e.to_string()))?;
@@ -692,7 +715,6 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
                                         mime_type: None,
                                     });
                                     self.send_message(stream, &msg)?;
-                                    sent += 1;
                                     self.result.blobs_sent += 1;
                                 }
                             }
@@ -704,20 +726,38 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
                     }
                 }
                 Err(CoreError::Timeout(_)) => {
-                    // Send our pending blobs
+                    // Send the next pending blob. If we don't have it locally, skip
+                    // it (advance `sent`) rather than retrying forever.
                     if sent < send_to_peer.len() {
-                        let hash = &send_to_peer[sent];
-                        if let Some(data) = blobs.get(hash) {
-                            let encrypted = self.engine.encrypt_blob(&data)?;
+                        let hash = send_to_peer[sent].clone();
+                        match blobs.get(&hash) {
+                            Some(data) => {
+                                let encrypted = self.engine.encrypt_blob(&data)?;
 
-                            let msg = Message::BlobData(BlobData {
-                                hash: hash.clone(),
-                                data: encrypted,
-                                mime_type: None,
-                            });
-                            self.send_message(stream, &msg)?;
-                            sent += 1;
-                            self.result.blobs_sent += 1;
+                                let msg = Message::BlobData(BlobData {
+                                    hash: hash.clone(),
+                                    data: encrypted,
+                                    mime_type: None,
+                                });
+                                self.send_message(stream, &msg)?;
+                                self.result.blobs_sent += 1;
+                            }
+                            None => {
+                                tracing::warn!(hash = %hash, "Blob not available locally, skipping");
+                            }
+                        }
+                        sent += 1;
+                        idle_timeouts = 0;
+                    } else {
+                        // Nothing left to send; only waiting on the peer now.
+                        idle_timeouts += 1;
+                        if idle_timeouts >= MAX_IDLE_TIMEOUTS {
+                            tracing::warn!(
+                                received,
+                                needed = need_from_peer.len(),
+                                "Blob exchange timed out waiting for peer"
+                            );
+                            break;
                         }
                     }
                 }

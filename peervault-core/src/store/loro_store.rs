@@ -13,6 +13,23 @@ use web_time::{SystemTime, UNIX_EPOCH};
 
 use super::{DocStore, FileNode, FileType, Hash, StoreError, StoreResult};
 
+/// Reject paths that could escape the vault directory when written to disk.
+///
+/// Paths originate from peer CRDT data and are untrusted. We disallow absolute
+/// paths, parent traversal (`..`) and embedded NUL bytes. Empty paths are also
+/// rejected (callers expect at least one path component).
+fn validate_path(path: &str) -> StoreResult<()> {
+    if path.is_empty() || path.starts_with('/') || path.starts_with('\\') {
+        return Err(StoreError::InvalidPath(path.to_string()));
+    }
+    for component in path.split(|c| c == '/' || c == '\\') {
+        if component == ".." || component.contains('\0') {
+            return Err(StoreError::InvalidPath(path.to_string()));
+        }
+    }
+    Ok(())
+}
+
 /// Tree container name (matches TypeScript)
 const TREE_NAME: &str = "files";
 
@@ -133,6 +150,11 @@ impl LoroStore {
     /// Create a node at path, creating parent folders as needed
     /// Returns the TreeID of the created/found node
     fn create_node_at_path(&self, path: &str, file_type: FileType) -> StoreResult<TreeID> {
+        // Defense-in-depth: never store a path that could escape the vault when the
+        // host later writes it to disk. Paths originate from peer CRDT data and are
+        // therefore untrusted.
+        validate_path(path)?;
+
         let doc = self.doc.write().unwrap();
         let tree = doc.get_tree(TREE_NAME);
 

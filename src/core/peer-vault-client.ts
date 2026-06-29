@@ -322,7 +322,8 @@ export class PeerVaultClient {
     const expiresAt = Date.now() + PeerVaultClient.PAIRING_TIMEOUT_MS;
     this.pendingPairings.set(nonce, expiresAt);
     this.vault.registerPairingNonce(nonce, expiresAt);
-    console.log(`[PeerVault] Created pairing ticket with nonce ${nonce.slice(0, 16)}... (expires in 10 min)`);
+    // Do not log the nonce — it is a one-time pairing secret and logs are exportable.
+    console.log("[PeerVault] Created pairing ticket (nonce expires in 10 min)");
 
     // Combine: base64(JSON({ t: ticket, k: key, v: vaultId, n: nonce }))
     const pairingData = {
@@ -342,6 +343,14 @@ export class PeerVaultClient {
         this.pendingPairings.delete(nonce);
       }
     }
+  }
+
+  /**
+   * Return the vault ID embedded in a pairing ticket, or null if the ticket is not
+   * a pairing ticket. Used by the host to adopt a peer's vault ID before connecting.
+   */
+  peekVaultId(ticket: string): string | null {
+    return this.parsePairingTicket(ticket)?.vaultId ?? null;
   }
 
   private parsePairingTicket(ticket: string): { transport: string; key: string; vaultId: string; nonce?: string } | null {
@@ -384,8 +393,9 @@ export class PeerVaultClient {
       }
     }
 
-    // Connect to peer with pairing nonce (for one-time ticket validation)
-    console.log(`[PeerVault] Connecting to peer with nonce: ${pairingNonce?.slice(0, 16) ?? 'none'}...`);
+    // Connect to peer with pairing nonce (for one-time ticket validation).
+    // Never log the nonce value itself.
+    console.log(`[PeerVault] Connecting to peer (pairing nonce ${pairingNonce ? "present" : "absent"})`);
     const peerId = await this.vault.connectPeerWithPairing(
       transportTicket,
       pairingNonce,
@@ -423,6 +433,22 @@ export class PeerVaultClient {
   // ===========================================================================
 
   async syncAll(): Promise<void> {
+    // Single-flight: auto-sync, the "sync now" command, and the large-delta
+    // fallback can all call this concurrently. Overlapping runs mutate shared peer
+    // state and open redundant connections, so skip if one is already in progress.
+    if (this._syncInProgress) {
+      console.log("[PeerVault] syncAll already in progress, skipping");
+      return;
+    }
+    this._syncInProgress = true;
+    try {
+      await this.syncAllInner();
+    } finally {
+      this._syncInProgress = false;
+    }
+  }
+
+  private async syncAllInner(): Promise<void> {
     // Reconnect to all known peers and sync with timeout
     const syncTimeout = 15000; // 15 second timeout per peer
 
@@ -433,7 +459,6 @@ export class PeerVaultClient {
     for (const peer of this.peers) {
       try {
         console.log(`[PeerVault] Syncing with peer ${peer.name} (${peer.id.slice(0, 8)})...`);
-        console.log(`[PeerVault] Using ticket: ${peer.ticket.slice(0, 50)}...`);
 
         // Add timeout to prevent hanging
         const syncPromise = this.vault?.connectPeer(peer.ticket);
@@ -583,19 +608,20 @@ export class PeerVaultClient {
           break;
 
         case "pairing_complete":
-          // A peer connected with a valid one-time pairing nonce - auto-add them
-          this.handlePairingComplete(event.peer_id, event.device_name);
+          // A peer connected with a valid one-time pairing nonce - auto-add them.
+          // Fire-and-forget, but catch rejections (savePeers can fail on disk error).
+          this.handlePairingComplete(event.peer_id, event.device_name).catch((e) =>
+            console.error("[PeerVault] Failed to handle pairing complete:", e)
+          );
           break;
 
         case "sync_needed":
           // Delta too large for gossip — trigger point-to-point sync (with guard)
           console.log(`[PeerVault] Sync needed: ${event.reason} (${event.size} bytes > ${event.max})`);
-          if (!this._syncInProgress) {
-            this._syncInProgress = true;
-            this.syncAll()
-              .catch((e) => console.error("[PeerVault] Auto sync after large delta failed:", e))
-              .finally(() => { this._syncInProgress = false; });
-          }
+          // syncAll is now single-flight internally, so just call it.
+          this.syncAll().catch((e) =>
+            console.error("[PeerVault] Auto sync after large delta failed:", e)
+          );
           break;
 
         case "gossip_neighbor_up":

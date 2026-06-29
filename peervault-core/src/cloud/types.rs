@@ -3,7 +3,10 @@
 use serde::{Deserialize, Serialize};
 
 /// S3-compatible storage configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is implemented by hand to avoid leaking the secret access key into
+/// logs or error messages.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CloudConfig {
     /// S3 endpoint URL (e.g., "https://s3.amazonaws.com" or "https://minio.example.com")
     pub endpoint: String,
@@ -17,6 +20,19 @@ pub struct CloudConfig {
     pub secret_access_key: String,
     /// Path prefix within bucket (e.g., "backups/vault1")
     pub path_prefix: String,
+}
+
+impl std::fmt::Debug for CloudConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloudConfig")
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("access_key_id", &"[REDACTED]")
+            .field("secret_access_key", &"[REDACTED]")
+            .field("path_prefix", &self.path_prefix)
+            .finish()
+    }
 }
 
 impl CloudConfig {

@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    name: Rust core (test + WASM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: cargo test (native)
+        # test-utils exposes MockHost for the integration test crates.
+        # Network-dependent tests are #[ignore]d (need a real relay).
+        run: nix develop --command bash -c 'cd peervault-core && cargo test --features test-utils'
+
+      - name: Build WASM
+        run: |
+          nix develop --command bash -c '
+            cd peervault-core &&
+            cargo build --target wasm32-unknown-unknown --features wasm --no-default-features --release'
+
+      - name: Verify WASM has no native ("env") imports
+        run: |
+          nix develop --command bash -c '
+            count=$(wasm-tools print peervault-core/target/wasm32-unknown-unknown/release/peervault_core.wasm | grep -c "\"env\"" || true);
+            echo "env imports: $count";
+            test "$count" -eq 0'
+
+  typescript:
+    name: TypeScript plugin (typecheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Install deps and typecheck
+        run: nix develop --command bash -c 'bun install && bun run check'

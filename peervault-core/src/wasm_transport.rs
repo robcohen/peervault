@@ -471,11 +471,19 @@ impl WasmStream {
             return Err(JsValue::from_str("Message too large"));
         }
 
-        // Read data
-        let mut data = vec![0u8; len];
-        recv.read_exact(&mut data)
-            .await
-            .map_err(|e| JsValue::from_str(&format!("Read data failed: {}", e)))?;
+        // Read the data in bounded chunks so a forged length prefix cannot make us
+        // pre-allocate a huge buffer before any payload arrives.
+        let mut data = Vec::new();
+        let mut remaining = len;
+        let mut buf = [0u8; 64 * 1024];
+        while remaining > 0 {
+            let n = remaining.min(buf.len());
+            recv.read_exact(&mut buf[..n])
+                .await
+                .map_err(|e| JsValue::from_str(&format!("Read data failed: {}", e)))?;
+            data.extend_from_slice(&buf[..n]);
+            remaining -= n;
+        }
 
         Ok(Uint8Array::from(data.as_slice()))
     }
@@ -535,11 +543,19 @@ impl Stream for WasmStream {
                 return Err(TransportError::ProtocolError("Message too large".into()));
             }
 
-            // Read data
-            let mut data = vec![0u8; len];
-            recv.read_exact(&mut data)
-                .await
-                .map_err(|e| TransportError::IoError(e.to_string()))?;
+            // Read the data in bounded chunks so a forged length prefix cannot make
+            // us pre-allocate a huge buffer before any payload arrives.
+            let mut data = Vec::new();
+            let mut remaining = len;
+            let mut buf = [0u8; 64 * 1024];
+            while remaining > 0 {
+                let n = remaining.min(buf.len());
+                recv.read_exact(&mut buf[..n])
+                    .await
+                    .map_err(|e| TransportError::IoError(e.to_string()))?;
+                data.extend_from_slice(&buf[..n]);
+                remaining -= n;
+            }
 
             Ok(data)
         })

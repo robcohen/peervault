@@ -1080,7 +1080,7 @@ impl WasmPeerVault {
         pending.insert(nonce.to_string(), expires_at_ms as u64);
         web_sys::console::log_1(&JsValue::from_str(&format!(
             "[WASM] Registered pairing nonce: {}...",
-            &nonce[..16.min(nonce.len())]
+            short(&nonce, 16)
         )));
     }
 
@@ -1100,7 +1100,7 @@ impl WasmPeerVault {
                 pending.remove(nonce);
                 web_sys::console::log_1(&JsValue::from_str(&format!(
                     "[WASM] Pairing nonce expired: {}...",
-                    &nonce[..16.min(nonce.len())]
+                    short(&nonce, 16)
                 )));
                 return false;
             }
@@ -1109,13 +1109,13 @@ impl WasmPeerVault {
             pending.remove(nonce);
             web_sys::console::log_1(&JsValue::from_str(&format!(
                 "[WASM] Pairing nonce validated and consumed: {}...",
-                &nonce[..16.min(nonce.len())]
+                short(&nonce, 16)
             )));
             true
         } else {
             web_sys::console::log_1(&JsValue::from_str(&format!(
                 "[WASM] Unknown pairing nonce: {}...",
-                &nonce[..16.min(nonce.len())]
+                short(&nonce, 16)
             )));
             false
         }
@@ -1134,7 +1134,7 @@ impl WasmPeerVault {
         self.known_peers.blocking_write().insert(peer_id.to_string(), now);
         web_sys::console::log_1(&JsValue::from_str(&format!(
             "[WASM] Added known peer: {}...",
-            &peer_id[..16.min(peer_id.len())]
+            short(&peer_id, 16)
         )));
     }
 
@@ -1198,12 +1198,12 @@ impl WasmPeerVault {
 
         future_to_promise(async move {
             info!("connectPeer: parsing ticket, nonce={}",
-                pairing_nonce.as_deref().map(|n| &n[..16.min(n.len())]).unwrap_or("none"));
+                pairing_nonce.as_deref().map(|n| short(n, 16)).unwrap_or("none"));
             let ticket = Ticket::from_string(&ticket_str)
                 .map_err(|e| JsValue::from_str(&format!("Invalid ticket: {}", e)))?;
 
             let peer_id = ticket.node_id.to_string();
-            info!("connectPeer: peer_id={}", &peer_id[..16.min(peer_id.len())]);
+            info!("connectPeer: peer_id={}", short(&peer_id, 16));
 
             // Helper: create SyncEngine from store + key
             async fn create_sync_engine(
@@ -1249,7 +1249,7 @@ impl WasmPeerVault {
                 let connections_guard = connections.read().await;
                 if let Some(existing_conn) = connections_guard.get(&peer_id) {
                     if !existing_conn.is_closed() {
-                        info!("connectPeer: reusing existing connection to {}", &peer_id[..16.min(peer_id.len())]);
+                        info!("connectPeer: reusing existing connection to {}", short(&peer_id, 16));
                         let s = existing_conn.open_stream().await
                             .map_err(|e| JsValue::from_str(&format!("Open stream: {}", e)))?;
                         drop(connections_guard);
@@ -1825,7 +1825,7 @@ fn validate_pairing(
     let nonce = pairing_nonce.ok_or_else(|| "Unknown peer, pairing nonce required".to_string())?;
 
     let expires_at = pending_pairings.get(nonce)
-        .ok_or_else(|| format!("Unknown pairing nonce: {}...", &nonce[..16.min(nonce.len())]))?;
+        .ok_or_else(|| format!("Unknown pairing nonce: {}...", short(&nonce, 16)))?;
 
     let now = web_time::SystemTime::now()
         .duration_since(web_time::SystemTime::UNIX_EPOCH)
@@ -1846,6 +1846,17 @@ fn validate_pairing(
 /// Run sync as INITIATOR using V3 binary protocol.
 ///
 /// Protocol: VersionInfo → Updates → BlobHashes → BlobTransfer → SyncComplete
+/// Truncate a string to at most `n` bytes on a UTF-8 char boundary, without panicking.
+///
+/// Used for log/error truncation of attacker-controlled strings (pairing nonces,
+/// peer ids) where naive byte slicing (`&s[..n]`) can panic mid-codepoint.
+fn short(s: &str, n: usize) -> &str {
+    match s.char_indices().nth(n) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
 async fn run_initiator_sync_v3(
     peer_id: &str,
     stream: &mut IrohStream,
@@ -1907,7 +1918,15 @@ async fn run_initiator_sync_v3(
         op_count: 0,
     })).await.map_err(map_err)?;
 
-    // Receive peer's updates
+    // The initiator drives completion: announce we're done right after sending our
+    // updates. The acceptor replies with its own SyncComplete once it has received
+    // this. Without this, both peers would block in the recv loop below forever,
+    // since neither would ever send the first SyncComplete.
+    send_sync_msg(stream, &SyncMessage::SyncComplete(proto::SyncComplete {
+        version_bytes: engine.version_vector(),
+    })).await.map_err(map_err)?;
+
+    // Receive peer's updates and wait for its completion acknowledgement.
     let mut updates_received = 0;
     loop {
         match recv_sync_msg(stream).await.map_err(map_err)? {
@@ -1916,12 +1935,8 @@ async fn run_initiator_sync_v3(
                     .map_err(|e| JsValue::from_str(&format!("Import updates failed: {}", e)))?;
                 updates_received += 1;
             }
-            SyncMessage::SyncComplete(complete) => {
-                // Peer completed — send our completion
-                let our_complete = SyncMessage::SyncComplete(proto::SyncComplete {
-                    version_bytes: engine.version_vector(),
-                });
-                send_sync_msg(stream, &our_complete).await.map_err(map_err)?;
+            SyncMessage::SyncComplete(_) => {
+                // Peer acknowledged completion; we already sent ours.
                 break;
             }
             SyncMessage::Error(e) => {
@@ -2022,7 +2037,7 @@ async fn handle_incoming_streams_v3(
     ).await;
 
     if let Err(e) = result {
-        warn!("Incoming sync from {} failed: {:?}", &peer_id[..16.min(peer_id.len())], e);
+        warn!("Incoming sync from {} failed: {:?}", short(&peer_id, 16), e);
     }
 }
 
@@ -2058,7 +2073,7 @@ async fn handle_incoming_streams_v3_inner(
 
     info!("Acceptor: received VersionInfo from {} (v{}, nonce={})",
         peer_info.hostname, peer_info.protocol_version,
-        peer_info.pairing_nonce.as_deref().map(|n| &n[..16.min(n.len())]).unwrap_or("none"));
+        peer_info.pairing_nonce.as_deref().map(|n| short(n, 16)).unwrap_or("none"));
 
     // Validate pairing (take snapshots to avoid holding locks)
     let known_snap: std::collections::HashMap<String, u64> = known_peers.read().await.clone();
@@ -2072,7 +2087,7 @@ async fn handle_incoming_streams_v3_inner(
     ) {
         Ok(v) => v,
         Err(reason) => {
-            warn!("Pairing rejected for {}: {}", &peer_id[..16.min(peer_id.len())], reason);
+            warn!("Pairing rejected for {}: {}", short(&peer_id, 16), reason);
             let err = SyncMessage::Error(proto::SyncError {
                 code: proto::error_codes::PAIRING_REJECTED,
                 message: reason,
@@ -2464,10 +2479,18 @@ async fn run_gossip_debounce(
         // Encrypt
         let enc_key_guard = encryption_key.read().await;
         let encrypted = match enc_key_guard.as_ref() {
-            Some(key) => key.encrypt(&delta).unwrap_or(delta),
-            None => delta,
+            Some(key) => key.encrypt(&delta),
+            None => Ok(delta),
         };
         drop(enc_key_guard);
+        // Never broadcast plaintext on an encryption failure — skip this delta.
+        let encrypted = match encrypted {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!("Gossip: encryption failed, skipping broadcast: {}", e);
+                continue;
+            }
+        };
 
         // Broadcast (or emit sync_needed if too large)
         match gb.broadcast_delta(&encrypted).await {
@@ -2529,7 +2552,7 @@ async fn run_accept_loop(
         match iroh.accept().await {
             Ok(connection) => {
                 let peer_id = connection.peer_id().to_string();
-                info!("Accept loop: accepted connection from {}", &peer_id[..16.min(peer_id.len())]);
+                info!("Accept loop: accepted connection from {}", short(&peer_id, 16));
 
                 // Store the connection
                 connections.write().await.insert(peer_id.clone(), connection);

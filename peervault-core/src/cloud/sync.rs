@@ -6,6 +6,7 @@
 //! - Blob sync (content-addressed)
 //! - Retry logic with exponential backoff
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -103,6 +104,9 @@ pub struct CloudSync {
     s3: S3Client,
     encryption: CloudEncryption,
     state: CloudSyncState,
+    /// Snapshot version we have already downloaded and imported this session,
+    /// so we don't re-download the (potentially large) snapshot every sync.
+    applied_snapshot_version: Option<String>,
 }
 
 impl CloudSync {
@@ -118,6 +122,7 @@ impl CloudSync {
             s3,
             encryption,
             state: CloudSyncState::default(),
+            applied_snapshot_version: None,
         })
     }
 
@@ -135,6 +140,30 @@ impl CloudSync {
 
         // Step 1: Fetch or create cloud metadata
         let mut meta = self.fetch_or_create_meta(engine).await?;
+
+        // Step 1b: Download and import the base snapshot if one exists and we
+        // haven't applied it yet. Without this, a fresh device (or one that synced
+        // before a compaction) would only fetch post-compaction deltas and end up
+        // with an incomplete vault.
+        if let Some(version) = meta.snapshot_version.clone() {
+            if self.applied_snapshot_version.as_deref() != Some(version.as_str()) {
+                self.state.phase = SyncPhase::Downloading;
+                match self.s3.get_object("state.enc").await {
+                    Ok(encrypted) => {
+                        let snapshot = self.encryption.decrypt(&encrypted)
+                            .map_err(|e| CloudSyncError::Encryption(e.to_string()))?;
+                        // Loro's import auto-detects snapshot vs update payloads.
+                        engine.import_updates(&snapshot)?;
+                        result.bytes_downloaded += encrypted.len() as u64;
+                        self.applied_snapshot_version = Some(version);
+                    }
+                    Err(S3Error::NotFound(_)) => {
+                        warn!("meta references snapshot {} but state.enc is missing", version);
+                    }
+                    Err(e) => return Err(CloudSyncError::S3(e.to_string())),
+                }
+            }
+        }
 
         // Step 2: Download any remote deltas we don't have
         self.state.phase = SyncPhase::Downloading;
@@ -291,7 +320,9 @@ impl CloudSync {
             // (In a real impl, we'd track applied deltas)
 
             let encrypted = self.with_retry(|| async {
-                self.s3.get_object(&format!("deltas/{}", obj.key)).await
+                // obj.key already includes the "deltas/" sub-prefix (list_objects
+                // only strips the configured path_prefix), so use it as-is.
+                self.s3.get_object(&obj.key).await
             }).await?;
 
             let delta_data = self.encryption.decrypt(&encrypted)
@@ -349,6 +380,15 @@ impl CloudSync {
     async fn compact<E: CloudSyncable>(&mut self, engine: &E, meta: &mut CloudMeta) -> Result<(), CloudSyncError> {
         info!("Compacting {} deltas into snapshot", meta.delta_count);
 
+        // Snapshot the delta set BEFORE exporting, then delete ONLY those keys.
+        // compact() runs after download_deltas in the same sync, so every delta
+        // listed here is already imported into the engine (and thus captured by the
+        // snapshot). Deltas uploaded concurrently after this point are excluded from
+        // the deletion list and survive for the next sync — avoiding silent loss of
+        // a concurrent uploader's changes.
+        let to_delete = self.s3.list_objects("deltas/").await
+            .map_err(|e| CloudSyncError::S3(e.to_string()))?;
+
         // Export full snapshot
         let snapshot = engine.export_snapshot()?;
         let encrypted = self.encryption.encrypt(&snapshot)
@@ -359,12 +399,10 @@ impl CloudSync {
             self.s3.put_object("state.enc", encrypted.clone(), Some("application/octet-stream")).await
         }).await?;
 
-        // Delete old deltas
-        let objects = self.s3.list_objects("deltas/").await
-            .map_err(|e| CloudSyncError::S3(e.to_string()))?;
-
-        for obj in objects {
-            let _ = self.s3.delete_object(&format!("deltas/{}", obj.key)).await;
+        // Delete only the deltas captured above.
+        for obj in to_delete {
+            // obj.key already includes the "deltas/" sub-prefix.
+            let _ = self.s3.delete_object(&obj.key).await;
         }
 
         // Update metadata
@@ -378,9 +416,17 @@ impl CloudSync {
 
     /// Update blob index
     async fn update_blob_index(&self, blob: &BlobInfo) -> Result<(), CloudSyncError> {
-        // Fetch existing index or create new
+        // Fetch existing index or create new. The index is encrypted at rest so the
+        // storage provider cannot read blob hashes, sizes or MIME types. A corrupt
+        // index is treated as a hard error rather than silently overwritten (which
+        // would discard every prior entry).
         let mut index: Vec<BlobInfo> = match self.s3.get_object("blob-index.json").await {
-            Ok(data) => serde_json::from_slice(&data).unwrap_or_default(),
+            Ok(encrypted) => {
+                let data = self.encryption.decrypt(&encrypted)
+                    .map_err(|e| CloudSyncError::Encryption(e.to_string()))?;
+                serde_json::from_slice(&data)
+                    .map_err(|e| CloudSyncError::Corruption(format!("Invalid blob-index.json: {}", e)))?
+            }
             Err(S3Error::NotFound(_)) => Vec::new(),
             Err(e) => return Err(CloudSyncError::S3(e.to_string())),
         };
@@ -389,10 +435,12 @@ impl CloudSync {
         if !index.iter().any(|b| b.hash == blob.hash) {
             index.push(blob.clone());
 
-            let data = serde_json::to_vec_pretty(&index)
+            let data = serde_json::to_vec(&index)
                 .map_err(|e| CloudSyncError::Corruption(format!("Serialize blob index: {}", e)))?;
+            let encrypted = self.encryption.encrypt(&data)
+                .map_err(|e| CloudSyncError::Encryption(e.to_string()))?;
 
-            self.s3.put_object("blob-index.json", data, Some("application/json")).await
+            self.s3.put_object("blob-index.json", encrypted, Some("application/octet-stream")).await
                 .map_err(|e| CloudSyncError::S3(e.to_string()))?;
         }
 
@@ -420,6 +468,10 @@ impl CloudSync {
 
                     warn!("S3 error (attempt {}): {}, retrying in {}ms", attempt, e, delay);
 
+                    // tokio's timer reactor isn't available on wasm32, where calling
+                    // tokio::time::sleep panics. Only sleep on native; on wasm retry
+                    // immediately (still bounded by MAX_RETRIES).
+                    #[cfg(not(target_arch = "wasm32"))]
                     tokio::time::sleep(Duration::from_millis(delay)).await;
 
                     delay = (delay * 2).min(MAX_DELAY_MS);
