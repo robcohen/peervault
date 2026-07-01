@@ -211,34 +211,6 @@ impl SyncEngine {
             .collect()
     }
 
-    /// Apply a local change
-    pub fn apply_local(&self, change: crate::LocalChange) -> Result<(), CoreError> {
-        match change.kind {
-            crate::ChangeKind::Create { content } => {
-                let text = String::from_utf8_lossy(&content);
-                self.set(&change.path, &text)
-            }
-            crate::ChangeKind::Modify { content } => {
-                let text = String::from_utf8_lossy(&content);
-                self.set(&change.path, &text)
-            }
-            crate::ChangeKind::Delete => self.delete(&change.path),
-            crate::ChangeKind::Rename { new_path } => {
-                if let Some(content) = self.get(&change.path) {
-                    self.delete(&change.path)?;
-                    self.set(&new_path, &content)
-                } else {
-                    Ok(())
-                }
-            }
-        }
-    }
-
-    /// Get number of pending changes
-    pub fn pending_count(&self) -> usize {
-        0 // Loro handles this internally
-    }
-
     /// Export state for persistence (encrypted)
     pub fn export_state(&self) -> Result<Vec<u8>, CoreError> {
         let key = self.require_vault_key_sync()?;
