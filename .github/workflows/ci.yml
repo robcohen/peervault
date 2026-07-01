@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/nix-installer-action@v22
       # Magic Nix Cache (hosted) was sunset in 2025. To re-enable cross-run
       # caching, add `permissions: id-token: write` and
       # `DeterminateSystems/flakehub-cache-action@main` here.
@@ -39,7 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/nix-installer-action@v22
       # Magic Nix Cache (hosted) was sunset in 2025. To re-enable cross-run
       # caching, add `permissions: id-token: write` and
       # `DeterminateSystems/flakehub-cache-action@main` here.
