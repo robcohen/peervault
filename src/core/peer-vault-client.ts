@@ -6,6 +6,10 @@
  */
 
 import type { App } from "obsidian";
+// Generated from the Rust `WasmEvent` enum via ts-rs — the single source of truth
+// for the WASM→host event schema. Regenerate with:
+//   cd peervault-core && cargo test --features "ts-export test-utils" --lib export_ts_bindings
+import type { WasmEvent } from "./generated/events";
 
 // =============================================================================
 // Types
@@ -644,24 +648,18 @@ export class PeerVaultClient {
 
   private handleWasmEvent(eventJson: string): void {
     try {
-      const event = JSON.parse(eventJson);
+      // Typed against the Rust-generated schema: the fields below are checked at
+      // compile time, so a rename in the Rust `WasmEvent` breaks the build here.
+      const event = JSON.parse(eventJson) as WasmEvent;
       console.log(`[PeerVault] WASM event: ${event.type}`, event);
 
-      // Map WASM events to our event types
+      // Map WASM events to our client event types.
       switch (event.type) {
         case "peer_connected":
           this.emit({
             type: "peer-connected",
             peerId: event.peer_id,
-            peerName: event.peer_name ?? `Peer ${event.peer_id.slice(0, 8)}`,
-          });
-          break;
-
-        case "peer_disconnected":
-          this.emit({
-            type: "peer-disconnected",
-            peerId: event.peer_id,
-            reason: event.reason ?? "unknown",
+            peerName: `Peer ${event.peer_id.slice(0, 8)}`,
           });
           break;
 
@@ -672,43 +670,15 @@ export class PeerVaultClient {
             result: {
               success: true,
               peerId: event.peer_id,
-              updatesReceived: event.updates_received ?? 0,
-              updatesSent: event.updates_sent ?? 0,
+              updatesReceived: event.updates_received,
+              updatesSent: event.updates_sent,
             },
           });
           break;
 
-        case "sync_error":
-          this.emit({
-            type: "sync-error",
-            peerId: event.peer_id,
-            error: event.error ?? "Unknown error",
-          });
-          break;
-
         case "document_changed":
-          if (event.source === "gossip") {
-            // CRDT delta received via gossip — trigger full disk sync
-            this.emit({
-              type: "gossip-update",
-              bytes: event.bytes ?? 0,
-            });
-          } else {
-            // Per-file change from sync engine
-            this.emit({
-              type: "file-changed",
-              path: event.key,
-              source: "remote",
-            });
-          }
-          break;
-
-        case "pairing_request":
-          this.emit({
-            type: "pairing-request",
-            peerId: event.peer_id,
-            peerName: event.peer_name ?? `Unknown ${event.peer_id.slice(0, 8)}`,
-          });
+          // CRDT delta received via gossip — trigger full disk sync.
+          this.emit({ type: "gossip-update", bytes: event.bytes });
           break;
 
         case "pairing_complete":
@@ -720,7 +690,7 @@ export class PeerVaultClient {
           break;
 
         case "sync_needed":
-          // Delta too large for gossip — trigger point-to-point sync (with guard)
+          // Delta too large for gossip — trigger point-to-point sync (with guard).
           console.log(`[PeerVault] Sync needed: ${event.reason} (${event.size} bytes > ${event.max})`);
           // syncAll is now single-flight internally, so just call it.
           this.syncAll().catch((e) =>
@@ -747,15 +717,12 @@ export class PeerVaultClient {
           }
           break;
 
-        case "error":
-          this.emit({
-            type: "error",
-            message: event.message ?? "Unknown error",
-          });
-          break;
-
-        default:
-          console.log(`[PeerVault] Unknown WASM event: ${event.type}`);
+        default: {
+          // Exhaustiveness: if Rust adds a WasmEvent variant, this errors until
+          // it's handled above.
+          const _exhaustive: never = event;
+          console.log(`[PeerVault] Unhandled WASM event:`, _exhaustive);
+        }
       }
     } catch (e) {
       console.error("[PeerVault] Failed to parse WASM event:", e);
