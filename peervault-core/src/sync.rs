@@ -28,8 +28,8 @@ pub struct SyncEngine {
     host: Arc<dyn HostInterface>,
     /// Our peer ID (for tracking who made changes)
     peer_id: String,
-    /// The Loro document store
-    store: LoroStore,
+    /// The document store (Loro today; `dyn DocStore` keeps the CRDT backend swappable)
+    store: Box<dyn DocStore + Send + Sync>,
     /// Vault encryption key (required)
     vault_key: Arc<std::sync::RwLock<Option<VaultKey>>>,
 }
@@ -49,7 +49,7 @@ impl SyncEngine {
         Ok(Self {
             host,
             peer_id,
-            store: LoroStore::new(vault_id),
+            store: Box::new(LoroStore::new(vault_id)),
             vault_key: Arc::new(std::sync::RwLock::new(None)),
         })
     }
@@ -65,7 +65,7 @@ impl SyncEngine {
 
     /// Initialize with a specific vault ID
     pub fn init_vault(&mut self, vault_id: [u8; 32]) {
-        self.store = LoroStore::new(vault_id);
+        self.store = Box::new(LoroStore::new(vault_id));
     }
 
     /// Set the vault encryption key
