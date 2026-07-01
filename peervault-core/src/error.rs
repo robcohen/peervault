@@ -1,7 +1,6 @@
 //! Error types for PeerVault Core
 
 use crate::host::HostError;
-use crate::transport::TransportError;
 use crate::store::StoreError;
 
 /// Core error type
@@ -9,8 +8,6 @@ use crate::store::StoreError;
 pub enum CoreError {
     /// Host interface error
     Host(HostError),
-    /// Transport error
-    Transport(TransportError),
     /// Store error
     Store(StoreError),
     /// Protocol error
@@ -41,7 +38,6 @@ impl std::fmt::Display for CoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Host(e) => write!(f, "host error: {}", e),
-            Self::Transport(e) => write!(f, "transport error: {}", e),
             Self::Store(e) => write!(f, "store error: {}", e),
             Self::Protocol(s) => write!(f, "protocol error: {}", s),
             Self::Crdt(s) => write!(f, "CRDT error: {}", s),
@@ -68,12 +64,6 @@ impl std::error::Error for CoreError {}
 impl From<HostError> for CoreError {
     fn from(e: HostError) -> Self {
         Self::Host(e)
-    }
-}
-
-impl From<TransportError> for CoreError {
-    fn from(e: TransportError) -> Self {
-        Self::Transport(e)
     }
 }
 
