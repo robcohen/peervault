@@ -5,7 +5,7 @@
 //! - 24-byte random nonce (prepended to ciphertext)
 //! - 16-byte authentication tag (appended by Poly1305)
 
-use rand::RngCore;
+use rand::Rng;
 use xsalsa20poly1305::{
     aead::{Aead, KeyInit},
     XSalsa20Poly1305, Nonce,
@@ -33,7 +33,7 @@ impl CloudEncryption {
     /// Returns: nonce (24 bytes) || ciphertext || tag (16 bytes)
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, EncryptionError> {
         let mut nonce_bytes = [0u8; NONCE_SIZE];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        rand::rng().fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from(nonce_bytes);
 
         let ciphertext = self.cipher

@@ -14,7 +14,7 @@ wasm-opt = false
 
 [features]
 default = ["native"]
-native = ["tokio/rt-multi-thread", "reqwest/rustls-tls"]
+native = ["tokio/rt-multi-thread", "reqwest/rustls"]
 test-utils = []  # Exposes MockHost for integration tests
 # Note: In WASM, reqwest uses browser fetch API automatically
 # WASM target for browser/JS embedding
@@ -56,14 +56,14 @@ hmac = "0.12"  # For AWS Signature V4
 hkdf = "0.12"
 argon2 = "0.5"  # Memory-hard passphrase KDF
 zeroize = { version = "1", features = ["derive"] }  # Wipe key material on drop
-rand = "0.9"
+rand = "0.10"
 
 # ECIES for key exchange (replaces manual x25519 + HKDF + encrypt)
 # Uses x25519 curve with XChaCha20-Poly1305, pure Rust for WASM
 ecies = { version = "0.2", default-features = false, features = ["x25519", "xchacha20"] }
 
 # HTTP client (for S3) - works in both native and WASM
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

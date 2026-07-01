@@ -29,7 +29,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
     XChaCha20Poly1305, XNonce,
 };
-use rand::RngCore;
+use rand::Rng;
 
 /// Size of the vault master key in bytes
 pub const KEY_SIZE: usize = 32;
@@ -89,7 +89,7 @@ impl VaultKey {
     /// Generate a new random vault key
     pub fn generate() -> Self {
         let mut key = [0u8; KEY_SIZE];
-        rand::thread_rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut key);
         Self { key }
     }
 
@@ -145,7 +145,7 @@ impl VaultKey {
 
         // Generate random nonce
         let mut nonce_bytes = [0u8; NONCE_SIZE];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        rand::rng().fill_bytes(&mut nonce_bytes);
         let nonce = XNonce::from_slice(&nonce_bytes);
 
         // Encrypt
