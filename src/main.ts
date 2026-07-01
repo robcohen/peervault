@@ -191,6 +191,16 @@ export default class PeerVaultPlugin extends Plugin {
         console.log("[PeerVault] No synced files found, performing initial vault scan...");
         await this.scanVault();
       }
+
+      // Seed the remote-deletion baseline from the CRDT's current keys. Without
+      // this, previousCrdtKeys would start empty after every reload, so the first
+      // disk-sync of the session would miss any deletion that happened on a peer
+      // while we were offline — and a later local re-scan would resurrect the
+      // deleted file. Seeding from the CRDT (not disk) is safe: a file deleted
+      // remotely while we were offline is still in our persisted CRDT now, so it
+      // enters the baseline and is removed once the delete delta arrives.
+      const baseline = await this.client.listFiles();
+      this.previousCrdtKeys = new Set(baseline.filter((p) => !p.startsWith("_crdt/")));
     } catch (e) {
       console.error("[PeerVault] Failed to initialize:", e);
       new Notice(`PeerVault: Failed to initialize - ${e}`);
@@ -574,6 +584,11 @@ export default class PeerVaultPlugin extends Plugin {
       // which carries no per-key delete event).
       for (const path of this.previousCrdtKeys) {
         if (!currentKeys.has(path)) {
+          // Don't delete a path the user just re-created locally: a pending
+          // file-change timer means a local edit/creation hasn't been ingested
+          // into the CRDT yet, so its absence from currentKeys is expected and
+          // removing it would silently destroy the user's new file.
+          if (this.fileChangeTimers.has(path)) continue;
           try {
             await this.app.vault.adapter.remove(path);
           } catch {

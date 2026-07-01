@@ -1217,9 +1217,15 @@ impl WasmPeerVault {
                 let vault_key = key_guard.clone()
                     .ok_or_else(|| JsValue::from_str("No encryption key"))?;
                 drop(key_guard);
+                let real_vault_id = *loro_store.vault_id();
                 let host = Arc::new(crate::host::mock::MockHost::new());
-                let engine = SyncEngine::new_with_key(host, vault_key)
+                let mut engine = SyncEngine::new_with_key(host, vault_key)
                     .map_err(|e| JsValue::from_str(&format!("SyncEngine: {}", e)))?;
+                // Carry the real vault id into the temporary sync engine so the
+                // VERSION_INFO we send advertises the actual vault (new_with_key
+                // starts at all-zeros and import does not restore it). Must run
+                // before import so the data lands in the correctly-identified store.
+                engine.init_vault(real_vault_id);
                 let snapshot = loro_store.export_snapshot()
                     .map_err(|e| JsValue::from_str(&format!("Export snapshot: {}", e)))?;
                 drop(store_guard);
@@ -2075,6 +2081,37 @@ async fn handle_incoming_streams_v3_inner(
         peer_info.hostname, peer_info.protocol_version,
         peer_info.pairing_nonce.as_deref().map(|n| short(n, 16)).unwrap_or("none"));
 
+    // Validate basic handshake invariants (vault id, protocol version) BEFORE
+    // consuming any one-time pairing nonce. Otherwise a peer presenting a valid
+    // nonce but a mismatched vault/version could burn the legitimate pairing
+    // nonce (and get inserted into known_peers) before being rejected.
+    let local_vault_id = {
+        let store_guard = store.read().await;
+        let id = *store_guard.as_ref()
+            .ok_or_else(|| JsValue::from_str("Store not initialized"))?
+            .vault_id();
+        drop(store_guard);
+        id
+    };
+    {
+        if peer_info.vault_id != local_vault_id {
+            let err = SyncMessage::Error(proto::SyncError {
+                code: proto::error_codes::VAULT_MISMATCH,
+                message: "Vault ID mismatch".into(),
+            });
+            let _ = send_sync_msg(&mut stream, &err).await;
+            return Err(JsValue::from_str("Vault ID mismatch"));
+        }
+    }
+    if peer_info.protocol_version < 2 {
+        let err = SyncMessage::Error(proto::SyncError {
+            code: proto::error_codes::VERSION_MISMATCH,
+            message: "Protocol version too old".into(),
+        });
+        let _ = send_sync_msg(&mut stream, &err).await;
+        return Err(JsValue::from_str("Protocol version too old"));
+    }
+
     // Validate pairing (take snapshots to avoid holding locks)
     let known_snap: std::collections::HashMap<String, u64> = known_peers.read().await.clone();
     let pending_snap: std::collections::HashMap<String, u64> = pending_pairings.read().await.clone();
@@ -2137,20 +2174,20 @@ async fn handle_incoming_streams_v3_inner(
         // store_guard dropped here
     };
     let host = Arc::new(crate::host::mock::MockHost::new());
-    let engine = SyncEngine::new_with_key(host, vault_key)
+    let mut engine = SyncEngine::new_with_key(host, vault_key)
         .map_err(|e| JsValue::from_str(&format!("SyncEngine failed: {}", e)))?;
+    // Carry the real vault id into the temporary sync engine. new_with_key starts
+    // at all-zeros and import_snapshot_raw does not restore the id, so without this
+    // the VERSION_INFO we send would advertise a zero vault id and peers could not
+    // validate it. init_vault must run before import so the imported data lands in
+    // the correctly-identified store.
+    engine.init_vault(local_vault_id);
     engine.import_snapshot_raw(&snapshot)
         .map_err(|e| JsValue::from_str(&format!("Import snapshot failed: {}", e)))?;
 
-    // Validate vault ID
-    if peer_info.vault_id != *engine.vault_id() {
-        let err = SyncMessage::Error(proto::SyncError {
-            code: proto::error_codes::VAULT_MISMATCH,
-            message: "Vault ID mismatch".into(),
-        });
-        let _ = send_sync_msg(&mut stream, &err).await;
-        return Err(JsValue::from_str("Vault ID mismatch"));
-    }
+    // Vault ID + protocol version were already validated above, before any
+    // pairing nonce was consumed. The store snapshot used to build `engine`
+    // shares the local vault id, so no re-check is needed here.
 
     // Send our VERSION_INFO (acceptor sends after receiving)
     let our_info = proto::VersionInfo {
@@ -3236,9 +3273,13 @@ impl WasmSyncRunner {
 
         // Create a temporary SyncEngine for this sync
         // Note: In a real implementation, we'd want to share the engine state
+        let real_vault_id = *loro_store.vault_id();
         let host = Arc::new(crate::host::mock::MockHost::new());
-        let sync_engine = SyncEngine::new_with_key(host, vault_key)
+        let mut sync_engine = SyncEngine::new_with_key(host, vault_key)
             .map_err(|e| JsValue::from_str(&format!("Failed to create sync engine: {}", e)))?;
+        // Carry the real vault id (new_with_key starts at all-zeros and import does
+        // not restore it) so the handshake advertises/validates the actual vault.
+        sync_engine.init_vault(real_vault_id);
 
         // Import the current store state
         let snapshot = loro_store.export_snapshot()
@@ -3328,9 +3369,13 @@ impl WasmSyncRunner {
         let vault_key = key_guard.clone()
             .ok_or_else(|| JsValue::from_str("Encryption key not set"))?;
 
+        let real_vault_id = *loro_store.vault_id();
         let host = Arc::new(crate::host::mock::MockHost::new());
-        let sync_engine = SyncEngine::new_with_key(host, vault_key)
+        let mut sync_engine = SyncEngine::new_with_key(host, vault_key)
             .map_err(|e| JsValue::from_str(&format!("Failed to create sync engine: {}", e)))?;
+        // Carry the real vault id (new_with_key starts at all-zeros and import does
+        // not restore it) so the handshake advertises/validates the actual vault.
+        sync_engine.init_vault(real_vault_id);
 
         let snapshot = loro_store.export_snapshot()
             .map_err(|e| JsValue::from_str(&format!("Failed to export snapshot: {}", e)))?;

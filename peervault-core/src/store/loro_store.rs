@@ -22,12 +22,33 @@ fn validate_path(path: &str) -> StoreResult<()> {
     if path.is_empty() || path.starts_with('/') || path.starts_with('\\') {
         return Err(StoreError::InvalidPath(path.to_string()));
     }
-    for component in path.split(|c| c == '/' || c == '\\') {
+    // Windows drive-absolute (`C:\x`, `C:x`) — reject any first component with a colon.
+    for (i, component) in path.split(|c| c == '/' || c == '\\').enumerate() {
         if component == ".." || component.contains('\0') {
+            return Err(StoreError::InvalidPath(path.to_string()));
+        }
+        if i == 0 && component.len() >= 2 && component.as_bytes()[1] == b':' {
             return Err(StoreError::InvalidPath(path.to_string()));
         }
     }
     Ok(())
+}
+
+/// Is a single tree-node `name` safe to use as one path component?
+///
+/// Node names come from peer CRDT data and are untrusted. A name must be a
+/// single component: it may not be empty, `.`/`..`, contain a path separator,
+/// a NUL byte, or a drive-letter colon. This is the egress-side guard that
+/// stops malicious imported nodes from escaping the vault when their paths are
+/// later written to disk by the host.
+fn is_safe_component(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+        && !name.contains(':')
 }
 
 /// Tree container name (matches TypeScript)
@@ -310,6 +331,13 @@ impl LoroStore {
                 Some(loro::ValueOrContainer::Value(LoroValue::String(s))) => s.to_string(),
                 _ => continue,
             };
+
+            // Reject peer-injected names that would escape the vault when the
+            // host writes this path to disk (`..`, separators, NUL, drive colon).
+            // Skip the whole subtree rooted at an unsafe name.
+            if !is_safe_component(&name) {
+                continue;
+            }
 
             let path = if prefix.is_empty() {
                 name.clone()

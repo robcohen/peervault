@@ -46,17 +46,25 @@ pub enum S3Error {
 impl S3Client {
     /// Create a new S3 client
     pub fn new(config: CloudConfig) -> S3Result<Self> {
-        // Require TLS. `http://` is permitted only for explicit localhost dev
-        // endpoints (e.g. a local MinIO), since SigV4 keeps the secret off the wire
-        // but does not protect against an on-path attacker tampering with requests.
-        if !config.endpoint.starts_with("https://") {
-            let is_local = config.endpoint.starts_with("http://localhost")
-                || config.endpoint.starts_with("http://127.0.0.1");
-            if !is_local {
-                return Err(S3Error::Config(
-                    "Cloud endpoint must use https:// (http is allowed only for localhost)".into(),
-                ));
-            }
+        // Require TLS. `http://` is permitted only for an explicit localhost dev
+        // endpoint (e.g. a local MinIO), since SigV4 keeps the secret off the wire
+        // but does not stop an on-path attacker tampering with plaintext requests.
+        // Parse the URL and compare the exact scheme/host — a prefix check like
+        // `starts_with("http://localhost")` also matches `http://localhost.evil.com`.
+        let url = reqwest::Url::parse(&config.endpoint)
+            .map_err(|e| S3Error::Config(format!("Invalid endpoint URL: {}", e)))?;
+        let allowed = match url.scheme() {
+            "https" => true,
+            "http" => matches!(
+                url.host_str(),
+                Some("localhost") | Some("127.0.0.1") | Some("::1") | Some("[::1]")
+            ),
+            _ => false,
+        };
+        if !allowed {
+            return Err(S3Error::Config(
+                "Cloud endpoint must use https:// (http is allowed only for localhost)".into(),
+            ));
         }
 
         let client = Client::builder()

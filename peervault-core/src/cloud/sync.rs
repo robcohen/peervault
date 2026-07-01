@@ -98,6 +98,10 @@ const MAX_DELAY_MS: u64 = 30_000;
 /// Delta count threshold for compaction
 const COMPACT_THRESHOLD: u32 = 50;
 
+/// Max times to re-download when a concurrent compaction changes the snapshot
+/// version mid-sync. Bounded so a steadily-compacting peer can't loop us forever.
+const MAX_DOWNLOAD_ATTEMPTS: u32 = 3;
+
 /// Cloud sync service
 pub struct CloudSync {
     config: CloudConfig,
@@ -138,38 +142,40 @@ impl CloudSync {
         self.state.phase = SyncPhase::Preparing;
         self.state.error = None;
 
-        // Step 1: Fetch or create cloud metadata
-        let mut meta = self.fetch_or_create_meta(engine).await?;
+        // Steps 1-2: Fetch metadata, then download + import the base snapshot and
+        // all remote deltas. A concurrent compaction on another device can replace
+        // state.enc and delete deltas while we download, which would otherwise
+        // leave us with an incomplete vault. Guard against that by re-reading meta
+        // afterward: if the snapshot version changed mid-download we retry, bounded
+        // by MAX_DOWNLOAD_ATTEMPTS (CRDT import is idempotent, so re-import is safe).
+        let mut meta;
+        let mut imported_keys;
+        let mut attempt = 0;
+        loop {
+            result.bytes_downloaded = 0;
+            result.deltas_downloaded = 0;
 
-        // Step 1b: Download and import the base snapshot if one exists and we
-        // haven't applied it yet. Without this, a fresh device (or one that synced
-        // before a compaction) would only fetch post-compaction deltas and end up
-        // with an incomplete vault.
-        if let Some(version) = meta.snapshot_version.clone() {
-            if self.applied_snapshot_version.as_deref() != Some(version.as_str()) {
-                self.state.phase = SyncPhase::Downloading;
-                match self.s3.get_object("state.enc").await {
-                    Ok(encrypted) => {
-                        let snapshot = self.encryption.decrypt(&encrypted)
-                            .map_err(|e| CloudSyncError::Encryption(e.to_string()))?;
-                        // Loro's import auto-detects snapshot vs update payloads.
-                        engine.import_updates(&snapshot)?;
-                        result.bytes_downloaded += encrypted.len() as u64;
-                        self.applied_snapshot_version = Some(version);
-                    }
-                    Err(S3Error::NotFound(_)) => {
-                        warn!("meta references snapshot {} but state.enc is missing", version);
-                    }
-                    Err(e) => return Err(CloudSyncError::S3(e.to_string())),
-                }
+            meta = self.fetch_or_create_meta(engine).await?;
+            let snapshot_before = meta.snapshot_version.clone();
+
+            // Step 1b: download + import the base snapshot if we haven't already.
+            self.download_snapshot(engine, &meta, &mut result).await?;
+
+            // Step 2: download remote deltas.
+            self.state.phase = SyncPhase::Downloading;
+            let (dl_stats, keys) = self.download_deltas(engine, &meta).await?;
+            imported_keys = keys;
+            result.deltas_downloaded = dl_stats.count;
+            result.bytes_downloaded += dl_stats.bytes;
+
+            attempt += 1;
+            let latest = self.fetch_or_create_meta(engine).await?;
+            if latest.snapshot_version == snapshot_before || attempt >= MAX_DOWNLOAD_ATTEMPTS {
+                meta = latest;
+                break;
             }
+            debug!("Snapshot changed during download (attempt {}), retrying", attempt);
         }
-
-        // Step 2: Download any remote deltas we don't have
-        self.state.phase = SyncPhase::Downloading;
-        let download_result = self.download_deltas(engine, &meta).await?;
-        result.deltas_downloaded = download_result.count;
-        result.bytes_downloaded += download_result.bytes;
 
         // Step 3: Upload local changes as deltas
         self.state.phase = SyncPhase::Uploading;
@@ -177,10 +183,12 @@ impl CloudSync {
         result.deltas_uploaded = upload_result.count;
         result.bytes_uploaded += upload_result.bytes;
 
-        // Step 4: Check if compaction is needed
-        if meta.delta_count >= COMPACT_THRESHOLD {
+        // Step 4: Compact if too many deltas have accumulated. Drive the decision
+        // off the actual number of deltas we just listed/imported, not the
+        // drift-prone per-device counter (which only counts our own uploads).
+        if imported_keys.len() >= COMPACT_THRESHOLD as usize {
             self.state.phase = SyncPhase::Compacting;
-            self.compact(engine, &mut meta).await?;
+            self.compact(engine, &mut meta, &imported_keys).await?;
             result.compacted = true;
         }
 
@@ -305,9 +313,43 @@ impl CloudSync {
             .map_err(|e| CloudSyncError::S3(e.to_string()))
     }
 
-    /// Download remote deltas
-    async fn download_deltas<E: CloudSyncable>(&mut self, engine: &E, meta: &CloudMeta) -> Result<TransferStats, CloudSyncError> {
+    /// Download and import the base snapshot if one exists and we haven't applied
+    /// it yet. Without this, a fresh device (or one that synced before a
+    /// compaction) would only fetch post-compaction deltas and end up with an
+    /// incomplete vault.
+    async fn download_snapshot<E: CloudSyncable>(&mut self, engine: &E, meta: &CloudMeta, result: &mut CloudSyncResult) -> Result<(), CloudSyncError> {
+        let Some(version) = meta.snapshot_version.clone() else {
+            return Ok(());
+        };
+        if self.applied_snapshot_version.as_deref() == Some(version.as_str()) {
+            return Ok(());
+        }
+
+        self.state.phase = SyncPhase::Downloading;
+        match self.s3.get_object("state.enc").await {
+            Ok(encrypted) => {
+                let snapshot = self.encryption.decrypt(&encrypted)
+                    .map_err(|e| CloudSyncError::Encryption(e.to_string()))?;
+                // Loro's import auto-detects snapshot vs update payloads.
+                engine.import_updates(&snapshot)?;
+                result.bytes_downloaded += encrypted.len() as u64;
+                self.applied_snapshot_version = Some(version);
+            }
+            Err(S3Error::NotFound(_)) => {
+                warn!("meta references snapshot {} but state.enc is missing", version);
+            }
+            Err(e) => return Err(CloudSyncError::S3(e.to_string())),
+        }
+        Ok(())
+    }
+
+    /// Download remote deltas. Returns transfer stats plus the keys of every
+    /// delta actually imported into the engine — compaction may only delete keys
+    /// in this set, since those (and only those) are guaranteed to be captured by
+    /// the snapshot it exports.
+    async fn download_deltas<E: CloudSyncable>(&mut self, engine: &E, _meta: &CloudMeta) -> Result<(TransferStats, Vec<String>), CloudSyncError> {
         let mut stats = TransferStats::default();
+        let mut imported_keys = Vec::new();
 
         // List all deltas
         let objects = self.s3.list_objects("deltas/").await
@@ -316,8 +358,8 @@ impl CloudSync {
         self.state.pending_downloads = objects.len();
 
         for obj in objects {
-            // Skip if we've already applied this delta
-            // (In a real impl, we'd track applied deltas)
+            // CRDT import is idempotent, so re-applying an already-seen delta is
+            // harmless; we re-import every listed delta each sync.
 
             let encrypted = self.with_retry(|| async {
                 // obj.key already includes the "deltas/" sub-prefix (list_objects
@@ -333,12 +375,13 @@ impl CloudSync {
 
             stats.count += 1;
             stats.bytes += encrypted.len() as u64;
+            imported_keys.push(obj.key.clone());
             self.state.pending_downloads = self.state.pending_downloads.saturating_sub(1);
 
             debug!("Applied delta {} ({} bytes)", obj.key, delta_data.len());
         }
 
-        Ok(stats)
+        Ok((stats, imported_keys))
     }
 
     /// Upload local changes as a delta
@@ -376,39 +419,41 @@ impl CloudSync {
         Ok(stats)
     }
 
-    /// Compact deltas into a snapshot
-    async fn compact<E: CloudSyncable>(&mut self, engine: &E, meta: &mut CloudMeta) -> Result<(), CloudSyncError> {
-        info!("Compacting {} deltas into snapshot", meta.delta_count);
+    /// Compact deltas into a snapshot.
+    ///
+    /// `imported_keys` are the delta keys this sync actually downloaded and
+    /// imported into the engine. We export the snapshot (which captures exactly
+    /// those imported deltas plus our own local changes) and then delete ONLY
+    /// those keys. A delta uploaded by another device after our download listing
+    /// is therefore neither in our snapshot nor in our deletion set — it survives
+    /// untouched for the next sync, avoiding silent loss of a concurrent
+    /// uploader's changes.
+    async fn compact<E: CloudSyncable>(&mut self, engine: &E, meta: &mut CloudMeta, imported_keys: &[String]) -> Result<(), CloudSyncError> {
+        info!("Compacting {} deltas into snapshot", imported_keys.len());
 
-        // Snapshot the delta set BEFORE exporting, then delete ONLY those keys.
-        // compact() runs after download_deltas in the same sync, so every delta
-        // listed here is already imported into the engine (and thus captured by the
-        // snapshot). Deltas uploaded concurrently after this point are excluded from
-        // the deletion list and survive for the next sync — avoiding silent loss of
-        // a concurrent uploader's changes.
-        let to_delete = self.s3.list_objects("deltas/").await
-            .map_err(|e| CloudSyncError::S3(e.to_string()))?;
-
-        // Export full snapshot
+        // Export full snapshot BEFORE deleting anything.
         let snapshot = engine.export_snapshot()?;
         let encrypted = self.encryption.encrypt(&snapshot)
             .map_err(|e| CloudSyncError::Encryption(e.to_string()))?;
 
-        // Upload snapshot
+        // Upload snapshot first — only delete deltas once the snapshot is durable.
         self.with_retry(|| async {
             self.s3.put_object("state.enc", encrypted.clone(), Some("application/octet-stream")).await
         }).await?;
 
-        // Delete only the deltas captured above.
-        for obj in to_delete {
-            // obj.key already includes the "deltas/" sub-prefix.
-            let _ = self.s3.delete_object(&obj.key).await;
-        }
-
-        // Update metadata
+        // Update + persist metadata BEFORE deleting deltas, so a fresh device that
+        // reads meta after our snapshot is uploaded always sees the new snapshot
+        // version (and won't expect the deltas we're about to remove).
         meta.last_snapshot = Some(iso_now());
         meta.snapshot_version = Some(hex::encode(engine.version_vector()));
         meta.delta_count = 0;
+        self.upload_meta(meta).await?;
+
+        // Delete only the deltas we imported (and thus captured in the snapshot).
+        for key in imported_keys {
+            // key already includes the "deltas/" sub-prefix.
+            let _ = self.s3.delete_object(key).await;
+        }
 
         info!("Compaction complete ({} bytes)", snapshot.len());
         Ok(())
