@@ -1620,7 +1620,9 @@ impl WasmPeerVault {
                 &config.region,
                 &config.access_key_id,
                 &config.secret_access_key,
-            ).with_prefix(&config.path_prefix.unwrap_or_default());
+            )
+            .with_prefix(&config.path_prefix.unwrap_or_default())
+            .with_insecure_http(config.allow_insecure_http.unwrap_or(false));
 
             // Create CloudSync instance
             let cloud = CloudSync::new(cloud_config, vault_key.as_bytes())
@@ -2669,6 +2671,8 @@ struct CloudConfigJs {
     access_key_id: String,
     secret_access_key: String,
     path_prefix: Option<String>,
+    #[serde(default)]
+    allow_insecure_http: Option<bool>,
 }
 
 /// Helper to create a vault ID from a string (hashes the input)

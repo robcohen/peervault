@@ -46,25 +46,43 @@ pub enum S3Error {
 impl S3Client {
     /// Create a new S3 client
     pub fn new(config: CloudConfig) -> S3Result<Self> {
-        // Require TLS. `http://` is permitted only for an explicit localhost dev
-        // endpoint (e.g. a local MinIO), since SigV4 keeps the secret off the wire
-        // but does not stop an on-path attacker tampering with plaintext requests.
-        // Parse the URL and compare the exact scheme/host — a prefix check like
-        // `starts_with("http://localhost")` also matches `http://localhost.evil.com`.
+        // Secure by default: require TLS. Plaintext `http://` is accepted only for
+        // a loopback endpoint (local dev) or when the operator explicitly opts in
+        // via `allow_insecure_http` (a trusted private network — docker/LAN MinIO).
+        // SigV4 keeps the secret off the wire, but http still exposes object
+        // keys/sizes and is open to request tampering by an on-path attacker.
+        // Parse the URL (a prefix check like `starts_with("http://localhost")` also
+        // matches `http://localhost.evil.com`) and classify the host precisely.
         let url = reqwest::Url::parse(&config.endpoint)
             .map_err(|e| S3Error::Config(format!("Invalid endpoint URL: {}", e)))?;
+        let host = url.host_str().unwrap_or("");
+        // `host_str()` yields IPv6 with brackets (e.g. "[::1]"); strip them to parse.
+        let bare_host = host.trim_start_matches('[').trim_end_matches(']');
+        let is_loopback = host == "localhost"
+            || bare_host
+                .parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false);
         let allowed = match url.scheme() {
             "https" => true,
-            "http" => matches!(
-                url.host_str(),
-                Some("localhost") | Some("127.0.0.1") | Some("::1") | Some("[::1]")
-            ),
+            "http" => is_loopback || config.allow_insecure_http,
             _ => false,
         };
         if !allowed {
             return Err(S3Error::Config(
-                "Cloud endpoint must use https:// (http is allowed only for localhost)".into(),
+                "Cloud endpoint must use https:// — set allowInsecureHttp to permit \
+                 plaintext http for a trusted private network, or use a loopback \
+                 endpoint for local development"
+                    .into(),
             ));
+        }
+        // Surface plaintext use against a non-loopback host so it is never silent.
+        if url.scheme() == "http" && !is_loopback {
+            tracing::warn!(
+                "Cloud storage endpoint uses plaintext http (allowInsecureHttp): vault \
+                 deltas remain app-encrypted, but object keys/sizes and requests are \
+                 exposed in transit and open to tampering"
+            );
         }
 
         let client = Client::builder()
@@ -566,6 +584,49 @@ fn extract_xml_value(xml: &str, tag: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cfg(endpoint: &str, insecure: bool) -> CloudConfig {
+        CloudConfig::new(endpoint, "bucket", "us-east-1", "ak", "sk")
+            .with_insecure_http(insecure)
+    }
+
+    #[test]
+    fn endpoint_policy_https_always_allowed() {
+        assert!(S3Client::new(cfg("https://s3.amazonaws.com", false)).is_ok());
+        assert!(S3Client::new(cfg("https://minio.example.com:9000", false)).is_ok());
+    }
+
+    #[test]
+    fn endpoint_policy_http_loopback_allowed_without_flag() {
+        for e in [
+            "http://localhost:9000",
+            "http://127.0.0.1:9000",
+            "http://127.0.0.5:9000", // 127.0.0.0/8 is all loopback
+            "http://[::1]:9000",
+        ] {
+            assert!(S3Client::new(cfg(e, false)).is_ok(), "{e} should be allowed");
+        }
+    }
+
+    #[test]
+    fn endpoint_policy_http_public_rejected_without_flag() {
+        // The old prefix bug: `http://localhost.evil.com` must NOT be treated as local.
+        for e in [
+            "http://minio:9000",
+            "http://192.168.1.10:9000",
+            "http://s3.amazonaws.com",
+            "http://localhost.evil.com",
+        ] {
+            assert!(S3Client::new(cfg(e, false)).is_err(), "{e} should be rejected");
+        }
+    }
+
+    #[test]
+    fn endpoint_policy_http_allowed_with_opt_in() {
+        for e in ["http://minio:9000", "http://192.168.1.10:9000", "http://nas.local"] {
+            assert!(S3Client::new(cfg(e, true)).is_ok(), "{e} should be allowed with flag");
+        }
+    }
 
     #[test]
     fn test_format_datetime() {
