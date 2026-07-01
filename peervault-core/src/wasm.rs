@@ -1341,6 +1341,16 @@ use crate::blobs_bridge::BlobsBridge;
 ///
 /// Used for log/error truncation of attacker-controlled strings (pairing nonces,
 /// peer ids) where naive byte slicing (`&s[..n]`) can panic mid-codepoint.
+/// Emit a typed `WasmEvent` to the host callback as a JSON string. Centralizes
+/// serialization so every event shares one schema (see `crate::events`).
+fn emit_event(on_event: &Option<Function>, event: &crate::events::WasmEvent) {
+    if let Some(cb) = on_event {
+        if let Ok(json) = serde_json::to_string(event) {
+            let _ = cb.call1(&JsValue::NULL, &JsValue::from_str(&json));
+        }
+    }
+}
+
 /// Build a JS `Error` carrying a stable machine-readable `code` alongside the
 /// human message, so the TypeScript layer can branch on the failure kind instead
 /// of string-matching. Backward compatible: `.message` is unchanged; `.code` is
@@ -1460,16 +1470,12 @@ async fn run_initiator_sync_v3(
         }
     }
 
-    if let Some(ref callback) = on_event {
-        let event = serde_json::json!({
-            "type": "sync_complete",
-            "peer_id": peer_id,
-            "direction": "outgoing",
-            "updates_received": runner.result().updates_received,
-            "updates_sent": runner.result().updates_sent,
-        });
-        let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(&event.to_string()));
-    }
+    emit_event(&on_event, &crate::events::WasmEvent::SyncComplete {
+        peer_id: peer_id.to_string(),
+        direction: "outgoing".into(),
+        updates_received: runner.result().updates_received,
+        updates_sent: runner.result().updates_sent,
+    });
     Ok(())
 }
 
@@ -1622,14 +1628,10 @@ async fn handle_incoming_streams_v3_inner(
             pending_pairings.write().unwrap().remove(nonce);
         }
         known_peers.write().unwrap().insert(peer_id.to_string(), now_ms);
-        if let Some(ref callback) = on_event {
-            let event = serde_json::json!({
-                "type": "pairing_complete",
-                "peer_id": peer_id,
-                "device_name": runner.result().peer_hostname,
-            });
-            let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(&event.to_string()));
-        }
+        emit_event(&on_event, &crate::events::WasmEvent::PairingComplete {
+            peer_id: peer_id.to_string(),
+            device_name: runner.result().peer_hostname.clone(),
+        });
     }
 
     let updates_received = runner.result().updates_received;
@@ -1645,16 +1647,12 @@ async fn handle_incoming_streams_v3_inner(
             .map_err(|e| JsValue::from_str(&format!("Import snapshot: {}", e)))?;
     }
 
-    if let Some(ref callback) = on_event {
-        let event = serde_json::json!({
-            "type": "sync_complete",
-            "peer_id": peer_id,
-            "direction": "incoming",
-            "updates_received": updates_received,
-            "updates_sent": updates_sent,
-        });
-        let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(&event.to_string()));
-    }
+    emit_event(&on_event, &crate::events::WasmEvent::SyncComplete {
+        peer_id: peer_id.to_string(),
+        direction: "incoming".into(),
+        updates_received,
+        updates_sent,
+    });
 
     // Subscribe to gossip for real-time updates (acceptor side)
     let gossip_guard = gossip_bridge_arc.read().await;
@@ -1755,38 +1753,23 @@ async fn run_gossip_receiver(
                         }
 
                         // Emit document_changed event
-                        if let Some(ref callback) = on_event {
-                            let event = serde_json::json!({
-                                "type": "document_changed",
-                                "source": "gossip",
-                                "bytes": plaintext.len(),
-                            });
-                            let _ = callback.call1(
-                                &JsValue::NULL,
-                                &JsValue::from_str(&event.to_string()),
-                            );
-                        }
+                        emit_event(&on_event, &crate::events::WasmEvent::DocumentChanged {
+                            source: "gossip".into(),
+                            bytes: plaintext.len(),
+                        });
                     }
                 }
                 Ok(Event::NeighborUp(peer)) => {
                     info!("Gossip: neighbor joined: {}", peer);
-                    if let Some(ref callback) = on_event {
-                        let event = serde_json::json!({
-                            "type": "gossip_neighbor_up",
-                            "peer_id": peer.to_string(),
-                        });
-                        let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(&event.to_string()));
-                    }
+                    emit_event(&on_event, &crate::events::WasmEvent::GossipNeighborUp {
+                        peer_id: peer.to_string(),
+                    });
                 }
                 Ok(Event::NeighborDown(peer)) => {
                     info!("Gossip: neighbor left: {}", peer);
-                    if let Some(ref callback) = on_event {
-                        let event = serde_json::json!({
-                            "type": "gossip_neighbor_down",
-                            "peer_id": peer.to_string(),
-                        });
-                        let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(&event.to_string()));
-                    }
+                    emit_event(&on_event, &crate::events::WasmEvent::GossipNeighborDown {
+                        peer_id: peer.to_string(),
+                    });
                 }
                 Ok(Event::Lagged) => {
                     warn!("Gossip: receiver lagged, messages may have been dropped");
@@ -1899,15 +1882,11 @@ async fn run_gossip_debounce(
             }
             Err(crate::error::CoreError::DeltaTooLarge { size, max }) => {
                 warn!("Delta too large for gossip ({} > {}), peers need point-to-point sync", size, max);
-                if let Some(ref callback) = on_event {
-                    let event = serde_json::json!({
-                        "type": "sync_needed",
-                        "reason": "delta_too_large",
-                        "size": size,
-                        "max": max,
-                    });
-                    let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(&event.to_string()));
-                }
+                emit_event(&on_event, &crate::events::WasmEvent::SyncNeeded {
+                    reason: "delta_too_large".into(),
+                    size,
+                    max,
+                });
             }
             Err(e) => {
                 warn!("Gossip broadcast failed: {}", e);
@@ -1974,17 +1953,10 @@ async fn run_accept_loop(
                 connections.write().await.insert(peer_id.clone(), connection);
 
                 // Emit event to JavaScript
-                if let Some(ref callback) = on_event {
-                    let event = serde_json::json!({
-                        "type": "peer_connected",
-                        "peer_id": peer_id,
-                        "direction": "incoming"
-                    });
-                    let _ = callback.call1(
-                        &JsValue::NULL,
-                        &JsValue::from_str(&event.to_string()),
-                    );
-                }
+                emit_event(&on_event, &crate::events::WasmEvent::PeerConnected {
+                    peer_id: peer_id.clone(),
+                    direction: "incoming".into(),
+                });
 
                 // Spawn V3 handler for this connection
                 let connections_clone = connections.clone();

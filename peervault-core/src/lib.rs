@@ -27,6 +27,7 @@
 //! ```
 
 pub mod host;
+pub mod events;
 pub mod protocol;
 pub mod wire;
 pub mod sync;

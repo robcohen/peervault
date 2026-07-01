@@ -16,6 +16,7 @@ wasm-opt = false
 default = ["native"]
 native = ["tokio/rt-multi-thread", "reqwest/rustls"]
 test-utils = []  # Exposes MockHost for integration tests
+ts-export = ["ts-rs"]  # emit src/core/generated/*.ts from the Rust event schema
 # Note: In WASM, reqwest uses browser fetch API automatically
 # WASM target for browser/JS embedding
 wasm = [
@@ -79,6 +80,7 @@ base64 = "0.22"
 # Async utilities
 futures = "0.3"
 async-trait = "0.1"  # async methods on the SyncStream trait
+ts-rs = { version = "10", optional = true }  # generate TS event types (cargo test --features ts-export)
 
 # Time - web-time works in both native and WASM
 web-time = "1"
