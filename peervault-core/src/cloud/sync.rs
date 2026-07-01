@@ -631,7 +631,14 @@ pub enum CloudSyncError {
 
 impl From<crate::error::CoreError> for CloudSyncError {
     fn from(e: crate::error::CoreError) -> Self {
-        CloudSyncError::Crdt(e.to_string())
+        use crate::error::CoreError;
+        // Preserve the error category instead of collapsing everything to `Crdt`
+        // (a crypto or store failure surfacing as "CRDT error" is misleading).
+        match e {
+            CoreError::Crypto(m) => CloudSyncError::Encryption(m),
+            CoreError::Crdt(m) => CloudSyncError::Crdt(m),
+            other => CloudSyncError::Crdt(other.to_string()),
+        }
     }
 }
 

@@ -50,6 +50,31 @@ export type ClientEvent =
 
 export type EventHandler = (event: ClientEvent) => void;
 
+/**
+ * Stable error codes surfaced by the WASM core (on the `.code` property of the
+ * thrown `Error`). Lets callers branch on the failure kind instead of matching
+ * on human-readable message strings.
+ */
+export type PeerVaultErrorCode =
+  | "KEY_CONFLICT"
+  | "DELTA_TOO_LARGE"
+  | "CRYPTO"
+  | "TIMEOUT"
+  | "PROTOCOL"
+  | "CRDT"
+  | "HOST"
+  | "STORE"
+  | "CONFIG"
+  | "INTERNAL";
+
+/** Extract the machine-readable code from an error thrown by the WASM core, if any. */
+export function errorCode(e: unknown): PeerVaultErrorCode | undefined {
+  if (e && typeof e === "object" && "code" in e) {
+    return (e as { code?: PeerVaultErrorCode }).code;
+  }
+  return undefined;
+}
+
 // =============================================================================
 // WASM Module Types (from peervault-core)
 // =============================================================================
@@ -455,11 +480,23 @@ export class PeerVaultClient {
     // Connect to peer with pairing nonce (for one-time ticket validation).
     // Never log the nonce value itself.
     console.log(`[PeerVault] Connecting to peer (pairing nonce ${pairingNonce ? "present" : "absent"})`);
-    const peerId = await this.vault.connectPeerWithPairing(
-      transportTicket,
-      pairingNonce,
-      this.config.deviceName
-    );
+    let peerId: string;
+    try {
+      peerId = await this.vault.connectPeerWithPairing(
+        transportTicket,
+        pairingNonce,
+        this.config.deviceName
+      );
+    } catch (e) {
+      // Surface the actionable key-conflict case with a clear, distinct message.
+      if (errorCode(e) === "KEY_CONFLICT") {
+        throw new Error(
+          "Pairing failed: this vault already has a different encryption key than the peer. " +
+            "Both devices must share the same vault key."
+        );
+      }
+      throw e;
+    }
 
     // Add to peer list
     const peer: PeerInfo = {
