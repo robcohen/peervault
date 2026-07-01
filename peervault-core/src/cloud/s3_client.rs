@@ -46,6 +46,45 @@ pub enum S3Error {
 impl S3Client {
     /// Create a new S3 client
     pub fn new(config: CloudConfig) -> S3Result<Self> {
+        // Secure by default: require TLS. Plaintext `http://` is accepted only for
+        // a loopback endpoint (local dev) or when the operator explicitly opts in
+        // via `allow_insecure_http` (a trusted private network — docker/LAN MinIO).
+        // SigV4 keeps the secret off the wire, but http still exposes object
+        // keys/sizes and is open to request tampering by an on-path attacker.
+        // Parse the URL (a prefix check like `starts_with("http://localhost")` also
+        // matches `http://localhost.evil.com`) and classify the host precisely.
+        let url = reqwest::Url::parse(&config.endpoint)
+            .map_err(|e| S3Error::Config(format!("Invalid endpoint URL: {}", e)))?;
+        let host = url.host_str().unwrap_or("");
+        // `host_str()` yields IPv6 with brackets (e.g. "[::1]"); strip them to parse.
+        let bare_host = host.trim_start_matches('[').trim_end_matches(']');
+        let is_loopback = host == "localhost"
+            || bare_host
+                .parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false);
+        let allowed = match url.scheme() {
+            "https" => true,
+            "http" => is_loopback || config.allow_insecure_http,
+            _ => false,
+        };
+        if !allowed {
+            return Err(S3Error::Config(
+                "Cloud endpoint must use https:// — set allowInsecureHttp to permit \
+                 plaintext http for a trusted private network, or use a loopback \
+                 endpoint for local development"
+                    .into(),
+            ));
+        }
+        // Surface plaintext use against a non-loopback host so it is never silent.
+        if url.scheme() == "http" && !is_loopback {
+            tracing::warn!(
+                "Cloud storage endpoint uses plaintext http (allowInsecureHttp): vault \
+                 deltas remain app-encrypted, but object keys/sizes and requests are \
+                 exposed in transit and open to tampering"
+            );
+        }
+
         let client = Client::builder()
             .build()
             .map_err(|e| S3Error::Network(e.to_string()))?;
@@ -58,7 +97,8 @@ impl S3Client {
         let full_key = self.config.object_path(key);
         let url = format!("{}/{}/{}", self.config.endpoint, self.config.bucket, full_key);
 
-        let request = self.sign_request("GET", &full_key, None)?;
+        let canonical_uri = format!("/{}/{}", self.config.bucket, full_key);
+        let request = self.sign_request("GET", &canonical_uri, "", None)?;
 
         let response = self.client
             .get(&url)
@@ -89,7 +129,8 @@ impl S3Client {
         let full_key = self.config.object_path(key);
         let url = format!("{}/{}/{}", self.config.endpoint, self.config.bucket, full_key);
 
-        let request = self.sign_request("PUT", &full_key, Some(&data))?;
+        let canonical_uri = format!("/{}/{}", self.config.bucket, full_key);
+        let request = self.sign_request("PUT", &canonical_uri, "", Some(&data))?;
 
         let mut req = self.client
             .put(&url)
@@ -118,7 +159,8 @@ impl S3Client {
         let full_key = self.config.object_path(key);
         let url = format!("{}/{}/{}", self.config.endpoint, self.config.bucket, full_key);
 
-        let request = self.sign_request("DELETE", &full_key, None)?;
+        let canonical_uri = format!("/{}/{}", self.config.bucket, full_key);
+        let request = self.sign_request("DELETE", &canonical_uri, "", None)?;
 
         let response = self.client
             .delete(&url)
@@ -142,37 +184,65 @@ impl S3Client {
         Ok(())
     }
 
-    /// List objects with a prefix
+    /// List objects with a prefix.
+    ///
+    /// Follows `NextContinuationToken` so result sets larger than the 1000-key
+    /// ListObjectsV2 page limit are fully enumerated.
     pub async fn list_objects(&self, prefix: &str) -> S3Result<Vec<S3Object>> {
         let full_prefix = self.config.object_path(prefix);
-        let url = format!(
-            "{}/{}?list-type=2&prefix={}",
-            self.config.endpoint,
-            self.config.bucket,
-            urlencoding::encode(&full_prefix)
-        );
+        let encoded_prefix = aws_uri_encode(&full_prefix);
+        let canonical_uri = format!("/{}", self.config.bucket);
 
-        let request = self.sign_request("GET", "", None)?;
+        let mut objects = Vec::new();
+        let mut continuation: Option<String> = None;
 
-        let response = self.client
-            .get(&url)
-            .headers(request.headers)
-            .send()
-            .await
-            .map_err(|e| S3Error::Network(e.to_string()))?;
+        loop {
+            // Canonical query string: parameters sorted by key, values AWS-URI-encoded.
+            // The exact same string is used for both signing and the request URL so
+            // the server-side signature can never disagree with the wire request.
+            let canonical_query = match &continuation {
+                Some(token) => format!(
+                    "continuation-token={}&list-type=2&prefix={}",
+                    aws_uri_encode(token),
+                    encoded_prefix
+                ),
+                None => format!("list-type=2&prefix={}", encoded_prefix),
+            };
 
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            let (code, message) = parse_s3_error(&body);
-            return Err(S3Error::S3 { status, code, message });
+            let url = format!(
+                "{}/{}?{}",
+                self.config.endpoint, self.config.bucket, canonical_query
+            );
+
+            let request = self.sign_request("GET", &canonical_uri, &canonical_query, None)?;
+
+            let response = self.client
+                .get(&url)
+                .headers(request.headers)
+                .send()
+                .await
+                .map_err(|e| S3Error::Network(e.to_string()))?;
+
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let body = response.text().await.unwrap_or_default();
+                let (code, message) = parse_s3_error(&body);
+                return Err(S3Error::S3 { status, code, message });
+            }
+
+            let body = response.text().await
+                .map_err(|e| S3Error::Network(e.to_string()))?;
+
+            let (mut page, next) = parse_list_objects_response(&body, &self.config.path_prefix);
+            objects.append(&mut page);
+
+            match next {
+                Some(token) => continuation = Some(token),
+                None => break,
+            }
         }
 
-        let body = response.text().await
-            .map_err(|e| S3Error::Network(e.to_string()))?;
-
-        // Parse XML response
-        Ok(parse_list_objects_response(&body, &self.config.path_prefix))
+        Ok(objects)
     }
 
     /// Check if an object exists
@@ -180,7 +250,8 @@ impl S3Client {
         let full_key = self.config.object_path(key);
         let url = format!("{}/{}/{}", self.config.endpoint, self.config.bucket, full_key);
 
-        let request = self.sign_request("HEAD", &full_key, None)?;
+        let canonical_uri = format!("/{}/{}", self.config.bucket, full_key);
+        let request = self.sign_request("HEAD", &canonical_uri, "", None)?;
 
         let response = self.client
             .head(&url)
@@ -225,8 +296,18 @@ impl S3Client {
         }))
     }
 
-    /// Sign a request using AWS Signature V4
-    fn sign_request(&self, method: &str, key: &str, body: Option<&[u8]>) -> S3Result<SignedRequest> {
+    /// Sign a request using AWS Signature V4.
+    ///
+    /// `canonical_uri` and `canonical_query` MUST exactly correspond to the path
+    /// and (sorted, URI-encoded) query string of the actual HTTP request, or the
+    /// server will reject the signature.
+    fn sign_request(
+        &self,
+        method: &str,
+        canonical_uri: &str,
+        canonical_query: &str,
+        body: Option<&[u8]>,
+    ) -> S3Result<SignedRequest> {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_err(|_| S3Error::Config("System time error".into()))?;
@@ -249,8 +330,6 @@ impl S3Client {
         };
 
         // Canonical request
-        let canonical_uri = format!("/{}/{}", self.config.bucket, key);
-        let canonical_query = "";
         let canonical_headers = format!(
             "host:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n",
             host, payload_hash, datetime
@@ -424,7 +503,11 @@ fn parse_s3_error(body: &str) -> (String, String) {
 }
 
 /// Parse ListObjectsV2 response
-fn parse_list_objects_response(body: &str, prefix_to_strip: &str) -> Vec<S3Object> {
+/// Parse a ListObjectsV2 XML response.
+///
+/// Returns the parsed objects and, when the result is truncated, the
+/// `NextContinuationToken` to fetch the following page.
+fn parse_list_objects_response(body: &str, prefix_to_strip: &str) -> (Vec<S3Object>, Option<String>) {
     let mut objects = Vec::new();
 
     // Find all <Contents> elements
@@ -459,7 +542,31 @@ fn parse_list_objects_response(body: &str, prefix_to_strip: &str) -> Vec<S3Objec
         }
     }
 
-    objects
+    let is_truncated = extract_xml_value(body, "IsTruncated")
+        .map(|v| v.trim() == "true")
+        .unwrap_or(false);
+    let next_token = if is_truncated {
+        extract_xml_value(body, "NextContinuationToken")
+    } else {
+        None
+    };
+
+    (objects, next_token)
+}
+
+/// URI-encode a value for an AWS SigV4 canonical query string (RFC 3986,
+/// unreserved characters left as-is, everything else percent-encoded).
+fn aws_uri_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for &b in value.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
 }
 
 /// Extract value from XML element
@@ -477,6 +584,49 @@ fn extract_xml_value(xml: &str, tag: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cfg(endpoint: &str, insecure: bool) -> CloudConfig {
+        CloudConfig::new(endpoint, "bucket", "us-east-1", "ak", "sk")
+            .with_insecure_http(insecure)
+    }
+
+    #[test]
+    fn endpoint_policy_https_always_allowed() {
+        assert!(S3Client::new(cfg("https://s3.amazonaws.com", false)).is_ok());
+        assert!(S3Client::new(cfg("https://minio.example.com:9000", false)).is_ok());
+    }
+
+    #[test]
+    fn endpoint_policy_http_loopback_allowed_without_flag() {
+        for e in [
+            "http://localhost:9000",
+            "http://127.0.0.1:9000",
+            "http://127.0.0.5:9000", // 127.0.0.0/8 is all loopback
+            "http://[::1]:9000",
+        ] {
+            assert!(S3Client::new(cfg(e, false)).is_ok(), "{e} should be allowed");
+        }
+    }
+
+    #[test]
+    fn endpoint_policy_http_public_rejected_without_flag() {
+        // The old prefix bug: `http://localhost.evil.com` must NOT be treated as local.
+        for e in [
+            "http://minio:9000",
+            "http://192.168.1.10:9000",
+            "http://s3.amazonaws.com",
+            "http://localhost.evil.com",
+        ] {
+            assert!(S3Client::new(cfg(e, false)).is_err(), "{e} should be rejected");
+        }
+    }
+
+    #[test]
+    fn endpoint_policy_http_allowed_with_opt_in() {
+        for e in ["http://minio:9000", "http://192.168.1.10:9000", "http://nas.local"] {
+            assert!(S3Client::new(cfg(e, true)).is_ok(), "{e} should be allowed with flag");
+        }
+    }
 
     #[test]
     fn test_format_datetime() {
@@ -522,7 +672,7 @@ mod tests {
                 </Contents>
             </ListBucketResult>"#;
 
-        let objects = parse_list_objects_response(body, "prefix");
+        let (objects, _next) = parse_list_objects_response(body, "prefix");
         assert_eq!(objects.len(), 2);
         assert_eq!(objects[0].key, "deltas/123.enc");
         assert_eq!(objects[0].size, 1024);

@@ -16,6 +16,13 @@ interface PeerVaultSettings {
   autoSync: boolean;
   autoSyncInterval: number; // minutes
   relayUrl: string; // Custom relay URL (empty = use default)
+  /**
+   * Stable, shared vault identifier (hex). Generated randomly on first run and,
+   * when pairing, adopted from the peer's ticket so both devices share the same
+   * gossip topic. Must NOT be derived from the local filesystem path (that gives
+   * each device a different id and breaks cross-device pairing).
+   */
+  vaultId: string;
 }
 
 const DEFAULT_SETTINGS: PeerVaultSettings = {
@@ -23,7 +30,17 @@ const DEFAULT_SETTINGS: PeerVaultSettings = {
   autoSync: true,
   autoSyncInterval: 5,
   relayUrl: "",
+  vaultId: "",
 };
+
+/** Byte-wise equality for two Uint8Arrays. */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
 
 /** Default relay URL shown in UI */
 const DEFAULT_RELAY_URL = "https://use1-1.relay.n0.computer";
@@ -33,7 +50,7 @@ const DEFAULT_RELAY_URL = "https://use1-1.relay.n0.computer";
 // =============================================================================
 
 export default class PeerVaultPlugin extends Plugin {
-  settings: PeerVaultSettings = DEFAULT_SETTINGS;
+  override settings: PeerVaultSettings = DEFAULT_SETTINGS;
   client: PeerVaultClient | null = null;
   private autoSyncTimer: number | null = null;
   // Per-file debounce timers to handle rapid changes to different files
@@ -44,6 +61,11 @@ export default class PeerVaultPlugin extends Plugin {
   private readonly CRDT_SYNC_DEBOUNCE_MS = 500;
   // Guard against concurrent syncCrdtToDisk calls
   private crdtSyncRunning = false;
+  // Set when a CRDT-to-disk sync is requested while one is already running, so we
+  // re-run afterwards instead of silently dropping the update.
+  private crdtSyncPending = false;
+  // Keys present in the CRDT at the last disk sync, used to detect remote deletions.
+  private previousCrdtKeys: Set<string> = new Set();
 
   override async onload(): Promise<void> {
     await this.loadSettings();
@@ -169,6 +191,16 @@ export default class PeerVaultPlugin extends Plugin {
         console.log("[PeerVault] No synced files found, performing initial vault scan...");
         await this.scanVault();
       }
+
+      // Seed the remote-deletion baseline from the CRDT's current keys. Without
+      // this, previousCrdtKeys would start empty after every reload, so the first
+      // disk-sync of the session would miss any deletion that happened on a peer
+      // while we were offline — and a later local re-scan would resurrect the
+      // deleted file. Seeding from the CRDT (not disk) is safe: a file deleted
+      // remotely while we were offline is still in our persisted CRDT now, so it
+      // enters the baseline and is removed once the delete delta arrives.
+      const baseline = await this.client.listFiles();
+      this.previousCrdtKeys = new Set(baseline.filter((p) => !p.startsWith("_crdt/")));
     } catch (e) {
       console.error("[PeerVault] Failed to initialize:", e);
       new Notice(`PeerVault: Failed to initialize - ${e}`);
@@ -264,13 +296,20 @@ export default class PeerVaultPlugin extends Plugin {
   }
 
   private async generateVaultId(): Promise<string> {
-    // Use vault path to generate consistent ID
-    const vaultPath = (this.app.vault.adapter as any).basePath || this.app.vault.getName();
-    const encoder = new TextEncoder();
-    const data = encoder.encode(vaultPath);
-    const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-    const hashArray = Array.from(new Uint8Array(hashBuffer));
-    return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+    // The vault ID must be a STABLE, SHARED identifier — never derived from the
+    // local filesystem path, since two devices syncing the same logical vault have
+    // different paths and would compute different IDs (breaking pairing and gossip).
+    // We persist a random ID on first run; the joiner adopts the initiator's ID
+    // from the pairing ticket (see promptAddPeer).
+    if (this.settings.vaultId) {
+      return this.settings.vaultId;
+    }
+    const bytes = new Uint8Array(32);
+    crypto.getRandomValues(bytes);
+    const id = Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+    this.settings.vaultId = id;
+    await this.saveSettings();
+    return id;
   }
 
   // ===========================================================================
@@ -300,10 +339,27 @@ export default class PeerVaultPlugin extends Plugin {
     if (file.path.startsWith(".obsidian/")) return;
 
     try {
-      const content = await this.app.vault.readBinary(file);
-      await this.client.setFile(file.path, new Uint8Array(content));
+      const bytes = new Uint8Array(await this.app.vault.readBinary(file));
+
+      // Echo-loop guard: if the on-disk content already matches the CRDT, this
+      // "modify" event is almost certainly the echo of a write we just made while
+      // applying a remote change. Re-ingesting it would re-broadcast the delta and
+      // create a sync ping-pong, so skip it.
+      const current = await this.client.getFile(file.path);
+      if (current && bytesEqual(current, bytes)) return;
+
+      await this.client.setFile(file.path, bytes);
     } catch (e) {
       console.error(`[PeerVault] Failed to sync file change: ${file.path}`, e);
+    }
+  }
+
+  /** Read a vault file as bytes, returning null if it does not exist. */
+  private async readDiskIfExists(path: string): Promise<Uint8Array | null> {
+    try {
+      return new Uint8Array(await this.app.vault.adapter.readBinary(path));
+    } catch {
+      return null;
     }
   }
 
@@ -455,6 +511,11 @@ export default class PeerVaultPlugin extends Plugin {
     try {
       const content = await this.client.getFile(path);
       if (content) {
+        // Skip the write if disk already matches the CRDT. This avoids a redundant
+        // write and, crucially, the echo "modify" event it would otherwise trigger.
+        const existing = await this.readDiskIfExists(path);
+        if (existing && bytesEqual(existing, content)) return;
+
         // Ensure parent directory exists
         const dir = path.substring(0, path.lastIndexOf("/"));
         if (dir) {
@@ -498,23 +559,52 @@ export default class PeerVaultPlugin extends Plugin {
 
   private async syncCrdtToDisk(): Promise<void> {
     if (!this.client?.isInitialized) return;
-    if (this.crdtSyncRunning) return; // Prevent concurrent runs
+    if (this.crdtSyncRunning) {
+      // Don't drop this request — re-run once the in-flight sync finishes.
+      this.crdtSyncPending = true;
+      return;
+    }
     this.crdtSyncRunning = true;
 
     try {
       const crdtFiles = await this.client.listFiles();
       console.log(`[PeerVault] Syncing ${crdtFiles.length} CRDT files to disk`);
 
+      const currentKeys = new Set<string>();
       for (const path of crdtFiles) {
         // Skip internal CRDT metadata
         if (path.startsWith("_crdt/")) continue;
-
+        currentKeys.add(path);
+        // applyRemoteChange is a no-op when disk already matches the CRDT.
         await this.applyRemoteChange(path);
       }
+
+      // Apply remote deletions: files present at the previous sync but no longer in
+      // the CRDT were deleted on a peer (and arrived via the gossip/full-resync path
+      // which carries no per-key delete event).
+      for (const path of this.previousCrdtKeys) {
+        if (!currentKeys.has(path)) {
+          // Don't delete a path the user just re-created locally: a pending
+          // file-change timer means a local edit/creation hasn't been ingested
+          // into the CRDT yet, so its absence from currentKeys is expected and
+          // removing it would silently destroy the user's new file.
+          if (this.fileChangeTimers.has(path)) continue;
+          try {
+            await this.app.vault.adapter.remove(path);
+          } catch {
+            // May already be gone locally.
+          }
+        }
+      }
+      this.previousCrdtKeys = currentKeys;
     } catch (e) {
       console.error("[PeerVault] Failed to sync CRDT to disk:", e);
     } finally {
       this.crdtSyncRunning = false;
+      if (this.crdtSyncPending) {
+        this.crdtSyncPending = false;
+        this.scheduleCrdtSync();
+      }
     }
   }
 
@@ -557,9 +647,25 @@ export default class PeerVaultPlugin extends Plugin {
     // Use Obsidian's prompt (simple text input)
     const ticket = await this.promptForText("Paste peer ticket:");
     if (!ticket) return;
+    const trimmed = ticket.trim();
+
+    // If the ticket is for a different vault ID, adopt it so both devices share the
+    // same gossip topic. The WASM vault is constructed with the ID at startup, so we
+    // persist the adopted ID and ask the user to reload; on the next load the local
+    // files are re-scanned under the shared ID and then merged with the peer via CRDT.
+    const ticketVaultId = this.client.peekVaultId(trimmed);
+    if (ticketVaultId && ticketVaultId !== this.settings.vaultId) {
+      this.settings.vaultId = ticketVaultId;
+      await this.saveSettings();
+      new Notice(
+        "PeerVault: Vault linked to peer. Reload the plugin (or restart Obsidian), then add this peer again to finish pairing.",
+        10000
+      );
+      return;
+    }
 
     try {
-      const peerId = await this.client.addPeer(ticket.trim());
+      const peerId = await this.client.addPeer(trimmed);
       new Notice(`PeerVault: Connected to peer ${peerId.slice(0, 8)}`);
     } catch (e) {
       new Notice(`PeerVault: Failed to add peer - ${e}`);

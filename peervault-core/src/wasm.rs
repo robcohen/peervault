@@ -1080,7 +1080,7 @@ impl WasmPeerVault {
         pending.insert(nonce.to_string(), expires_at_ms as u64);
         web_sys::console::log_1(&JsValue::from_str(&format!(
             "[WASM] Registered pairing nonce: {}...",
-            &nonce[..16.min(nonce.len())]
+            short(&nonce, 16)
         )));
     }
 
@@ -1100,7 +1100,7 @@ impl WasmPeerVault {
                 pending.remove(nonce);
                 web_sys::console::log_1(&JsValue::from_str(&format!(
                     "[WASM] Pairing nonce expired: {}...",
-                    &nonce[..16.min(nonce.len())]
+                    short(&nonce, 16)
                 )));
                 return false;
             }
@@ -1109,13 +1109,13 @@ impl WasmPeerVault {
             pending.remove(nonce);
             web_sys::console::log_1(&JsValue::from_str(&format!(
                 "[WASM] Pairing nonce validated and consumed: {}...",
-                &nonce[..16.min(nonce.len())]
+                short(&nonce, 16)
             )));
             true
         } else {
             web_sys::console::log_1(&JsValue::from_str(&format!(
                 "[WASM] Unknown pairing nonce: {}...",
-                &nonce[..16.min(nonce.len())]
+                short(&nonce, 16)
             )));
             false
         }
@@ -1134,7 +1134,7 @@ impl WasmPeerVault {
         self.known_peers.blocking_write().insert(peer_id.to_string(), now);
         web_sys::console::log_1(&JsValue::from_str(&format!(
             "[WASM] Added known peer: {}...",
-            &peer_id[..16.min(peer_id.len())]
+            short(&peer_id, 16)
         )));
     }
 
@@ -1198,12 +1198,12 @@ impl WasmPeerVault {
 
         future_to_promise(async move {
             info!("connectPeer: parsing ticket, nonce={}",
-                pairing_nonce.as_deref().map(|n| &n[..16.min(n.len())]).unwrap_or("none"));
+                pairing_nonce.as_deref().map(|n| short(n, 16)).unwrap_or("none"));
             let ticket = Ticket::from_string(&ticket_str)
                 .map_err(|e| JsValue::from_str(&format!("Invalid ticket: {}", e)))?;
 
             let peer_id = ticket.node_id.to_string();
-            info!("connectPeer: peer_id={}", &peer_id[..16.min(peer_id.len())]);
+            info!("connectPeer: peer_id={}", short(&peer_id, 16));
 
             // Helper: create SyncEngine from store + key
             async fn create_sync_engine(
@@ -1217,9 +1217,15 @@ impl WasmPeerVault {
                 let vault_key = key_guard.clone()
                     .ok_or_else(|| JsValue::from_str("No encryption key"))?;
                 drop(key_guard);
+                let real_vault_id = *loro_store.vault_id();
                 let host = Arc::new(crate::host::mock::MockHost::new());
-                let engine = SyncEngine::new_with_key(host, vault_key)
+                let mut engine = SyncEngine::new_with_key(host, vault_key)
                     .map_err(|e| JsValue::from_str(&format!("SyncEngine: {}", e)))?;
+                // Carry the real vault id into the temporary sync engine so the
+                // VERSION_INFO we send advertises the actual vault (new_with_key
+                // starts at all-zeros and import does not restore it). Must run
+                // before import so the data lands in the correctly-identified store.
+                engine.init_vault(real_vault_id);
                 let snapshot = loro_store.export_snapshot()
                     .map_err(|e| JsValue::from_str(&format!("Export snapshot: {}", e)))?;
                 drop(store_guard);
@@ -1249,7 +1255,7 @@ impl WasmPeerVault {
                 let connections_guard = connections.read().await;
                 if let Some(existing_conn) = connections_guard.get(&peer_id) {
                     if !existing_conn.is_closed() {
-                        info!("connectPeer: reusing existing connection to {}", &peer_id[..16.min(peer_id.len())]);
+                        info!("connectPeer: reusing existing connection to {}", short(&peer_id, 16));
                         let s = existing_conn.open_stream().await
                             .map_err(|e| JsValue::from_str(&format!("Open stream: {}", e)))?;
                         drop(connections_guard);
@@ -1614,7 +1620,9 @@ impl WasmPeerVault {
                 &config.region,
                 &config.access_key_id,
                 &config.secret_access_key,
-            ).with_prefix(&config.path_prefix.unwrap_or_default());
+            )
+            .with_prefix(&config.path_prefix.unwrap_or_default())
+            .with_insecure_http(config.allow_insecure_http.unwrap_or(false));
 
             // Create CloudSync instance
             let cloud = CloudSync::new(cloud_config, vault_key.as_bytes())
@@ -1825,7 +1833,7 @@ fn validate_pairing(
     let nonce = pairing_nonce.ok_or_else(|| "Unknown peer, pairing nonce required".to_string())?;
 
     let expires_at = pending_pairings.get(nonce)
-        .ok_or_else(|| format!("Unknown pairing nonce: {}...", &nonce[..16.min(nonce.len())]))?;
+        .ok_or_else(|| format!("Unknown pairing nonce: {}...", short(&nonce, 16)))?;
 
     let now = web_time::SystemTime::now()
         .duration_since(web_time::SystemTime::UNIX_EPOCH)
@@ -1846,6 +1854,17 @@ fn validate_pairing(
 /// Run sync as INITIATOR using V3 binary protocol.
 ///
 /// Protocol: VersionInfo → Updates → BlobHashes → BlobTransfer → SyncComplete
+/// Truncate a string to at most `n` bytes on a UTF-8 char boundary, without panicking.
+///
+/// Used for log/error truncation of attacker-controlled strings (pairing nonces,
+/// peer ids) where naive byte slicing (`&s[..n]`) can panic mid-codepoint.
+fn short(s: &str, n: usize) -> &str {
+    match s.char_indices().nth(n) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
+
 async fn run_initiator_sync_v3(
     peer_id: &str,
     stream: &mut IrohStream,
@@ -1907,7 +1926,15 @@ async fn run_initiator_sync_v3(
         op_count: 0,
     })).await.map_err(map_err)?;
 
-    // Receive peer's updates
+    // The initiator drives completion: announce we're done right after sending our
+    // updates. The acceptor replies with its own SyncComplete once it has received
+    // this. Without this, both peers would block in the recv loop below forever,
+    // since neither would ever send the first SyncComplete.
+    send_sync_msg(stream, &SyncMessage::SyncComplete(proto::SyncComplete {
+        version_bytes: engine.version_vector(),
+    })).await.map_err(map_err)?;
+
+    // Receive peer's updates and wait for its completion acknowledgement.
     let mut updates_received = 0;
     loop {
         match recv_sync_msg(stream).await.map_err(map_err)? {
@@ -1916,12 +1943,8 @@ async fn run_initiator_sync_v3(
                     .map_err(|e| JsValue::from_str(&format!("Import updates failed: {}", e)))?;
                 updates_received += 1;
             }
-            SyncMessage::SyncComplete(complete) => {
-                // Peer completed — send our completion
-                let our_complete = SyncMessage::SyncComplete(proto::SyncComplete {
-                    version_bytes: engine.version_vector(),
-                });
-                send_sync_msg(stream, &our_complete).await.map_err(map_err)?;
+            SyncMessage::SyncComplete(_) => {
+                // Peer acknowledged completion; we already sent ours.
                 break;
             }
             SyncMessage::Error(e) => {
@@ -2022,7 +2045,7 @@ async fn handle_incoming_streams_v3(
     ).await;
 
     if let Err(e) = result {
-        warn!("Incoming sync from {} failed: {:?}", &peer_id[..16.min(peer_id.len())], e);
+        warn!("Incoming sync from {} failed: {:?}", short(&peer_id, 16), e);
     }
 }
 
@@ -2058,7 +2081,38 @@ async fn handle_incoming_streams_v3_inner(
 
     info!("Acceptor: received VersionInfo from {} (v{}, nonce={})",
         peer_info.hostname, peer_info.protocol_version,
-        peer_info.pairing_nonce.as_deref().map(|n| &n[..16.min(n.len())]).unwrap_or("none"));
+        peer_info.pairing_nonce.as_deref().map(|n| short(n, 16)).unwrap_or("none"));
+
+    // Validate basic handshake invariants (vault id, protocol version) BEFORE
+    // consuming any one-time pairing nonce. Otherwise a peer presenting a valid
+    // nonce but a mismatched vault/version could burn the legitimate pairing
+    // nonce (and get inserted into known_peers) before being rejected.
+    let local_vault_id = {
+        let store_guard = store.read().await;
+        let id = *store_guard.as_ref()
+            .ok_or_else(|| JsValue::from_str("Store not initialized"))?
+            .vault_id();
+        drop(store_guard);
+        id
+    };
+    {
+        if peer_info.vault_id != local_vault_id {
+            let err = SyncMessage::Error(proto::SyncError {
+                code: proto::error_codes::VAULT_MISMATCH,
+                message: "Vault ID mismatch".into(),
+            });
+            let _ = send_sync_msg(&mut stream, &err).await;
+            return Err(JsValue::from_str("Vault ID mismatch"));
+        }
+    }
+    if peer_info.protocol_version < 2 {
+        let err = SyncMessage::Error(proto::SyncError {
+            code: proto::error_codes::VERSION_MISMATCH,
+            message: "Protocol version too old".into(),
+        });
+        let _ = send_sync_msg(&mut stream, &err).await;
+        return Err(JsValue::from_str("Protocol version too old"));
+    }
 
     // Validate pairing (take snapshots to avoid holding locks)
     let known_snap: std::collections::HashMap<String, u64> = known_peers.read().await.clone();
@@ -2072,7 +2126,7 @@ async fn handle_incoming_streams_v3_inner(
     ) {
         Ok(v) => v,
         Err(reason) => {
-            warn!("Pairing rejected for {}: {}", &peer_id[..16.min(peer_id.len())], reason);
+            warn!("Pairing rejected for {}: {}", short(&peer_id, 16), reason);
             let err = SyncMessage::Error(proto::SyncError {
                 code: proto::error_codes::PAIRING_REJECTED,
                 message: reason,
@@ -2122,20 +2176,20 @@ async fn handle_incoming_streams_v3_inner(
         // store_guard dropped here
     };
     let host = Arc::new(crate::host::mock::MockHost::new());
-    let engine = SyncEngine::new_with_key(host, vault_key)
+    let mut engine = SyncEngine::new_with_key(host, vault_key)
         .map_err(|e| JsValue::from_str(&format!("SyncEngine failed: {}", e)))?;
+    // Carry the real vault id into the temporary sync engine. new_with_key starts
+    // at all-zeros and import_snapshot_raw does not restore the id, so without this
+    // the VERSION_INFO we send would advertise a zero vault id and peers could not
+    // validate it. init_vault must run before import so the imported data lands in
+    // the correctly-identified store.
+    engine.init_vault(local_vault_id);
     engine.import_snapshot_raw(&snapshot)
         .map_err(|e| JsValue::from_str(&format!("Import snapshot failed: {}", e)))?;
 
-    // Validate vault ID
-    if peer_info.vault_id != *engine.vault_id() {
-        let err = SyncMessage::Error(proto::SyncError {
-            code: proto::error_codes::VAULT_MISMATCH,
-            message: "Vault ID mismatch".into(),
-        });
-        let _ = send_sync_msg(&mut stream, &err).await;
-        return Err(JsValue::from_str("Vault ID mismatch"));
-    }
+    // Vault ID + protocol version were already validated above, before any
+    // pairing nonce was consumed. The store snapshot used to build `engine`
+    // shares the local vault id, so no re-check is needed here.
 
     // Send our VERSION_INFO (acceptor sends after receiving)
     let our_info = proto::VersionInfo {
@@ -2464,10 +2518,18 @@ async fn run_gossip_debounce(
         // Encrypt
         let enc_key_guard = encryption_key.read().await;
         let encrypted = match enc_key_guard.as_ref() {
-            Some(key) => key.encrypt(&delta).unwrap_or(delta),
-            None => delta,
+            Some(key) => key.encrypt(&delta),
+            None => Ok(delta),
         };
         drop(enc_key_guard);
+        // Never broadcast plaintext on an encryption failure — skip this delta.
+        let encrypted = match encrypted {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!("Gossip: encryption failed, skipping broadcast: {}", e);
+                continue;
+            }
+        };
 
         // Broadcast (or emit sync_needed if too large)
         match gb.broadcast_delta(&encrypted).await {
@@ -2529,7 +2591,7 @@ async fn run_accept_loop(
         match iroh.accept().await {
             Ok(connection) => {
                 let peer_id = connection.peer_id().to_string();
-                info!("Accept loop: accepted connection from {}", &peer_id[..16.min(peer_id.len())]);
+                info!("Accept loop: accepted connection from {}", short(&peer_id, 16));
 
                 // Store the connection
                 connections.write().await.insert(peer_id.clone(), connection);
@@ -2609,6 +2671,8 @@ struct CloudConfigJs {
     access_key_id: String,
     secret_access_key: String,
     path_prefix: Option<String>,
+    #[serde(default)]
+    allow_insecure_http: Option<bool>,
 }
 
 /// Helper to create a vault ID from a string (hashes the input)
@@ -3213,9 +3277,13 @@ impl WasmSyncRunner {
 
         // Create a temporary SyncEngine for this sync
         // Note: In a real implementation, we'd want to share the engine state
+        let real_vault_id = *loro_store.vault_id();
         let host = Arc::new(crate::host::mock::MockHost::new());
-        let sync_engine = SyncEngine::new_with_key(host, vault_key)
+        let mut sync_engine = SyncEngine::new_with_key(host, vault_key)
             .map_err(|e| JsValue::from_str(&format!("Failed to create sync engine: {}", e)))?;
+        // Carry the real vault id (new_with_key starts at all-zeros and import does
+        // not restore it) so the handshake advertises/validates the actual vault.
+        sync_engine.init_vault(real_vault_id);
 
         // Import the current store state
         let snapshot = loro_store.export_snapshot()
@@ -3305,9 +3373,13 @@ impl WasmSyncRunner {
         let vault_key = key_guard.clone()
             .ok_or_else(|| JsValue::from_str("Encryption key not set"))?;
 
+        let real_vault_id = *loro_store.vault_id();
         let host = Arc::new(crate::host::mock::MockHost::new());
-        let sync_engine = SyncEngine::new_with_key(host, vault_key)
+        let mut sync_engine = SyncEngine::new_with_key(host, vault_key)
             .map_err(|e| JsValue::from_str(&format!("Failed to create sync engine: {}", e)))?;
+        // Carry the real vault id (new_with_key starts at all-zeros and import does
+        // not restore it) so the handshake advertises/validates the actual vault.
+        sync_engine.init_vault(real_vault_id);
 
         let snapshot = loro_store.export_snapshot()
             .map_err(|e| JsValue::from_str(&format!("Failed to export snapshot: {}", e)))?;

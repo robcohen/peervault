@@ -638,7 +638,21 @@ pub mod mock {
         }
 
         fn random_bytes(&self, len: usize) -> Vec<u8> {
-            vec![0u8; len] // Deterministic for testing
+            // In WASM this type is used as the production host, so it MUST return
+            // cryptographically secure randomness (rand pulls entropy from the
+            // browser crypto API via getrandom's `js` backend). Native test builds
+            // keep deterministic zeros so test vectors stay reproducible.
+            #[cfg(feature = "wasm")]
+            {
+                use rand::RngCore;
+                let mut bytes = vec![0u8; len];
+                rand::thread_rng().fill_bytes(&mut bytes);
+                bytes
+            }
+            #[cfg(not(feature = "wasm"))]
+            {
+                vec![0u8; len] // Deterministic for testing
+            }
         }
     }
 }

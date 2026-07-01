@@ -71,3 +71,7 @@ peervault-*.tar.gz
 
 # Local relay server
 .relay/
+
+# Local MinIO dev server (just minio-start)
+.minio/
+.local/

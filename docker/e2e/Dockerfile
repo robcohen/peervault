@@ -1,7 +1,8 @@
 # Dockerfile for running Obsidian E2E tests
 # Uses Xvfb for headless display and socat for CDP port forwarding
 
-FROM debian:bookworm-slim
+# Fully-qualified image name so this builds under podman (no unqualified-search-registries).
+FROM docker.io/library/debian:bookworm-slim
 
 ARG OBSIDIAN_VERSION=1.7.7
 ARG DEBIAN_FRONTEND=noninteractive

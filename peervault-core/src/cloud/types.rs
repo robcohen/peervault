@@ -3,7 +3,10 @@
 use serde::{Deserialize, Serialize};
 
 /// S3-compatible storage configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is implemented by hand to avoid leaking the secret access key into
+/// logs or error messages.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CloudConfig {
     /// S3 endpoint URL (e.g., "https://s3.amazonaws.com" or "https://minio.example.com")
     pub endpoint: String,
@@ -17,6 +20,29 @@ pub struct CloudConfig {
     pub secret_access_key: String,
     /// Path prefix within bucket (e.g., "backups/vault1")
     pub path_prefix: String,
+    /// Permit plaintext `http://` endpoints to a non-loopback host.
+    ///
+    /// Secure by default (`false`): only `https://` — or an `http://` loopback
+    /// endpoint for local dev — is accepted. Set this to opt into plaintext http
+    /// for a trusted private network (e.g. a docker `minio:9000` service or a LAN
+    /// MinIO). Vault deltas are app-encrypted regardless, but http still exposes
+    /// object keys/sizes and is vulnerable to request tampering in transit.
+    #[serde(default)]
+    pub allow_insecure_http: bool,
+}
+
+impl std::fmt::Debug for CloudConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloudConfig")
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("access_key_id", &"[REDACTED]")
+            .field("secret_access_key", &"[REDACTED]")
+            .field("path_prefix", &self.path_prefix)
+            .field("allow_insecure_http", &self.allow_insecure_http)
+            .finish()
+    }
 }
 
 impl CloudConfig {
@@ -35,12 +61,20 @@ impl CloudConfig {
             access_key_id: access_key_id.into(),
             secret_access_key: secret_access_key.into(),
             path_prefix: String::new(),
+            allow_insecure_http: false,
         }
     }
 
     /// Set path prefix
     pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.path_prefix = prefix.into();
+        self
+    }
+
+    /// Opt into plaintext `http://` endpoints to a non-loopback host (see the
+    /// `allow_insecure_http` field). Secure (https-only) by default.
+    pub fn with_insecure_http(mut self, allow: bool) -> Self {
+        self.allow_insecure_http = allow;
         self
     }
 

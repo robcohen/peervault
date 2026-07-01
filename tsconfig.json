@@ -8,10 +8,6 @@
     "noEmit": true,
     "outDir": "dist",
     "rootDir": "src",
-    "baseUrl": ".",
-    "paths": {
-      "@/*": ["src/*"]
-    },
     "strict": true,
     "strictNullChecks": true,
     "noImplicitAny": true,

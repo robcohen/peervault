@@ -297,16 +297,25 @@ export async function createScaledContext(): Promise<ScaledTestContext> {
           clients.map(async (c) => {
             try {
               return await c.client.evaluate<{ version: string; files: string[] } | null>(`
-                (function() {
-                  const plugin = window.app?.plugins?.plugins?.["peervault"];
-                  const dm = plugin?.documentManager;
-                  if (!dm) return null;
-                  const version = dm.doc?.version?.();
-                  const files = dm.doc?.getMap("files")?.keys() || [];
-                  return {
-                    version: version ? JSON.stringify(version) : null,
-                    files: Array.from(files).sort()
-                  };
+                (async function() {
+                  // The WASM-based plugin exposes state via plugin.client (there is
+                  // no documentManager). Build a convergence fingerprint from the
+                  // synced file set plus a per-file content checksum, so we detect
+                  // both file-list AND content convergence across peers.
+                  const client = window.app?.plugins?.plugins?.["peervault"]?.client;
+                  if (!client?.listFiles) return null;
+                  const files = (await client.listFiles())
+                    .filter((p) => !p.startsWith("_"))
+                    .sort();
+                  let fp = "";
+                  for (const p of files) {
+                    const c = await client.getFile(p);
+                    const len = c ? c.length : 0;
+                    let sum = 0;
+                    if (c) for (let i = 0; i < len; i++) sum = (sum * 31 + c[i]) >>> 0;
+                    fp += p + ":" + len + ":" + sum + ";";
+                  }
+                  return { version: fp || "empty", files };
                 })()
               `);
             } catch {
@@ -376,19 +385,44 @@ export async function createScaledContext(): Promise<ScaledTestContext> {
     ): Promise<void> {
       console.log(`Pairing ${client1.name} with ${client2.name}...`);
 
-      // Clear client2's encryption key so it adopts client1's key
-      // This ensures both vaults use the same encryption key
-      try {
-        await client2.state.clearEncryptionKey();
-      } catch (e) {
-        console.log(`  Warning: clearEncryptionKey failed: ${e}`);
-      }
-      await delay(500); // Allow state to settle
-
-      // Get pairing ticket from client1 (includes encryption key)
+      // Get pairing ticket from client1 (includes vault id, encryption key, nonce)
       const ticket1 = await client1.plugin.getPairingTicket();
+      const vaultId1 = (() => {
+        try {
+          return JSON.parse(atob(ticket1)).v as string | undefined;
+        } catch {
+          return undefined;
+        }
+      })();
 
-      // client2 adds client1 as peer (adopts client1's encryption key)
+      // client2 adopts client1's vault id, mirroring the product's promptAddPeer
+      // adopt-and-reload flow. Two independently-created vaults have different
+      // random vault ids; the WASM acceptor rejects connections whose vault id
+      // doesn't match, so both peers must share one id (and thus one gossip topic)
+      // before pairing. The id is baked into the WASM vault at construction, so we
+      // persist it in settings and reload the plugin to pick it up.
+      if (vaultId1) {
+        await client2.client.evaluate(`
+          (async function() {
+            const plugin = window.app?.plugins?.plugins?.["peervault"];
+            if (plugin) {
+              plugin.settings.vaultId = ${JSON.stringify(vaultId1)};
+              await plugin.saveSettings();
+            }
+            // Different test vaults: skip the TS-side vault-id guard defensively.
+            window.E2E_SKIP_VAULT_ID_CHECK = true;
+          })()
+        `);
+        try {
+          await client2.state.reloadPlugin();
+          await client2.plugin.waitForReady(15000);
+        } catch (e) {
+          console.log(`  Warning: vault-id adopt/reload failed: ${e}`);
+        }
+        await delay(500); // Allow state to settle after reload
+      }
+
+      // client2 adds client1 as peer (adopts client1's encryption key from ticket)
       try {
         await client2.plugin.addPeer(ticket1, client1.name);
         console.log(`  ${client2.name} -> ${client1.name}: OK`);

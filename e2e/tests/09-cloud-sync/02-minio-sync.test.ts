@@ -25,6 +25,9 @@ const MINIO_CONFIG = {
   accessKeyId: "minioadmin",
   secretAccessKey: "minioadmin",
   region: "us-east-1",
+  // MinIO here is plaintext http on a trusted (loopback/docker) network. Opt into
+  // insecure http so the non-loopback `minio:9000` container endpoint is accepted.
+  allowInsecureHttp: true,
 };
 
 // Shared vault key for encryption (derived from passphrase)
