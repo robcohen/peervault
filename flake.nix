@@ -35,7 +35,7 @@
 
             # TypeScript tooling
             typescript
-            nodePackages.typescript-language-server
+            typescript-language-server
 
             # Rust (for potential Iroh/WASM compilation)
             rustToolchain

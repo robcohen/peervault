@@ -1,7 +1,7 @@
 # Build stage: compile iroh-relay from source
 # Using latest Rust as iroh-relay requires Rust 1.89+
 # Fully-qualified image name so this builds under podman (no unqualified-search-registries).
-FROM docker.io/library/rust:latest AS builder
+FROM docker.io/library/rust:1-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \

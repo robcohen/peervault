@@ -38,10 +38,11 @@ impl CloudEncryption {
     pub fn encrypt(&self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, EncryptionError> {
         let mut nonce_bytes = [0u8; NONCE_SIZE];
         rand::rng().fill_bytes(&mut nonce_bytes);
-        let nonce = XNonce::from_slice(&nonce_bytes);
+        let nonce = XNonce::try_from(&nonce_bytes[..])
+            .map_err(|_| EncryptionError::EncryptionFailed)?;
 
         let ciphertext = self.cipher
-            .encrypt(nonce, Payload { msg: plaintext, aad })
+            .encrypt(&nonce, Payload { msg: plaintext, aad })
             .map_err(|_| EncryptionError::EncryptionFailed)?;
 
         // Prepend nonce to ciphertext
@@ -60,10 +61,11 @@ impl CloudEncryption {
         }
 
         let (nonce_bytes, ciphertext) = data.split_at(NONCE_SIZE);
-        let nonce = XNonce::from_slice(nonce_bytes);
+        let nonce = XNonce::try_from(nonce_bytes)
+            .map_err(|_| EncryptionError::InvalidCiphertext)?;
 
         self.cipher
-            .decrypt(nonce, Payload { msg: ciphertext, aad })
+            .decrypt(&nonce, Payload { msg: ciphertext, aad })
             .map_err(|_| EncryptionError::DecryptionFailed)
     }
 

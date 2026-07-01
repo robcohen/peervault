@@ -146,11 +146,12 @@ impl VaultKey {
         // Generate random nonce
         let mut nonce_bytes = [0u8; NONCE_SIZE];
         rand::rng().fill_bytes(&mut nonce_bytes);
-        let nonce = XNonce::from_slice(&nonce_bytes);
+        let nonce = XNonce::try_from(&nonce_bytes[..])
+            .map_err(|e| CryptoError::Encryption(e.to_string()))?;
 
         // Encrypt
         let ciphertext = cipher
-            .encrypt(nonce, plaintext)
+            .encrypt(&nonce, plaintext)
             .map_err(|e| CryptoError::Encryption(e.to_string()))?;
 
         // Prepend nonce to ciphertext
@@ -177,12 +178,13 @@ impl VaultKey {
             .map_err(|e| CryptoError::Decryption(e.to_string()))?;
 
         // Extract nonce and ciphertext
-        let nonce = XNonce::from_slice(&ciphertext[..NONCE_SIZE]);
+        let nonce = XNonce::try_from(&ciphertext[..NONCE_SIZE])
+            .map_err(|e| CryptoError::Decryption(e.to_string()))?;
         let encrypted = &ciphertext[NONCE_SIZE..];
 
         // Decrypt
         cipher
-            .decrypt(nonce, encrypted)
+            .decrypt(&nonce, encrypted)
             .map_err(|_| CryptoError::Decryption("Decryption failed - wrong key or tampered data".into()))
     }
 
