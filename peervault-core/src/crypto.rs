@@ -8,7 +8,7 @@
 //! ```text
 //! User Passphrase (optional)
 //!       |
-//!       v (HKDF)
+//!       v (Argon2id, memory-hard)
 //! Vault Master Key (32 bytes)
 //!       |
 //!       +---> Content Encryption Key (derived per-document)
@@ -29,9 +29,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
     XChaCha20Poly1305, XNonce,
 };
-use hkdf::Hkdf;
-use sha2::Sha256;
-use rand::RngCore;
+use rand::Rng;
 
 /// Size of the vault master key in bytes
 pub const KEY_SIZE: usize = 32;
@@ -91,21 +89,26 @@ impl VaultKey {
     /// Generate a new random vault key
     pub fn generate() -> Self {
         let mut key = [0u8; KEY_SIZE];
-        rand::thread_rng().fill_bytes(&mut key);
+        rand::rng().fill_bytes(&mut key);
         Self { key }
     }
 
-    /// Derive a vault key from a passphrase
+    /// Derive a vault key from a passphrase.
     ///
-    /// Uses HKDF with the vault ID as salt for domain separation.
+    /// Uses Argon2id (memory-hard) with the vault ID as the salt. HKDF (the previous
+    /// KDF) is fast and lets an attacker who obtains any ciphertext brute-force a
+    /// low-entropy passphrase at billions/sec; Argon2id makes that far more expensive.
+    ///
+    /// The vault ID is used as a deterministic salt so both devices derive the same
+    /// key from the same passphrase without having to store/exchange a random salt.
     pub fn from_passphrase(passphrase: &str, vault_id: &[u8; 32]) -> CryptoResult<Self> {
         if passphrase.is_empty() {
             return Err(CryptoError::InvalidInput("Passphrase cannot be empty".into()));
         }
 
-        let hk = Hkdf::<Sha256>::new(Some(vault_id), passphrase.as_bytes());
         let mut key = [0u8; KEY_SIZE];
-        hk.expand(b"peervault-vault-key", &mut key)
+        argon2::Argon2::default()
+            .hash_password_into(passphrase.as_bytes(), vault_id, &mut key)
             .map_err(|e| CryptoError::KeyDerivation(e.to_string()))?;
 
         Ok(Self { key })
@@ -142,7 +145,7 @@ impl VaultKey {
 
         // Generate random nonce
         let mut nonce_bytes = [0u8; NONCE_SIZE];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        rand::rng().fill_bytes(&mut nonce_bytes);
         let nonce = XNonce::from_slice(&nonce_bytes);
 
         // Encrypt
@@ -222,8 +225,10 @@ impl std::fmt::Debug for VaultKey {
 
 impl Drop for VaultKey {
     fn drop(&mut self) {
-        // Zero out key material on drop
-        self.key.fill(0);
+        // Securely wipe key material on drop. `zeroize` uses volatile writes + a
+        // compiler fence so the zeroing can't be optimized away (unlike `fill(0)`).
+        use zeroize::Zeroize;
+        self.key.zeroize();
     }
 }
 

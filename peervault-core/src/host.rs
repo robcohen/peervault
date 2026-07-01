@@ -644,9 +644,9 @@ pub mod mock {
             // keep deterministic zeros so test vectors stay reproducible.
             #[cfg(feature = "wasm")]
             {
-                use rand::RngCore;
+                use rand::Rng;
                 let mut bytes = vec![0u8; len];
-                rand::thread_rng().fill_bytes(&mut bytes);
+                rand::rng().fill_bytes(&mut bytes);
                 bytes
             }
             #[cfg(not(feature = "wasm"))]

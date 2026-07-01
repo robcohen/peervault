@@ -14,7 +14,7 @@ wasm-opt = false
 
 [features]
 default = ["native"]
-native = ["tokio/rt-multi-thread", "reqwest/rustls-tls"]
+native = ["tokio/rt-multi-thread", "reqwest/rustls"]
 test-utils = []  # Exposes MockHost for integration tests
 # Note: In WASM, reqwest uses browser fetch API automatically
 # WASM target for browser/JS embedding
@@ -38,37 +38,39 @@ tokio = { version = "1", default-features = false, features = ["sync"] }
 
 # Iroh networking (P2P transport)
 # Use default-features = false for WASM compatibility
-iroh = { version = "0.95", default-features = false }
-iroh-tickets = { version = "0.2", default-features = false }
-iroh-blobs = { version = "0.97", default-features = false }
-iroh-gossip = { version = "0.95", default-features = false, features = ["net"] }
+# tls-ring gives the ring crypto provider needed by the endpoint presets, without
+# the native-code default features (portmapper/fast-apple-datapath) that break WASM.
+iroh = { version = "1.0", default-features = false, features = ["tls-ring"] }
+iroh-tickets = { version = "1.0", default-features = false }
+iroh-blobs = { version = "0.103", default-features = false }
+iroh-gossip = { version = "0.101", default-features = false, features = ["net"] }
 
 # Loro CRDT - high-performance collaborative data structures
 loro = "1.10"
 
 # Crypto
 chacha20poly1305 = "0.10"
-xsalsa20poly1305 = "0.9"   # NaCl secretbox compatible
 sha2 = "0.10"
 hmac = "0.12"  # For AWS Signature V4
 hkdf = "0.12"
-rand = "0.9"
+argon2 = "0.5"  # Memory-hard passphrase KDF
+zeroize = { version = "1", features = ["derive"] }  # Wipe key material on drop
+rand = "0.10"
 
 # ECIES for key exchange (replaces manual x25519 + HKDF + encrypt)
 # Uses x25519 curve with XChaCha20-Poly1305, pure Rust for WASM
 ecies = { version = "0.2", default-features = false, features = ["x25519", "xchacha20"] }
 
 # HTTP client (for S3) - works in both native and WASM
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# NOTE: kept at 1.x deliberately. bincode 2/3 change the default wire encoding and
-# restructured serde support (3.0 dropped the `serde` feature). Upgrading touches the
-# V3 sync wire format and must be done with a cross-version compatibility test under
-# the Docker e2e, not as a blind bump.
-bincode = "1"
+# bincode 2.x. All encode/decode goes through crate::wire using config::legacy(),
+# which is byte-compatible with bincode 1.x, so the sync wire format is unchanged.
+# (3.0 dropped the `serde` feature, so we stay on 2.x for serde-derived types.)
+bincode = { version = "2", features = ["serde"] }
 
 # Hex encoding
 hex = "0.4"
@@ -92,8 +94,9 @@ anyhow = "1"
 # Logging
 tracing = "0.1"
 
-# WASM bindings (optional) - pin exact version to match iroh-examples
-wasm-bindgen = { version = "=0.2.105", optional = true }
+# WASM bindings (optional). Must match the wasm-bindgen-cli used by `just wasm`
+# (wasm-pack fetches the matching CLI). Bumped for iroh 1.0 (needs js-sys 0.3.83+).
+wasm-bindgen = { version = "0.2.108", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 js-sys = { version = "0.3", optional = true }
 web-sys = { version = "0.3", optional = true, features = [

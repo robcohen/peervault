@@ -111,6 +111,10 @@ pub struct CloudSync {
     /// Snapshot version we have already downloaded and imported this session,
     /// so we don't re-download the (potentially large) snapshot every sync.
     applied_snapshot_version: Option<String>,
+    /// Delta object keys already downloaded + imported this session, so we don't
+    /// re-fetch/re-decrypt/re-import every delta on every sync. Reset on compaction
+    /// (which deletes the deltas). Session-scoped only (not persisted).
+    applied_deltas: std::collections::HashSet<String>,
 }
 
 impl CloudSync {
@@ -127,6 +131,7 @@ impl CloudSync {
             encryption,
             state: CloudSyncState::default(),
             applied_snapshot_version: None,
+            applied_deltas: std::collections::HashSet::new(),
         })
     }
 
@@ -233,7 +238,7 @@ impl CloudSync {
         }
 
         // Encrypt and upload
-        let encrypted = self.encryption.encrypt(data)
+        let encrypted = self.encryption.encrypt(data, key.as_bytes())
             .map_err(|e| CloudSyncError::Encryption(e.to_string()))?;
 
         self.with_retry(|| async {
@@ -261,7 +266,7 @@ impl CloudSync {
             self.s3.get_object(&key).await
         }).await?;
 
-        let decrypted = self.encryption.decrypt(&encrypted)
+        let decrypted = self.encryption.decrypt(&encrypted, key.as_bytes())
             .map_err(|e| CloudSyncError::Encryption(e.to_string()))?;
 
         // Verify hash
@@ -328,7 +333,7 @@ impl CloudSync {
         self.state.phase = SyncPhase::Downloading;
         match self.s3.get_object("state.enc").await {
             Ok(encrypted) => {
-                let snapshot = self.encryption.decrypt(&encrypted)
+                let snapshot = self.encryption.decrypt(&encrypted, b"state.enc")
                     .map_err(|e| CloudSyncError::Encryption(e.to_string()))?;
                 // Loro's import auto-detects snapshot vs update payloads.
                 engine.import_updates(&snapshot)?;
@@ -358,8 +363,16 @@ impl CloudSync {
         self.state.pending_downloads = objects.len();
 
         for obj in objects {
-            // CRDT import is idempotent, so re-applying an already-seen delta is
-            // harmless; we re-import every listed delta each sync.
+            // Every listed delta is present and (once imported) part of the snapshot,
+            // so it must be tracked for compaction regardless of whether we download it.
+            imported_keys.push(obj.key.clone());
+            self.state.pending_downloads = self.state.pending_downloads.saturating_sub(1);
+
+            // Skip deltas we already downloaded + imported this session — avoids
+            // re-fetching and re-decrypting the whole delta set on every sync.
+            if self.applied_deltas.contains(&obj.key) {
+                continue;
+            }
 
             let encrypted = self.with_retry(|| async {
                 // obj.key already includes the "deltas/" sub-prefix (list_objects
@@ -367,7 +380,7 @@ impl CloudSync {
                 self.s3.get_object(&obj.key).await
             }).await?;
 
-            let delta_data = self.encryption.decrypt(&encrypted)
+            let delta_data = self.encryption.decrypt(&encrypted, obj.key.as_bytes())
                 .map_err(|e| CloudSyncError::Encryption(e.to_string()))?;
 
             // Import delta into sync engine
@@ -375,8 +388,7 @@ impl CloudSync {
 
             stats.count += 1;
             stats.bytes += encrypted.len() as u64;
-            imported_keys.push(obj.key.clone());
-            self.state.pending_downloads = self.state.pending_downloads.saturating_sub(1);
+            self.applied_deltas.insert(obj.key.clone());
 
             debug!("Applied delta {} ({} bytes)", obj.key, delta_data.len());
         }
@@ -400,12 +412,11 @@ impl CloudSync {
             return Ok(stats);
         }
 
-        // Generate delta ID and encrypt
+        // Generate delta ID and encrypt (bind the object key as AAD).
         let delta_id = DeltaInfo::generate_id(&delta_data);
-        let encrypted = self.encryption.encrypt(&delta_data)
-            .map_err(|e| CloudSyncError::Encryption(e.to_string()))?;
-
         let key = format!("deltas/{}.enc", delta_id);
+        let encrypted = self.encryption.encrypt(&delta_data, key.as_bytes())
+            .map_err(|e| CloudSyncError::Encryption(e.to_string()))?;
 
         self.with_retry(|| async {
             self.s3.put_object(&key, encrypted.clone(), Some("application/octet-stream")).await
@@ -433,7 +444,7 @@ impl CloudSync {
 
         // Export full snapshot BEFORE deleting anything.
         let snapshot = engine.export_snapshot()?;
-        let encrypted = self.encryption.encrypt(&snapshot)
+        let encrypted = self.encryption.encrypt(&snapshot, b"state.enc")
             .map_err(|e| CloudSyncError::Encryption(e.to_string()))?;
 
         // Upload snapshot first — only delete deltas once the snapshot is durable.
@@ -453,6 +464,7 @@ impl CloudSync {
         for key in imported_keys {
             // key already includes the "deltas/" sub-prefix.
             let _ = self.s3.delete_object(key).await;
+            self.applied_deltas.remove(key);
         }
 
         info!("Compaction complete ({} bytes)", snapshot.len());
@@ -467,7 +479,7 @@ impl CloudSync {
         // would discard every prior entry).
         let mut index: Vec<BlobInfo> = match self.s3.get_object("blob-index.json").await {
             Ok(encrypted) => {
-                let data = self.encryption.decrypt(&encrypted)
+                let data = self.encryption.decrypt(&encrypted, b"blob-index.json")
                     .map_err(|e| CloudSyncError::Encryption(e.to_string()))?;
                 serde_json::from_slice(&data)
                     .map_err(|e| CloudSyncError::Corruption(format!("Invalid blob-index.json: {}", e)))?
@@ -482,7 +494,7 @@ impl CloudSync {
 
             let data = serde_json::to_vec(&index)
                 .map_err(|e| CloudSyncError::Corruption(format!("Serialize blob index: {}", e)))?;
-            let encrypted = self.encryption.encrypt(&data)
+            let encrypted = self.encryption.encrypt(&data, b"blob-index.json")
                 .map_err(|e| CloudSyncError::Encryption(e.to_string()))?;
 
             self.s3.put_object("blob-index.json", encrypted, Some("application/octet-stream")).await

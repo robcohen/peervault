@@ -113,6 +113,28 @@ interface WasmModule {
 
 const DATA_DIR = ".obsidian/plugins/peervault/data";
 
+// On-disk format markers for the persisted vault key (first byte).
+// Legacy keys have no marker (raw ASCII hex, first byte 0x30-0x66), which is
+// distinguishable from these markers.
+const KEY_FMT_PLAINTEXT = 0x00;
+const KEY_FMT_SAFE_STORAGE = 0x01;
+
+/**
+ * Electron safeStorage (OS keychain-backed), if reachable from this context.
+ * Returns null on mobile or when the API isn't exposed to the renderer, in which
+ * case the vault key falls back to plaintext-at-rest (the prior behaviour).
+ */
+function getSafeStorage(): any | null {
+  try {
+    const req = (window as any).require ?? (globalThis as any).require;
+    const electron = req?.("electron");
+    const ss = electron?.safeStorage ?? electron?.remote?.safeStorage;
+    return ss && typeof ss.isEncryptionAvailable === "function" ? ss : null;
+  } catch {
+    return null;
+  }
+}
+
 class Storage {
   constructor(private app: App) {}
 
@@ -254,20 +276,20 @@ export class PeerVaultClient {
   async generateEncryptionKey(): Promise<string> {
     if (!this.vault) throw new Error("Not initialized");
     const keyHex = await this.vault.generateEncryptionKey();
-    await this.storage.set("encryption-key", new TextEncoder().encode(keyHex));
+    await this.persistEncryptionKey(keyHex);
     return keyHex;
   }
 
   async setEncryptionKey(keyHex: string): Promise<void> {
     if (!this.vault) throw new Error("Not initialized");
     await this.vault.setEncryptionKey(keyHex);
-    await this.storage.set("encryption-key", new TextEncoder().encode(keyHex));
+    await this.persistEncryptionKey(keyHex);
   }
 
   async deriveEncryptionKey(passphrase: string): Promise<string> {
     if (!this.vault) throw new Error("Not initialized");
     const keyHex = await this.vault.deriveEncryptionKey(passphrase);
-    await this.storage.set("encryption-key", new TextEncoder().encode(keyHex));
+    await this.persistEncryptionKey(keyHex);
     return keyHex;
   }
 
@@ -282,10 +304,47 @@ export class PeerVaultClient {
     await this.storage.delete("encryption-key");
   }
 
-  private async loadEncryptionKey(): Promise<void> {
+  /** Persist the vault key, encrypted via the OS keychain (safeStorage) when available. */
+  private async persistEncryptionKey(keyHex: string): Promise<void> {
+    const ss = getSafeStorage();
+    if (ss?.isEncryptionAvailable()) {
+      const enc: Uint8Array = ss.encryptString(keyHex);
+      const out = new Uint8Array(enc.length + 1);
+      out[0] = KEY_FMT_SAFE_STORAGE;
+      out.set(enc, 1);
+      await this.storage.set("encryption-key", out);
+    } else {
+      // Fallback (mobile / safeStorage not reachable): plaintext hex, as before.
+      const hex = new TextEncoder().encode(keyHex);
+      const out = new Uint8Array(hex.length + 1);
+      out[0] = KEY_FMT_PLAINTEXT;
+      out.set(hex, 1);
+      await this.storage.set("encryption-key", out);
+    }
+  }
+
+  /** Read the persisted vault key, handling safeStorage / plaintext / legacy formats. */
+  private async readEncryptionKeyHex(): Promise<string | null> {
     const data = await this.storage.get("encryption-key");
-    if (data && this.vault) {
-      const keyHex = new TextDecoder().decode(data);
+    if (!data || data.length === 0) return null;
+    switch (data[0]) {
+      case KEY_FMT_SAFE_STORAGE: {
+        const ss = getSafeStorage();
+        if (!ss) throw new Error("Vault key was sealed with the OS keychain, but safeStorage is unavailable here");
+        const Buf = (globalThis as any).Buffer;
+        return ss.decryptString(Buf ? Buf.from(data.slice(1)) : data.slice(1));
+      }
+      case KEY_FMT_PLAINTEXT:
+        return new TextDecoder().decode(data.slice(1));
+      default:
+        // Legacy: raw ASCII hex with no marker byte.
+        return new TextDecoder().decode(data);
+    }
+  }
+
+  private async loadEncryptionKey(): Promise<void> {
+    const keyHex = await this.readEncryptionKeyHex();
+    if (keyHex && this.vault) {
       await this.vault.setEncryptionKey(keyHex);
     }
   }

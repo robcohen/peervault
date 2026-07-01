@@ -36,6 +36,7 @@
 pub mod host;
 pub mod transport;
 pub mod protocol;
+pub mod wire;
 pub mod sync;
 pub mod session;
 pub mod runner;

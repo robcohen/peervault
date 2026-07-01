@@ -223,7 +223,7 @@ pub mod sync {
                 Message::BlobSyncComplete(_) => MessageType::BlobSyncComplete as u8,
             };
 
-            let payload = bincode::serialize(self)
+            let payload = crate::wire::encode(self)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
             let mut result = Vec::with_capacity(1 + payload.len());
@@ -237,7 +237,7 @@ pub mod sync {
                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "empty message"));
             }
 
-            bincode::deserialize(&data[1..])
+            crate::wire::decode(&data[1..])
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
         }
 
@@ -346,7 +346,7 @@ pub mod keys {
                 Message::Error(_) => MessageType::Error as u8,
             };
 
-            let payload = bincode::serialize(self)
+            let payload = crate::wire::encode(self)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
             let mut result = Vec::with_capacity(1 + payload.len());
@@ -360,7 +360,7 @@ pub mod keys {
                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "empty message"));
             }
 
-            bincode::deserialize(&data[1..])
+            crate::wire::decode(&data[1..])
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
         }
     }

@@ -73,7 +73,7 @@ impl BlobStore {
     pub async fn get_meta(&self, hash: &Hash) -> Option<BlobMeta> {
         let key = format!("{}{}", BLOB_META_PREFIX, Self::hash_to_hex(hash));
         let data = self.host.storage_get(&key).await.ok().flatten()?;
-        bincode::deserialize(&data).ok()
+        crate::wire::decode(&data).ok()
     }
 
     /// Store a blob (verifies hash)
@@ -103,7 +103,7 @@ impl BlobStore {
             stored_at: self.host.now_millis(),
         };
         let meta_key = format!("{}{}", BLOB_META_PREFIX, hex_hash);
-        let meta_bytes = bincode::serialize(&meta)
+        let meta_bytes = crate::wire::encode(&meta)
             .map_err(|e| CoreError::Internal(format!("serialize meta: {}", e)))?;
         self.host.storage_set(&meta_key, &meta_bytes).await
             .map_err(CoreError::from)?;
@@ -143,7 +143,7 @@ impl BlobStore {
             stored_at: self.host.now_millis(),
         };
         let meta_key = format!("{}{}", BLOB_META_PREFIX, hex_hash);
-        let meta_bytes = bincode::serialize(&meta)
+        let meta_bytes = crate::wire::encode(&meta)
             .map_err(|e| CoreError::Internal(format!("serialize meta: {}", e)))?;
         self.host.storage_set(&meta_key, &meta_bytes).await
             .map_err(CoreError::from)?;

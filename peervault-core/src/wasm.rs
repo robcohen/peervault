@@ -16,8 +16,6 @@ use crate::net::{IrohTransport, IrohConnection, IrohStream, Ticket};
 use iroh::SecretKey;
 use crate::store::{LoroStore, DocStore};
 use crate::cloud::{CloudConfig, CloudSync, CloudSyncState, SyncPhase};
-use crate::key_exchange::{KeyExchangeSession, KeyExchangeError};
-use crate::protocol::keys::{Message as KeyMessage, Request as KeyRequest, Response as KeyResponse};
 use crate::sync::SyncEngine;
 use crate::runner::{SyncRunner, RunnerConfig, SyncStream, BlobOps};
 use iroh_blobs::Hash;
@@ -456,14 +454,14 @@ pub struct WasmPeerVault {
     encryption_key: Arc<RwLock<Option<VaultKey>>>,
     /// Cloud sync instance (optional)
     cloud_sync: Arc<RwLock<Option<CloudSync>>>,
-    /// Key exchange session (for receiving vault key during pairing)
-    key_exchange: Arc<RwLock<Option<KeyExchangeSession>>>,
     /// Pending pairing nonces (nonce_hex -> expires_at_ms)
-    /// Used for one-time ticket validation
-    pending_pairings: Arc<RwLock<HashMap<String, u64>>>,
+    /// Used for one-time ticket validation.
+    /// Plain std lock: only ever touched momentarily (never held across .await), so
+    /// this avoids tokio's `blocking_*` which panics if called in an async context.
+    pending_pairings: Arc<std::sync::RwLock<HashMap<String, u64>>>,
     /// Known peer IDs (peer_id -> added_at_ms)
-    /// Peers that have successfully completed pairing
-    known_peers: Arc<RwLock<HashMap<String, u64>>>,
+    /// Peers that have successfully completed pairing. Plain std lock (see above).
+    known_peers: Arc<std::sync::RwLock<HashMap<String, u64>>>,
     /// iroh-blobs bridge for V3 blob transfer
     blobs_bridge: Arc<RwLock<Option<crate::blobs_bridge::BlobsBridge>>>,
     /// iroh-gossip bridge for real-time CRDT delta broadcast
@@ -499,9 +497,8 @@ impl WasmPeerVault {
             on_storage_change: None,
             encryption_key: Arc::new(RwLock::new(None)),
             cloud_sync: Arc::new(RwLock::new(None)),
-            key_exchange: Arc::new(RwLock::new(None)),
-            pending_pairings: Arc::new(RwLock::new(HashMap::new())),
-            known_peers: Arc::new(RwLock::new(HashMap::new())),
+            pending_pairings: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            known_peers: Arc::new(std::sync::RwLock::new(HashMap::new())),
             blobs_bridge: Arc::new(RwLock::new(None)),
             gossip_bridge: Arc::new(RwLock::new(None)),
         })
@@ -642,144 +639,6 @@ impl WasmPeerVault {
     }
 
     // =========================================================================
-    // Key Exchange (P2P Vault Key Sharing)
-    // =========================================================================
-
-    /// Start a key exchange session as the initiator (requesting a key)
-    ///
-    /// Returns a base64-encoded request message to send to the peer.
-    /// Call this when pairing with a peer who has the vault key.
-    #[wasm_bindgen(js_name = startKeyExchangeRequest)]
-    pub fn start_key_exchange_request(&self) -> Promise {
-        let key_exchange = self.key_exchange.clone();
-        let encryption_key = self.encryption_key.clone();
-
-        future_to_promise(async move {
-            // Check if we already have a key
-            let has_key = encryption_key.read().await.is_some();
-
-            // Create new session as initiator
-            let session = KeyExchangeSession::new_initiator();
-            let request = session.create_request(has_key);
-
-            // Encode the request message
-            let encoded = request.encode()
-                .map_err(|e| JsValue::from_str(&format!("Failed to encode request: {}", e)))?;
-
-            // Store the session
-            *key_exchange.write().await = Some(session);
-
-            // Return base64-encoded message
-            use base64::Engine;
-            Ok(JsValue::from_str(&base64::engine::general_purpose::STANDARD.encode(&encoded)))
-        })
-    }
-
-    /// Handle a key exchange response from peer (as initiator)
-    ///
-    /// Takes the base64-encoded response message from peer.
-    /// Extracts and stores the vault key if successful.
-    /// Returns true if the key was received successfully.
-    #[wasm_bindgen(js_name = handleKeyExchangeResponse)]
-    pub fn handle_key_exchange_response(&self, response_b64: &str) -> Promise {
-        let key_exchange = self.key_exchange.clone();
-        let encryption_key = self.encryption_key.clone();
-        let response_b64 = response_b64.to_string();
-
-        future_to_promise(async move {
-            use base64::Engine;
-
-            // Decode the response
-            let response_bytes = base64::engine::general_purpose::STANDARD.decode(&response_b64)
-                .map_err(|e| JsValue::from_str(&format!("Invalid base64: {}", e)))?;
-
-            let message = KeyMessage::decode(&response_bytes)
-                .map_err(|e| JsValue::from_str(&format!("Invalid message: {}", e)))?;
-
-            // Get our session
-            let mut session_guard = key_exchange.write().await;
-            let session = session_guard.as_mut()
-                .ok_or_else(|| JsValue::from_str("No active key exchange session"))?;
-
-            // Handle the response
-            match message {
-                KeyMessage::Response(response) => {
-                    let vault_key = session.handle_response(&response)
-                        .map_err(|e| JsValue::from_str(&format!("Key exchange failed: {}", e)))?;
-
-                    // Store the vault key
-                    *encryption_key.write().await = Some(vault_key);
-
-                    // Clear the session
-                    *session_guard = None;
-
-                    Ok(JsValue::from_str(if response.is_new_key { "new" } else { "existing" }))
-                }
-                KeyMessage::Error(e) => {
-                    Err(JsValue::from_str(&format!("Peer rejected: {}", e.message)))
-                }
-                _ => Err(JsValue::from_str("Unexpected message type")),
-            }
-        })
-    }
-
-    /// Handle a key exchange request from peer (as responder)
-    ///
-    /// Takes the base64-encoded request message from peer.
-    /// Returns a base64-encoded response message to send back.
-    /// Requires that we already have a vault key.
-    #[wasm_bindgen(js_name = handleKeyExchangeRequest)]
-    pub fn handle_key_exchange_request(&self, request_b64: &str) -> Promise {
-        let encryption_key = self.encryption_key.clone();
-        let request_b64 = request_b64.to_string();
-
-        future_to_promise(async move {
-            use base64::Engine;
-
-            // Decode the request
-            let request_bytes = base64::engine::general_purpose::STANDARD.decode(&request_b64)
-                .map_err(|e| JsValue::from_str(&format!("Invalid base64: {}", e)))?;
-
-            let message = KeyMessage::decode(&request_bytes)
-                .map_err(|e| JsValue::from_str(&format!("Invalid message: {}", e)))?;
-
-            // Get our vault key
-            let vault_key = encryption_key.read().await.clone()
-                .ok_or_else(|| JsValue::from_str("No vault key available to share"))?;
-
-            // Handle the request
-            match message {
-                KeyMessage::Request(request) => {
-                    // Create a responder session
-                    let mut session = KeyExchangeSession::new_responder();
-
-                    // Generate response
-                    let response = session.handle_request(&request, Some(&vault_key))
-                        .map_err(|e| JsValue::from_str(&format!("Key exchange failed: {}", e)))?;
-
-                    // Encode the response
-                    let encoded = response.encode()
-                        .map_err(|e| JsValue::from_str(&format!("Failed to encode response: {}", e)))?;
-
-                    Ok(JsValue::from_str(&base64::engine::general_purpose::STANDARD.encode(&encoded)))
-                }
-                _ => Err(JsValue::from_str("Expected key exchange request")),
-            }
-        })
-    }
-
-    /// Cancel an in-progress key exchange session
-    #[wasm_bindgen(js_name = cancelKeyExchange)]
-    pub fn cancel_key_exchange(&self) -> Promise {
-        let key_exchange = self.key_exchange.clone();
-
-        future_to_promise(async move {
-            *key_exchange.write().await = None;
-            Ok(JsValue::TRUE)
-        })
-    }
-
-    // =========================================================================
     // Blob Encryption (for P2P transfer)
     // =========================================================================
 
@@ -860,7 +719,7 @@ impl WasmPeerVault {
             // Build endpoint, then create GossipBridge (needs endpoint for Gossip),
             // then create transport (registers Gossip on Router)
             use iroh::{RelayMap, RelayMode, RelayUrl};
-            let secret_key = SecretKey::generate(&mut rand::rng());
+            let secret_key = SecretKey::generate();
             let relay_mode = match relay_url.as_deref() {
                 Some(url) => {
                     let relay: RelayUrl = url.parse()
@@ -873,7 +732,7 @@ impl WasmPeerVault {
                     RelayMode::Custom(RelayMap::from_iter(vec![relay]))
                 }
             };
-            let endpoint = iroh::Endpoint::builder()
+            let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
                 .secret_key(secret_key.clone())
                 .relay_mode(relay_mode)
                 .bind()
@@ -957,7 +816,7 @@ impl WasmPeerVault {
 
             // Build endpoint, GossipBridge, then transport (same as start())
             use iroh::{RelayMap, RelayMode, RelayUrl};
-            let secret_key = SecretKey::generate(&mut rand::rng());
+            let secret_key = SecretKey::generate();
             let relay_mode = match relay_url.as_deref() {
                 Some(url) => {
                     let relay: RelayUrl = url.parse()
@@ -970,7 +829,7 @@ impl WasmPeerVault {
                     RelayMode::Custom(RelayMap::from_iter(vec![relay]))
                 }
             };
-            let endpoint = iroh::Endpoint::builder()
+            let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
                 .secret_key(secret_key.clone())
                 .relay_mode(relay_mode)
                 .bind()
@@ -1076,7 +935,7 @@ impl WasmPeerVault {
     /// used once and expires after the given timestamp.
     #[wasm_bindgen(js_name = registerPairingNonce)]
     pub fn register_pairing_nonce(&self, nonce: &str, expires_at_ms: f64) {
-        let mut pending = self.pending_pairings.blocking_write();
+        let mut pending = self.pending_pairings.write().unwrap();
         pending.insert(nonce.to_string(), expires_at_ms as u64);
         web_sys::console::log_1(&JsValue::from_str(&format!(
             "[WASM] Registered pairing nonce: {}...",
@@ -1090,7 +949,7 @@ impl WasmPeerVault {
     /// Returns false if the nonce was invalid, expired, or already used.
     #[wasm_bindgen(js_name = validatePairingNonce)]
     pub fn validate_pairing_nonce(&self, nonce: &str) -> bool {
-        let mut pending = self.pending_pairings.blocking_write();
+        let mut pending = self.pending_pairings.write().unwrap();
 
         // Check if nonce exists
         if let Some(&expires_at) = pending.get(nonce) {
@@ -1124,14 +983,14 @@ impl WasmPeerVault {
     /// Check if a peer is known (already paired)
     #[wasm_bindgen(js_name = isKnownPeer)]
     pub fn is_known_peer(&self, peer_id: &str) -> bool {
-        self.known_peers.blocking_read().contains_key(peer_id)
+        self.known_peers.read().unwrap().contains_key(peer_id)
     }
 
     /// Add a peer to the known peers list
     #[wasm_bindgen(js_name = addKnownPeer)]
     pub fn add_known_peer(&self, peer_id: &str) {
         let now = js_sys::Date::now() as u64;
-        self.known_peers.blocking_write().insert(peer_id.to_string(), now);
+        self.known_peers.write().unwrap().insert(peer_id.to_string(), now);
         web_sys::console::log_1(&JsValue::from_str(&format!(
             "[WASM] Added known peer: {}...",
             short(&peer_id, 16)
@@ -1141,13 +1000,13 @@ impl WasmPeerVault {
     /// Remove a peer from the known peers list
     #[wasm_bindgen(js_name = removeKnownPeer)]
     pub fn remove_known_peer(&self, peer_id: &str) {
-        self.known_peers.blocking_write().remove(peer_id);
+        self.known_peers.write().unwrap().remove(peer_id);
     }
 
     /// Get list of known peer IDs
     #[wasm_bindgen(js_name = getKnownPeers)]
     pub fn get_known_peers(&self) -> Vec<JsValue> {
-        self.known_peers.blocking_read()
+        self.known_peers.read().unwrap()
             .keys()
             .map(|k| JsValue::from_str(k))
             .collect()
@@ -2031,8 +1890,8 @@ async fn handle_incoming_streams_v3(
     connections: Arc<RwLock<HashMap<String, IrohConnection>>>,
     store: Arc<RwLock<Option<LoroStore>>>,
     on_event: Option<Function>,
-    pending_pairings: Arc<RwLock<HashMap<String, u64>>>,
-    known_peers: Arc<RwLock<HashMap<String, u64>>>,
+    pending_pairings: Arc<std::sync::RwLock<HashMap<String, u64>>>,
+    known_peers: Arc<std::sync::RwLock<HashMap<String, u64>>>,
     encryption_key: Arc<RwLock<Option<VaultKey>>>,
     blobs_bridge_arc: Arc<RwLock<Option<BlobsBridge>>>,
     gossip_bridge_arc: Arc<RwLock<Option<crate::gossip_bridge::GossipBridge>>>,
@@ -2054,8 +1913,8 @@ async fn handle_incoming_streams_v3_inner(
     connections: &Arc<RwLock<HashMap<String, IrohConnection>>>,
     store: &Arc<RwLock<Option<LoroStore>>>,
     on_event: &Option<Function>,
-    pending_pairings: &Arc<RwLock<HashMap<String, u64>>>,
-    known_peers: &Arc<RwLock<HashMap<String, u64>>>,
+    pending_pairings: &Arc<std::sync::RwLock<HashMap<String, u64>>>,
+    known_peers: &Arc<std::sync::RwLock<HashMap<String, u64>>>,
     encryption_key: &Arc<RwLock<Option<VaultKey>>>,
     blobs_bridge_arc: &Arc<RwLock<Option<BlobsBridge>>>,
     gossip_bridge_arc: &Arc<RwLock<Option<crate::gossip_bridge::GossipBridge>>>,
@@ -2115,8 +1974,8 @@ async fn handle_incoming_streams_v3_inner(
     }
 
     // Validate pairing (take snapshots to avoid holding locks)
-    let known_snap: std::collections::HashMap<String, u64> = known_peers.read().await.clone();
-    let pending_snap: std::collections::HashMap<String, u64> = pending_pairings.read().await.clone();
+    let known_snap: std::collections::HashMap<String, u64> = known_peers.read().unwrap().clone();
+    let pending_snap: std::collections::HashMap<String, u64> = pending_pairings.read().unwrap().clone();
 
     let validation = match validate_pairing(
         peer_id,
@@ -2139,9 +1998,9 @@ async fn handle_incoming_streams_v3_inner(
     // Update state if newly paired
     if validation.is_new_peer {
         if let Some(nonce) = &validation.consumed_nonce {
-            pending_pairings.write().await.remove(nonce);
+            pending_pairings.write().unwrap().remove(nonce);
         }
-        known_peers.write().await.insert(
+        known_peers.write().unwrap().insert(
             peer_id.to_string(),
             web_time::SystemTime::now()
                 .duration_since(web_time::SystemTime::UNIX_EPOCH)
@@ -2568,8 +2427,8 @@ async fn run_accept_loop(
     connections: Arc<RwLock<HashMap<String, IrohConnection>>>,
     store: Arc<RwLock<Option<LoroStore>>>,
     on_event: Option<Function>,
-    pending_pairings: Arc<RwLock<HashMap<String, u64>>>,
-    known_peers: Arc<RwLock<HashMap<String, u64>>>,
+    pending_pairings: Arc<std::sync::RwLock<HashMap<String, u64>>>,
+    known_peers: Arc<std::sync::RwLock<HashMap<String, u64>>>,
     encryption_key: Arc<RwLock<Option<VaultKey>>>,
     blobs_bridge: Arc<RwLock<Option<BlobsBridge>>>,
     gossip_bridge: Arc<RwLock<Option<crate::gossip_bridge::GossipBridge>>>,
@@ -3365,11 +3224,11 @@ impl WasmSyncRunner {
 
         let mut stream = JsSyncStream { js_send, js_recv, js_close };
 
-        let store_guard = engine.store.blocking_read();
+        let store_guard = engine.store.read().await;
         let loro_store = store_guard.as_ref()
             .ok_or_else(|| JsValue::from_str("Store not started"))?;
 
-        let key_guard = engine.encryption_key.blocking_read();
+        let key_guard = engine.encryption_key.read().await;
         let vault_key = key_guard.clone()
             .ok_or_else(|| JsValue::from_str("Encryption key not set"))?;
 
