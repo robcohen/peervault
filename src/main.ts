@@ -5,7 +5,7 @@
  */
 
 import { Plugin, PluginSettingTab, Setting, Notice, TFile, TFolder, TAbstractFile, debounce } from "obsidian";
-import { PeerVaultClient, type ClientConfig, type ClientEvent, type PeerInfo } from "./core/peer-vault-client";
+import { PeerVaultClient, type ClientConfig, type ClientEvent, type PeerInfo, ObsidianStorage } from "./core/peer-vault-client";
 
 // =============================================================================
 // Settings
@@ -65,7 +65,6 @@ export default class PeerVaultPlugin extends Plugin {
   // re-run afterwards instead of silently dropping the update.
   private crdtSyncPending = false;
   // Keys present in the CRDT at the last disk sync, used to detect remote deletions.
-  private previousCrdtKeys: Set<string> = new Set();
 
   override async onload(): Promise<void> {
     await this.loadSettings();
@@ -176,7 +175,7 @@ export default class PeerVaultPlugin extends Plugin {
         relayUrl: this.settings.relayUrl || undefined,
       };
 
-      this.client = new PeerVaultClient(this.app, config);
+      this.client = new PeerVaultClient(new ObsidianStorage(this.app), config);
 
       // Listen for events
       this.client.on((event) => this.handleClientEvent(event));
@@ -192,15 +191,8 @@ export default class PeerVaultPlugin extends Plugin {
         await this.scanVault();
       }
 
-      // Seed the remote-deletion baseline from the CRDT's current keys. Without
-      // this, previousCrdtKeys would start empty after every reload, so the first
-      // disk-sync of the session would miss any deletion that happened on a peer
-      // while we were offline — and a later local re-scan would resurrect the
-      // deleted file. Seeding from the CRDT (not disk) is safe: a file deleted
-      // remotely while we were offline is still in our persisted CRDT now, so it
-      // enters the baseline and is removed once the delete delta arrives.
-      const baseline = await this.client.listFiles();
-      this.previousCrdtKeys = new Set(baseline.filter((p) => !p.startsWith("_crdt/")));
+      // The remote-deletion baseline is owned and auto-seeded by the Rust core
+      // (see vault::seed_reconcile_baseline) — no TS-side shadow state.
     } catch (e) {
       console.error("[PeerVault] Failed to initialize:", e);
       new Notice(`PeerVault: Failed to initialize - ${e}`);
@@ -567,36 +559,25 @@ export default class PeerVaultPlugin extends Plugin {
     this.crdtSyncRunning = true;
 
     try {
-      const crdtFiles = await this.client.listFiles();
-      console.log(`[PeerVault] Syncing ${crdtFiles.length} CRDT files to disk`);
+      // The core computes the reconciliation plan (upserts + remote deletions) and
+      // owns the deletion baseline; this host only applies file IO. Paths with a
+      // pending local-edit timer are passed as dirty so the core never schedules
+      // them for deletion (a local creation not yet ingested must not be removed).
+      const dirty = Array.from(this.fileChangeTimers.keys());
+      const plan = await this.client.reconcilePlan(dirty);
+      console.log(`[PeerVault] Reconcile: ${plan.upserts.length} upserts, ${plan.deletes.length} deletes`);
 
-      const currentKeys = new Set<string>();
-      for (const path of crdtFiles) {
-        // Skip internal CRDT metadata
-        if (path.startsWith("_crdt/")) continue;
-        currentKeys.add(path);
+      for (const path of plan.upserts) {
         // applyRemoteChange is a no-op when disk already matches the CRDT.
         await this.applyRemoteChange(path);
       }
-
-      // Apply remote deletions: files present at the previous sync but no longer in
-      // the CRDT were deleted on a peer (and arrived via the gossip/full-resync path
-      // which carries no per-key delete event).
-      for (const path of this.previousCrdtKeys) {
-        if (!currentKeys.has(path)) {
-          // Don't delete a path the user just re-created locally: a pending
-          // file-change timer means a local edit/creation hasn't been ingested
-          // into the CRDT yet, so its absence from currentKeys is expected and
-          // removing it would silently destroy the user's new file.
-          if (this.fileChangeTimers.has(path)) continue;
-          try {
-            await this.app.vault.adapter.remove(path);
-          } catch {
-            // May already be gone locally.
-          }
+      for (const path of plan.deletes) {
+        try {
+          await this.app.vault.adapter.remove(path);
+        } catch {
+          // May already be gone locally.
         }
       }
-      this.previousCrdtKeys = currentKeys;
     } catch (e) {
       console.error("[PeerVault] Failed to sync CRDT to disk:", e);
     } finally {

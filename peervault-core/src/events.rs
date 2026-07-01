@@ -71,3 +71,17 @@ mod ts_export {
         WasmEvent::export_all().expect("export TS bindings");
     }
 }
+
+/// Host event callback. On wasm the host is single-threaded JS (`Rc`, no `Send`);
+/// on native it may be called from any runtime thread (`Arc + Send + Sync`).
+#[cfg(target_arch = "wasm32")]
+pub type EventCallback = std::rc::Rc<dyn Fn(&WasmEvent)>;
+#[cfg(not(target_arch = "wasm32"))]
+pub type EventCallback = std::sync::Arc<dyn Fn(&WasmEvent) + Send + Sync>;
+
+/// Host state-persistence callback, invoked with the exported store state
+/// whenever it changes. Same threading split as `EventCallback`.
+#[cfg(target_arch = "wasm32")]
+pub type StateCallback = std::rc::Rc<dyn Fn(&[u8])>;
+#[cfg(not(target_arch = "wasm32"))]
+pub type StateCallback = std::sync::Arc<dyn Fn(&[u8]) + Send + Sync>;

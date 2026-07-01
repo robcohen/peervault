@@ -28,6 +28,8 @@
 
 pub mod host;
 pub mod events;
+pub mod rt;
+pub mod vault;
 pub mod protocol;
 pub mod wire;
 pub mod sync;
