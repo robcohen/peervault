@@ -1,72 +1,77 @@
 # Review follow-ups
 
-Items identified during the full review that are **not** addressed in this PR, with
-the reason each was deferred. Most need the Docker e2e environment (Obsidian + Xvfb
-+ relay), which can't run in a sandbox without Docker/root/user-namespaces.
+Tracks the items surfaced by the full code review and the follow-up architecture
+review. The original review backlog and the architecture-review batches have
+since landed; what remains are a few items **deliberately deferred**, each with
+its rationale below.
 
-## 1. Validate end-to-end (needs Docker)
+## Done
 
-- [ ] **Sync deadlock fix — real two-device run.** The fix (initiator drives
-  `SyncComplete`) is compile-verified on native + wasm32 and backed by the in-memory
-  `sync_integration` (8) / `sync_stress` (13) tests, but the live path
-  (`wasm.rs::run_initiator_sync_v3` / `handle_incoming_streams_v3_inner`) was never
-  run against real iroh streams here. Run `bun run test:e2e` (suites `01-pairing`,
-  `02-sync-basic`, `08-mesh-sync`).
-- [ ] **TypeScript changes in a real Obsidian instance** (echo-loop guard, remote
-  deletions, vault-id adoption, single-flight sync). Type-checked only (`tsc`).
-- [ ] **Cloud sync against AWS S3 / R2 / B2.** SigV4 + delta/blob/snapshot round-trips
-  are validated against **MinIO** (`tests/cloud_minio.rs`, gated by
-  `PEERVAULT_MINIO_TEST=1`), not the hosted providers.
+The full-review backlog and the six architecture-review batches shipped across
+PRs #8–#22:
 
-## 2. Dependency upgrades (Tier 3 — breaking, need e2e)
+- **Dependency modernization** — iroh 1.0 stack (iroh 1.0.1, iroh-blobs 0.103,
+  iroh-gossip 0.101, iroh-tickets 1.0), bincode 2 (via `wire::` `config::legacy()`,
+  wire-compatible), reqwest 0.13, rand 0.10, chacha20poly1305 0.11, thiserror 2,
+  loro 1.13; dropped dead deps (hkdf, urlencoding, n0-future); nix toolchain bump
+  (rustc 1.96, wasm-pack 0.15); CI action pinned.
+- **Crypto hardening** — Argon2id passphrase KDF, OS-keychain (`safeStorage`) key
+  at rest, `zeroize` on key material, AEAD associated data on cloud objects,
+  removal of the dormant unauthenticated key-exchange path.
+- **Sync correctness** — deadlock fix (initiator drives `SyncComplete`), handshake
+  vault-id adoption, converged the live sync onto the unit-tested `SyncRunner`,
+  `blocking_read`→`std` locks, shutdown hang + background-task-leak fixes.
+- **Cloud** — applied-delta tracking, download size cap, snapshot-change re-read,
+  and `meta.json` optimistic concurrency (ETag `If-Match` compare-and-swap;
+  validated against MinIO, which honors it).
+- **Architecture** — deleted ~2,580 lines of dead "Path A" (incl. a duplicate
+  crypto stack), structured `{code}` errors across the WASM boundary, `dyn DocStore`
+  (swappable CRDT backend), typed WASM events via ts-rs, peer-list lockstep,
+  property-based CRDT convergence + hostile-input tests.
 
-- [ ] **iroh 1.0 stack** (the dominant debt): `iroh` 0.95→1.0.1, `iroh-blobs`
-  0.97→0.103, `iroh-gossip` 0.95→0.101, `iroh-tickets` 0.2→1.0. Breaking API changes
-  across `net/transport.rs`, `gossip_bridge.rs`, `blobs_bridge.rs`,
-  `sync_handler.rs`, `wasm.rs`.
-- [ ] **wasm-bindgen pin skew.** `Cargo.toml` pins `=0.2.105` but the dev-shell CLI is
-  0.2.108 (latest 0.2.126) — `just wasm` will fail on the mismatch. Realign; likely
-  resolves as part of the iroh upgrade.
-- [ ] **Blanket `cargo update` is blocked.** It advances the RustCrypto pre-release
-  crates (`ed25519`/`pkcs8`/`signature` rc→final), breaking `ed25519-dalek` (pinned
-  via iroh). The remaining minor patches (anyhow, rustls, quinn, hyper, …) move with
-  the iroh upgrade. Only `loro` 1.13.6 + `thiserror` 2 were applied in this PR.
-- [ ] **bincode 1 → 2/3.** Changes the default wire encoding (the V3 sync format) and
-  3.0 dropped the `serde` feature. Target bincode 2.0.1 with `config::legacy()`, add a
-  wire round-trip test, and validate cross-version sync under the e2e before merging.
-- [ ] **reqwest 0.13, rand 0.10, chacha20poly1305 0.11, hkdf 0.13** — major bumps,
-  one at a time with tests.
+## Deferred (with rationale)
 
-## 3. Code follow-ups (from the review, deferred to keep this PR verifiable)
+### 1. Live `Transport` trait — decided **against**
 
-- [ ] **Converge the two sync state machines.** `wasm.rs`'s V3 functions duplicate
-  `runner.rs::SyncRunner` (the tested one). Route `connect_peer` through the runner so
-  the live path is the integration-tested path. Needs e2e to confirm the iroh-blobs
-  bridge integration.
-- [ ] **`blocking_read`/`blocking_write` on tokio `RwLock` in WASM exports**
-  (`wasm.rs`, `sync.rs`). Latent hang risk; convert pairing/known-peer maps to
-  `std::sync` (never held across `.await`) or make the methods async. Runtime-context
-  dependent — validate in the WASM runtime / e2e.
+Abstracting `IrohTransport` behind a `Transport` trait was investigated and
+rejected: it would re-create the dead `Transport`/`Connection`/`Stream` hierarchy
+removed in the Path-A deletion. The networking stack is coupled to iroh
+**end-to-end** — `gossip_bridge` and `blobs_bridge` take `&iroh::Endpoint`
+directly (built on iroh-gossip / iroh-blobs), so any `Transport` trait must expose
+`fn endpoint(&self) -> &iroh::Endpoint`, leaking the concrete type and defeating
+the abstraction. You cannot swap the transport without also replacing gossip +
+blobs. The protocol layer that *is* worth abstracting (`SyncRunner`) already has
+its `SyncStream` seam (used by the integration + property tests). Revisit only if
+a concrete second transport (non-iroh QUIC, or a full in-memory mesh for testing)
+actually materializes — otherwise YAGNI.
 
-## 4. Crypto hardening (flagged in review, not yet implemented)
+### 2. AAD on content encryption — needs a versioned migration
 
-- [ ] **Passphrase KDF**: `VaultKey::from_passphrase` uses HKDF-SHA256 (fast). Switch
-  to Argon2id with a random per-vault salt (`crypto.rs`).
-- [ ] **Vault key at rest**: stored as plaintext hex inside the vault folder
-  (`peer-vault-client.ts`); move to OS keychain / Electron `safeStorage`.
-- [ ] **Zeroize** key material (`VaultKey`, `KeyManager`, decrypted buffers) with the
-  `zeroize` crate; current `fill(0)` is elidable.
-- [ ] **AEAD associated data**: bind cloud objects to their key/version to prevent
-  swap/rollback by a malicious backend (`cloud/encryption.rs`).
-- [ ] **Dormant unauthenticated key exchange** (`key_exchange.rs` /
-  `wasm.rs::handleKeyExchangeRequest`): not currently wired to the network, but gate
-  it behind pairing or remove it so it can't be exposed later.
+`VaultKey::encrypt` (content/CRDT deltas) uses no associated data, while
+`CloudEncryption` binds the object key as AAD. Adding AAD to `VaultKey` would give
+the same anti-substitution property, but it is a **wire/at-rest format change**:
+existing `state.bin` and in-flight deltas encrypted without AAD would fail to
+decrypt. Requires a version byte on the ciphertext + a read path that accepts both
+formats, not a silent flip. Defer until we do a deliberate format-version bump.
 
-## 5. Cloud sync residual
+### 3. Full peer-list dedup — larger state-ownership change
 
-- [ ] **Applied-delta tracking**: `download_deltas` re-fetches every delta each sync
-  (idempotent but wasteful); track applied delta ids (`sync.rs`).
-- [ ] **Download size cap**: bound `get_object` / total per-sync bytes (OOM risk on
-  large/hostile objects).
-- [ ] **Compaction**: now deletes only the pre-snapshot delta set; a fully concurrent-
-  safe design needs conditional writes / a compaction lease.
+PR #20 fixed the correctness bug (removed peers now leave the core's `known_peers`
+too). The fuller change — make the Rust core the single source of truth for the
+peer list and drop the TS `peers.json` shadow entirely — is larger: `known_peers`
+stores only ids, while `peers.json` also holds name + ticket, so the core would
+need to expose (and persist) that metadata first. Left as its own PR.
+
+### 4. S3 client testability — no HTTP-layer trait
+
+`S3Client` embeds `reqwest::Client` with no HTTP trait, so retry/backoff and the
+`meta.json` conflict path can only be exercised behind the env-gated MinIO suite,
+not in CI. Extracting an `HttpClient` trait would let those paths run against a
+mock in CI. Nice-to-have; not blocking.
+
+### 5. Hosted-cloud validation
+
+SigV4 + delta/blob/snapshot round-trips and the `If-Match` CAS are validated
+against **MinIO** (`tests/cloud_minio.rs`, gated by `PEERVAULT_MINIO_TEST=1`), not
+the hosted providers (AWS S3 / R2 / B2). Worth a manual pass before advertising
+those backends as supported.
