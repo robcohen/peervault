@@ -3425,6 +3425,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "argon2",
+ "async-trait",
  "base64",
  "bincode 2.0.1",
  "chacha20poly1305",

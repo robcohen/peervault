@@ -19,7 +19,6 @@ use crate::cloud::{CloudConfig, CloudSync, CloudSyncState, SyncPhase};
 use crate::sync::SyncEngine;
 use crate::runner::{SyncRunner, RunnerConfig, SyncStream, BlobOps};
 use iroh_blobs::Hash;
-use crate::error::CoreError;
 use base64::Engine as _;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -1724,6 +1723,44 @@ fn short(s: &str, n: usize) -> &str {
     }
 }
 
+/// Adapts an `IrohStream` to the runner's `SyncStream` trait (same length-prefix
+/// framing that `send_sync_msg`/`recv_sync_msg` use).
+struct SyncStreamAdapter<'a>(&'a mut IrohStream);
+
+#[async_trait::async_trait]
+impl crate::runner::SyncStream for SyncStreamAdapter<'_> {
+    async fn send(&mut self, data: &[u8]) -> Result<(), crate::error::CoreError> {
+        self.0.send(data).await.map_err(|e| crate::error::CoreError::Protocol(e.to_string()))
+    }
+    async fn recv(&mut self, _timeout_ms: u64) -> Result<Vec<u8>, crate::error::CoreError> {
+        self.0.recv().await.map_err(|e| crate::error::CoreError::Protocol(e.to_string()))
+    }
+    async fn close(&mut self) -> Result<(), crate::error::CoreError> {
+        Ok(())
+    }
+}
+
+/// A `BlobOps` that only reports a fixed hash list; blob bytes are transferred
+/// out-of-band via iroh-blobs, so get/store are unused.
+struct StaticBlobOps {
+    hashes: Vec<iroh_blobs::Hash>,
+}
+
+impl crate::runner::BlobOps for StaticBlobOps {
+    fn list_hashes(&self) -> Vec<iroh_blobs::Hash> {
+        self.hashes.clone()
+    }
+    fn get(&self, _hash: &iroh_blobs::Hash) -> Option<Vec<u8>> {
+        None
+    }
+    fn store(&mut self, _hash: &iroh_blobs::Hash, _data: &[u8]) -> Result<(), crate::error::CoreError> {
+        Ok(())
+    }
+}
+
+/// Run the initiator side of the V3 sync via the unit-tested `SyncRunner`:
+/// version exchange (+ vault-id validation) + CRDT updates + SyncComplete, then
+/// out-of-band iroh-blobs transfer coordinated on the sync stream.
 async fn run_initiator_sync_v3(
     peer_id: &str,
     stream: &mut IrohStream,
@@ -1736,153 +1773,52 @@ async fn run_initiator_sync_v3(
     endpoint: Option<&iroh::Endpoint>,
     on_event: &Option<Function>,
 ) -> Result<(), JsValue> {
-    let map_err = |e: String| JsValue::from_str(&e);
+    use crate::runner::{SyncRunner, RunnerConfig};
+    let ce = |e: crate::error::CoreError| JsValue::from_str(&e.to_string());
 
-    // Phase 1: Send our VERSION_INFO (initiator sends first)
-    let our_info = proto::VersionInfo {
-        protocol_version: PROTOCOL_VERSION,
-        vault_id: *engine.vault_id(),
-        version_bytes: engine.version_vector(),
+    let cfg = RunnerConfig {
         hostname: hostname.to_string(),
         nickname: nickname.map(|s| s.to_string()),
-        has_vault_key: true,
         plugin_version: plugin_version.map(|s| s.to_string()),
         pairing_nonce,
-        supports_iroh_blobs: true,
+        ..Default::default()
     };
-    send_sync_msg(stream, &SyncMessage::VersionInfo(our_info)).await.map_err(map_err)?;
+    let mut runner = SyncRunner::new(cfg, engine, peer_id.to_string(), true);
+    let mut adapter = SyncStreamAdapter(stream);
 
-    // Receive peer's VERSION_INFO
-    let peer_info = match recv_sync_msg(stream).await.map_err(map_err)? {
-        SyncMessage::VersionInfo(info) => info,
-        SyncMessage::Error(e) => {
-            return Err(JsValue::from_str(&format!("Peer rejected: {} (code {})", e.message, e.code)));
-        }
-        other => {
-            return Err(JsValue::from_str(&format!("Expected VersionInfo, got {:?}", other.message_type())));
-        }
-    };
+    // Phases 1-2: version exchange + CRDT updates + SyncComplete.
+    runner.run_crdt_only(&mut adapter).await.map_err(ce)?;
 
-    // Validate vault ID
-    if peer_info.vault_id != *engine.vault_id() {
-        let err = SyncMessage::Error(proto::SyncError {
-            code: proto::error_codes::VAULT_MISMATCH,
-            message: "Vault ID mismatch".into(),
-        });
-        let _ = send_sync_msg(stream, &err).await;
-        return Err(JsValue::from_str("Vault ID mismatch"));
-    }
-
-    info!("Initiator: connected to {} (v{}, iroh-blobs={})",
-        peer_info.hostname, peer_info.protocol_version, peer_info.supports_iroh_blobs);
-
-    // Phase 2: Exchange CRDT updates
-    let updates = engine.export_updates_since(&peer_info.version_bytes)
-        .map_err(|e| JsValue::from_str(&format!("Export updates failed: {}", e)))?;
-    let updates_len = updates.len();
-    send_sync_msg(stream, &SyncMessage::Updates(proto::Updates {
-        data: updates,
-        op_count: 0,
-    })).await.map_err(map_err)?;
-
-    // The initiator drives completion: announce we're done right after sending our
-    // updates. The acceptor replies with its own SyncComplete once it has received
-    // this. Without this, both peers would block in the recv loop below forever,
-    // since neither would ever send the first SyncComplete.
-    send_sync_msg(stream, &SyncMessage::SyncComplete(proto::SyncComplete {
-        version_bytes: engine.version_vector(),
-    })).await.map_err(map_err)?;
-
-    // Receive peer's updates and wait for its completion acknowledgement.
-    let mut updates_received = 0;
-    loop {
-        match recv_sync_msg(stream).await.map_err(map_err)? {
-            SyncMessage::Updates(updates) => {
-                engine.import_updates(&updates.data)
-                    .map_err(|e| JsValue::from_str(&format!("Import updates failed: {}", e)))?;
-                updates_received += 1;
-            }
-            SyncMessage::SyncComplete(_) => {
-                // Peer acknowledged completion; we already sent ours.
-                break;
-            }
-            SyncMessage::Error(e) => {
-                return Err(JsValue::from_str(&format!("Sync error: {}", e.message)));
-            }
-            _ => continue,
-        }
-    }
-
-    // Phase 3: Blob exchange (V3 via iroh-blobs if both support it)
-    if peer_info.supports_iroh_blobs {
+    // Phase 3: out-of-band iroh-blobs transfer.
+    if runner.peer_supports_iroh_blobs() {
         if let (Some(bridge), Some(ep)) = (blobs_bridge, endpoint) {
-            // Exchange blob hashes
             let our_hashes = bridge.list_host_hashes().await
                 .map_err(|e| JsValue::from_str(&format!("List blobs failed: {}", e)))?;
-
-            send_sync_msg(stream, &SyncMessage::BlobHashes(proto::BlobHashes {
-                hashes: our_hashes.clone(),
-            })).await.map_err(map_err)?;
-
-            let peer_hashes = match recv_sync_msg(stream).await.map_err(map_err)? {
-                SyncMessage::BlobHashes(bh) => bh.hashes,
-                SyncMessage::BlobSyncComplete(_) => vec![], // peer has no blobs
-                other => {
-                    warn!("Expected BlobHashes, got {:?}", other.message_type());
-                    vec![]
-                }
-            };
-
-            // Compute diffs
-            let our_set: std::collections::HashSet<_> = our_hashes.iter().collect();
-            let peer_set: std::collections::HashSet<_> = peer_hashes.iter().collect();
-            let need: Vec<_> = peer_hashes.iter().filter(|h| !our_set.contains(h)).cloned().collect();
-            let send: Vec<_> = our_hashes.iter().filter(|h| !peer_set.contains(h)).cloned().collect();
-
+            let static_blobs = StaticBlobOps { hashes: our_hashes };
+            let (need, send) = runner.exchange_blob_hashes(&mut adapter, &static_blobs).await.map_err(ce)?;
             if !need.is_empty() || !send.is_empty() {
                 let peer_endpoint_id: iroh::EndpointId = peer_id.parse()
                     .map_err(|e| JsValue::from_str(&format!("Invalid peer ID: {}", e)))?;
-
                 bridge.exchange_blobs_v3(ep, peer_endpoint_id, &need, &send).await
                     .map_err(|e| JsValue::from_str(&format!("Blob transfer failed: {}", e)))?;
             }
-
-            // Signal completion
-            send_sync_msg(stream, &SyncMessage::BlobSyncComplete(proto::BlobSyncComplete {
-                blob_count: 0,
-            })).await.map_err(map_err)?;
-
-            // Wait for peer's blob sync completion (with message limit)
-            let mut blob_sync_done = false;
-            for _ in 0..100 {
-                match recv_sync_msg(stream).await.map_err(map_err)? {
-                    SyncMessage::BlobSyncComplete(_) => { blob_sync_done = true; break; }
-                    SyncMessage::Error(e) => {
-                        return Err(JsValue::from_str(&format!("Blob sync error: {}", e.message)));
-                    }
-                    _ => continue,
-                }
-            }
-            if !blob_sync_done {
-                warn!("Blob sync completion not received after 100 messages");
-            }
+            runner.send_blob_sync_complete(&mut adapter, send.len()).await.map_err(ce)?;
         }
     }
 
-    // Emit sync_complete event
     if let Some(ref callback) = on_event {
         let event = serde_json::json!({
             "type": "sync_complete",
             "peer_id": peer_id,
             "direction": "outgoing",
-            "updates_received": updates_received,
-            "updates_sent": 1,
+            "updates_received": runner.result().updates_received,
+            "updates_sent": runner.result().updates_sent,
         });
         let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(&event.to_string()));
     }
-
     Ok(())
 }
+
 
 /// Handle incoming streams using V3 binary protocol (acceptor side).
 async fn handle_incoming_streams_v3(
@@ -2862,466 +2798,6 @@ struct SessionConfigJs {
     max_retry_delay_ms: Option<u64>,
 }
 
-// ============================================================================
-// Sync Runner for WASM
-// ============================================================================
-
-use crate::runner::SyncRunResult;
-use std::cell::RefCell;
-
-/// JavaScript-backed sync stream
-///
-/// Implements SyncStream by calling JavaScript callbacks.
-struct JsSyncStream {
-    /// JS callback: (data: Uint8Array) => void
-    js_send: Function,
-    /// JS callback: (timeoutMs: number) => Uint8Array | null
-    js_recv: Function,
-    /// JS callback: () => void
-    js_close: Function,
-}
-
-// SAFETY: WASM is single-threaded, so Send+Sync is safe for JS callbacks
-unsafe impl Send for JsSyncStream {}
-unsafe impl Sync for JsSyncStream {}
-
-impl SyncStream for JsSyncStream {
-    fn send(&mut self, data: &[u8]) -> Result<(), CoreError> {
-        let arr = Uint8Array::new_with_length(data.len() as u32);
-        arr.copy_from(data);
-
-        self.js_send.call1(&JsValue::NULL, &arr)
-            .map_err(|e| CoreError::Protocol(format!("JS send error: {:?}", e)))?;
-
-        Ok(())
-    }
-
-    fn recv(&mut self, timeout_ms: u64) -> Result<Vec<u8>, CoreError> {
-        let result = self.js_recv.call1(&JsValue::NULL, &JsValue::from_f64(timeout_ms as f64))
-            .map_err(|e| CoreError::Protocol(format!("JS recv error: {:?}", e)))?;
-
-        if result.is_null() || result.is_undefined() {
-            return Err(CoreError::Timeout("No data received".into()));
-        }
-
-        let arr = Uint8Array::new(&result);
-        Ok(arr.to_vec())
-    }
-
-    fn close(&mut self) -> Result<(), CoreError> {
-        self.js_close.call0(&JsValue::NULL)
-            .map_err(|e| CoreError::Protocol(format!("JS close error: {:?}", e)))?;
-        Ok(())
-    }
-}
-
-/// JavaScript-backed blob operations
-struct JsBlobOps {
-    /// JS callback: () => string[] (hex hashes)
-    js_list_hashes: Function,
-    /// JS callback: (hash: string) => Uint8Array | null
-    js_get: Function,
-    /// JS callback: (hash: string, data: Uint8Array) => void
-    js_store: Function,
-}
-
-// SAFETY: WASM is single-threaded, so Send+Sync is safe for JS callbacks
-unsafe impl Send for JsBlobOps {}
-unsafe impl Sync for JsBlobOps {}
-
-impl BlobOps for JsBlobOps {
-    fn list_hashes(&self) -> Vec<Hash> {
-        match self.js_list_hashes.call0(&JsValue::NULL) {
-            Ok(result) => {
-                let arr = js_sys::Array::from(&result);
-                arr.iter()
-                    .filter_map(|v| {
-                        let hex_str = v.as_string()?;
-                        let bytes = hex::decode(&hex_str).ok()?;
-                        let arr: [u8; 32] = bytes.try_into().ok()?;
-                        Some(Hash::from(arr))
-                    })
-                    .collect()
-            }
-            Err(_) => vec![],
-        }
-    }
-
-    fn get(&self, hash: &Hash) -> Option<Vec<u8>> {
-        let hex_str = hex::encode(hash.as_bytes());
-        match self.js_get.call1(&JsValue::NULL, &JsValue::from_str(&hex_str)) {
-            Ok(result) => {
-                if result.is_null() || result.is_undefined() {
-                    None
-                } else {
-                    let arr = Uint8Array::new(&result);
-                    Some(arr.to_vec())
-                }
-            }
-            Err(_) => None,
-        }
-    }
-
-    fn store(&mut self, hash: &Hash, data: &[u8]) -> Result<(), CoreError> {
-        let hex_str = hex::encode(hash.as_bytes());
-        let arr = Uint8Array::new_with_length(data.len() as u32);
-        arr.copy_from(data);
-
-        self.js_store.call2(&JsValue::NULL, &JsValue::from_str(&hex_str), &arr)
-            .map_err(|e| CoreError::Protocol(format!("JS store error: {:?}", e)))?;
-
-        Ok(())
-    }
-}
-
-/// WASM Sync Runner
-///
-/// Orchestrates the sync protocol using JavaScript-provided stream and blob callbacks.
-///
-/// Usage from TypeScript:
-/// ```typescript
-/// const runner = new WasmSyncRunner(engine, peerId, true);
-///
-/// // Configure stream callbacks (wrapping your Iroh stream)
-/// runner.setStreamCallbacks(
-///   (data) => stream.send(data),
-///   (timeoutMs) => stream.recv(timeoutMs),
-///   () => stream.close()
-/// );
-///
-/// // Configure blob callbacks (wrapping your blob store)
-/// runner.setBlobCallbacks(
-///   () => blobStore.listHashes(),
-///   (hash) => blobStore.get(hash),
-///   (hash, data) => blobStore.store(hash, data)
-/// );
-///
-/// // Run the sync
-/// const result = runner.run();
-/// console.log(result); // { updatesReceived: 5, blobsReceived: 2, isLive: true, ... }
-/// ```
-#[wasm_bindgen]
-pub struct WasmSyncRunner {
-    config: RunnerConfig,
-    peer_id: String,
-    is_initiator: bool,
-    // Stream callbacks
-    js_stream_send: Option<Function>,
-    js_stream_recv: Option<Function>,
-    js_stream_close: Option<Function>,
-    // Blob callbacks
-    js_blob_list: Option<Function>,
-    js_blob_get: Option<Function>,
-    js_blob_store: Option<Function>,
-}
-
-#[wasm_bindgen]
-impl WasmSyncRunner {
-    /// Create a new sync runner
-    ///
-    /// @param peer_id - The peer we're syncing with
-    /// @param is_initiator - True if we initiated the connection
-    /// @param config_json - Optional JSON config (same as WasmSyncSession)
-    #[wasm_bindgen(constructor)]
-    pub fn new(
-        peer_id: &str,
-        is_initiator: bool,
-        config_json: Option<String>,
-    ) -> Result<WasmSyncRunner, JsValue> {
-        let config = match config_json {
-            Some(json) => {
-                let js_config: RunnerConfigJs = serde_json::from_str(&json)
-                    .map_err(|e| JsValue::from_str(&format!("Invalid config JSON: {}", e)))?;
-                RunnerConfig {
-                    hostname: js_config.hostname.unwrap_or_else(|| "Unknown".into()),
-                    nickname: js_config.nickname,
-                    plugin_version: js_config.plugin_version,
-                    pairing_nonce: None,
-                    receive_timeout_ms: js_config.receive_timeout_ms.unwrap_or(30000),
-                    ping_interval_ms: js_config.ping_interval_ms.unwrap_or(15000),
-                    max_inline_blob_size: js_config.max_inline_blob_size.unwrap_or(1024 * 1024),
-                }
-            }
-            None => RunnerConfig::default(),
-        };
-
-        Ok(WasmSyncRunner {
-            config,
-            peer_id: peer_id.to_string(),
-            is_initiator,
-            js_stream_send: None,
-            js_stream_recv: None,
-            js_stream_close: None,
-            js_blob_list: None,
-            js_blob_get: None,
-            js_blob_store: None,
-        })
-    }
-
-    /// Set stream callbacks
-    ///
-    /// @param send - (data: Uint8Array) => void
-    /// @param recv - (timeoutMs: number) => Uint8Array | null (null = timeout)
-    /// @param close - () => void
-    #[wasm_bindgen(js_name = setStreamCallbacks)]
-    pub fn set_stream_callbacks(
-        &mut self,
-        send: Function,
-        recv: Function,
-        close: Function,
-    ) {
-        self.js_stream_send = Some(send);
-        self.js_stream_recv = Some(recv);
-        self.js_stream_close = Some(close);
-    }
-
-    /// Set blob callbacks
-    ///
-    /// @param list_hashes - () => string[] (hex hashes)
-    /// @param get - (hash: string) => Uint8Array | null
-    /// @param store - (hash: string, data: Uint8Array) => void
-    #[wasm_bindgen(js_name = setBlobCallbacks)]
-    pub fn set_blob_callbacks(
-        &mut self,
-        list_hashes: Function,
-        get: Function,
-        store: Function,
-    ) {
-        self.js_blob_list = Some(list_hashes);
-        self.js_blob_get = Some(get);
-        self.js_blob_store = Some(store);
-    }
-
-    /// Run the sync protocol
-    ///
-    /// Returns JSON with sync results:
-    /// {
-    ///   "updatesSent": number,
-    ///   "updatesReceived": number,
-    ///   "blobsSent": number,
-    ///   "blobsReceived": number,
-    ///   "bytesSent": number,
-    ///   "bytesReceived": number,
-    ///   "isLive": boolean,
-    ///   "peerHostname": string,
-    ///   "peerNickname": string | null,
-    ///   "error": string | null
-    /// }
-    #[wasm_bindgen]
-    pub fn run(&mut self, engine: &WasmPeerVault) -> Result<String, JsValue> {
-        // Validate callbacks are set
-        let js_send = self.js_stream_send.clone()
-            .ok_or_else(|| JsValue::from_str("Stream send callback not set"))?;
-        let js_recv = self.js_stream_recv.clone()
-            .ok_or_else(|| JsValue::from_str("Stream recv callback not set"))?;
-        let js_close = self.js_stream_close.clone()
-            .ok_or_else(|| JsValue::from_str("Stream close callback not set"))?;
-
-        // Create stream adapter
-        let mut stream = JsSyncStream {
-            js_send,
-            js_recv,
-            js_close,
-        };
-
-        // Get the sync engine from WasmPeerVault
-        // We need to access it synchronously, so use blocking_read
-        let store_guard = engine.store.blocking_read();
-        let loro_store = store_guard.as_ref()
-            .ok_or_else(|| JsValue::from_str("Store not started"))?;
-
-        let key_guard = engine.encryption_key.blocking_read();
-        let vault_key = key_guard.clone()
-            .ok_or_else(|| JsValue::from_str("Encryption key not set"))?;
-
-        // Create a temporary SyncEngine for this sync
-        // Note: In a real implementation, we'd want to share the engine state
-        let real_vault_id = *loro_store.vault_id();
-        let host = Arc::new(crate::host::mock::MockHost::new());
-        let mut sync_engine = SyncEngine::new_with_key(host, vault_key)
-            .map_err(|e| JsValue::from_str(&format!("Failed to create sync engine: {}", e)))?;
-        // Carry the real vault id (new_with_key starts at all-zeros and import does
-        // not restore it) so the handshake advertises/validates the actual vault.
-        sync_engine.init_vault(real_vault_id);
-
-        // Import the current store state
-        let snapshot = loro_store.export_snapshot()
-            .map_err(|e| JsValue::from_str(&format!("Failed to export snapshot: {}", e)))?;
-        sync_engine.import_snapshot_raw(&snapshot)
-            .map_err(|e| JsValue::from_str(&format!("Failed to import snapshot: {}", e)))?;
-
-        // Create and run the sync runner
-        let mut runner = SyncRunner::new(
-            self.config.clone(),
-            &sync_engine,
-            self.peer_id.clone(),
-            self.is_initiator,
-        );
-
-        // Run sync - with or without blobs depending on callbacks
-        let result = if self.js_blob_list.is_some() {
-            let mut blobs = JsBlobOps {
-                js_list_hashes: self.js_blob_list.clone().unwrap(),
-                js_get: self.js_blob_get.clone().unwrap(),
-                js_store: self.js_blob_store.clone().unwrap(),
-            };
-            runner.run(&mut stream, &mut blobs)
-                .map_err(|e| JsValue::from_str(&format!("Sync failed: {}", e)))?
-        } else {
-            runner.run_without_blobs(&mut stream)
-                .map_err(|e| JsValue::from_str(&format!("Sync failed: {}", e)))?
-        };
-
-        // If successful, export the updated state back to the store
-        let updated_snapshot = sync_engine.export_snapshot_raw()
-            .map_err(|e| JsValue::from_str(&format!("Failed to export updated snapshot: {}", e)))?;
-        loro_store.import_snapshot(&updated_snapshot)
-            .map_err(|e| JsValue::from_str(&format!("Failed to import updated snapshot: {}", e)))?;
-
-        // Convert result to JSON
-        let result_json = serde_json::json!({
-            "updatesSent": result.updates_sent,
-            "updatesReceived": result.updates_received,
-            "blobsSent": result.blobs_sent,
-            "blobsReceived": result.blobs_received,
-            "bytesSent": result.bytes_sent,
-            "bytesReceived": result.bytes_received,
-            "isLive": result.is_live,
-            "peerHostname": result.peer_hostname,
-            "peerNickname": result.peer_nickname,
-            "error": result.error,
-        });
-
-        Ok(result_json.to_string())
-    }
-
-    /// Get the current state of the runner
-    #[wasm_bindgen(js_name = getState)]
-    pub fn get_state(&self) -> String {
-        // Runner doesn't persist state between runs
-        "idle".to_string()
-    }
-}
-
-// Rust-only API for V3 iroh-blobs sync (not exposed to JS)
-impl WasmSyncRunner {
-    /// Run sync with V3 iroh-blobs transfer when peer supports it.
-    /// Falls back to V2 inline blobs otherwise.
-    pub async fn run_with_iroh_blobs(
-        &mut self,
-        engine: &WasmPeerVault,
-        blobs_bridge: &crate::blobs_bridge::BlobsBridge,
-        endpoint: &iroh::Endpoint,
-    ) -> Result<String, JsValue> {
-        use crate::runner::SyncRunResult;
-
-        let js_send = self.js_stream_send.clone()
-            .ok_or_else(|| JsValue::from_str("Stream send callback not set"))?;
-        let js_recv = self.js_stream_recv.clone()
-            .ok_or_else(|| JsValue::from_str("Stream recv callback not set"))?;
-        let js_close = self.js_stream_close.clone()
-            .ok_or_else(|| JsValue::from_str("Stream close callback not set"))?;
-
-        let mut stream = JsSyncStream { js_send, js_recv, js_close };
-
-        let store_guard = engine.store.read().await;
-        let loro_store = store_guard.as_ref()
-            .ok_or_else(|| JsValue::from_str("Store not started"))?;
-
-        let key_guard = engine.encryption_key.read().await;
-        let vault_key = key_guard.clone()
-            .ok_or_else(|| JsValue::from_str("Encryption key not set"))?;
-
-        let real_vault_id = *loro_store.vault_id();
-        let host = Arc::new(crate::host::mock::MockHost::new());
-        let mut sync_engine = SyncEngine::new_with_key(host, vault_key)
-            .map_err(|e| JsValue::from_str(&format!("Failed to create sync engine: {}", e)))?;
-        // Carry the real vault id (new_with_key starts at all-zeros and import does
-        // not restore it) so the handshake advertises/validates the actual vault.
-        sync_engine.init_vault(real_vault_id);
-
-        let snapshot = loro_store.export_snapshot()
-            .map_err(|e| JsValue::from_str(&format!("Failed to export snapshot: {}", e)))?;
-        sync_engine.import_snapshot_raw(&snapshot)
-            .map_err(|e| JsValue::from_str(&format!("Failed to import snapshot: {}", e)))?;
-
-        let mut runner = SyncRunner::new(
-            self.config.clone(),
-            &sync_engine,
-            self.peer_id.clone(),
-            self.is_initiator,
-        );
-
-        // Phase 1-2: Version exchange + CRDT sync
-        runner.run_crdt_only(&mut stream)
-            .map_err(|e| JsValue::from_str(&format!("CRDT sync failed: {}", e)))?;
-
-        // Phase 3: Blob exchange — V3 or V2
-        if runner.peer_supports_iroh_blobs() && self.js_blob_list.is_some() {
-            // V3: Exchange hash lists on sync stream, transfer via iroh-blobs
-            let blobs = JsBlobOps {
-                js_list_hashes: self.js_blob_list.clone().unwrap(),
-                js_get: self.js_blob_get.clone().unwrap(),
-                js_store: self.js_blob_store.clone().unwrap(),
-            };
-
-            let (need_from_peer, send_to_peer) = runner.exchange_blob_hashes(&mut stream, &blobs)
-                .map_err(|e| JsValue::from_str(&format!("Blob hash exchange failed: {}", e)))?;
-
-            // Parse peer's node ID for the Downloader
-            let peer_endpoint_id: iroh::EndpointId = self.peer_id.parse()
-                .map_err(|e| JsValue::from_str(&format!("Invalid peer ID: {}", e)))?;
-
-            // Transfer blobs via iroh-blobs (async, Bao-verified)
-            let (received, sent) = blobs_bridge.exchange_blobs_v3(
-                endpoint,
-                peer_endpoint_id,
-                &need_from_peer,
-                &send_to_peer,
-            ).await
-            .map_err(|e| JsValue::from_str(&format!("iroh-blobs transfer failed: {}", e)))?;
-
-            // Signal completion on sync stream
-            runner.send_blob_sync_complete(&mut stream, sent)
-                .map_err(|e| JsValue::from_str(&format!("Blob sync complete failed: {}", e)))?;
-        } else if self.js_blob_list.is_some() {
-            // V2 fallback: inline blob exchange
-            let mut blobs = JsBlobOps {
-                js_list_hashes: self.js_blob_list.clone().unwrap(),
-                js_get: self.js_blob_get.clone().unwrap(),
-                js_store: self.js_blob_store.clone().unwrap(),
-            };
-            // Use the existing inline exchange (private method not accessible here,
-            // so fall back to full run which repeats version exchange - not ideal)
-            // TODO: expose exchange_blobs as public or restructure
-        }
-
-        // Phase 4: Complete and enter live mode
-        let result = runner.complete_and_enter_live(&mut stream)
-            .map_err(|e| JsValue::from_str(&format!("Sync completion failed: {}", e)))?;
-
-        // Export updated state
-        let updated_snapshot = sync_engine.export_snapshot_raw()
-            .map_err(|e| JsValue::from_str(&format!("Failed to export snapshot: {}", e)))?;
-        loro_store.import_snapshot(&updated_snapshot)
-            .map_err(|e| JsValue::from_str(&format!("Failed to import snapshot: {}", e)))?;
-
-        let result_json = serde_json::json!({
-            "updatesSent": result.updates_sent,
-            "updatesReceived": result.updates_received,
-            "blobsSent": result.blobs_sent,
-            "blobsReceived": result.blobs_received,
-            "bytesSent": result.bytes_sent,
-            "bytesReceived": result.bytes_received,
-            "isLive": result.is_live,
-            "peerHostname": result.peer_hostname,
-            "peerNickname": result.peer_nickname,
-            "error": result.error,
-        });
-
-        Ok(result_json.to_string())
-    }
-}
 
 /// Runner config for JS interop
 #[derive(serde::Deserialize)]
@@ -3358,239 +2834,6 @@ struct RawSyncResult {
     error: Option<String>,
 }
 
-/// Run sync with raw Loro bytes
-///
-/// This function allows TypeScript to run the sync protocol using its own
-/// LoroDoc by passing the raw snapshot bytes. The flow is:
-/// 1. TypeScript: `const snapshot = loroDoc.exportSnapshot()`
-/// 2. TypeScript: `const result = await syncWithRaw(snapshot, ...)`
-/// 3. TypeScript: `loroDoc.import(result.updatedSnapshot)`
-///
-/// This bridges the TypeScript loro-crdt package with the Rust sync protocol.
-#[wasm_bindgen(js_name = syncWithRaw)]
-pub fn sync_with_raw(
-    loro_snapshot: &Uint8Array,
-    vault_key_hex: &str,
-    vault_id_hex: &str,
-    peer_id: &str,
-    is_initiator: bool,
-    send: Function,
-    recv: Function,
-    close: Function,
-    config_json: Option<String>,
-) -> Result<JsValue, JsValue> {
-    // Parse vault key
-    let vault_key_bytes = hex::decode(vault_key_hex)
-        .map_err(|e| JsValue::from_str(&format!("Invalid vault key hex: {}", e)))?;
-    let vault_key = VaultKey::from_bytes(&vault_key_bytes)
-        .map_err(|e| JsValue::from_str(&format!("Invalid vault key: {}", e)))?;
-
-    // Parse vault ID
-    let vault_id_bytes = hex::decode(vault_id_hex)
-        .map_err(|e| JsValue::from_str(&format!("Invalid vault ID hex: {}", e)))?;
-    if vault_id_bytes.len() != 32 {
-        return Err(JsValue::from_str("Vault ID must be 32 bytes"));
-    }
-    let mut vault_id = [0u8; 32];
-    vault_id.copy_from_slice(&vault_id_bytes);
-
-    // Parse config
-    let config = match config_json {
-        Some(json) => {
-            let js_config: RunnerConfigJs = serde_json::from_str(&json)
-                .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-            RunnerConfig {
-                hostname: js_config.hostname.unwrap_or_else(|| "Unknown".into()),
-                nickname: js_config.nickname,
-                plugin_version: js_config.plugin_version,
-                pairing_nonce: None,
-                receive_timeout_ms: js_config.receive_timeout_ms.unwrap_or(30000),
-                ping_interval_ms: js_config.ping_interval_ms.unwrap_or(15000),
-                max_inline_blob_size: js_config.max_inline_blob_size.unwrap_or(1024 * 1024),
-            }
-        }
-        None => RunnerConfig::default(),
-    };
-
-    // Create stream adapter
-    let mut stream = JsSyncStream {
-        js_send: send,
-        js_recv: recv,
-        js_close: close,
-    };
-
-    // Create SyncEngine with the provided data
-    let host = Arc::new(crate::host::mock::MockHost::new());
-    let mut sync_engine = SyncEngine::new_with_key(host, vault_key)
-        .map_err(|e| JsValue::from_str(&format!("Failed to create sync engine: {}", e)))?;
-
-    // Set vault ID
-    sync_engine.init_vault(vault_id);
-
-    // Import the TypeScript Loro snapshot
-    let snapshot_bytes = loro_snapshot.to_vec();
-    sync_engine.import_snapshot_raw(&snapshot_bytes)
-        .map_err(|e| JsValue::from_str(&format!("Failed to import snapshot: {}", e)))?;
-
-    // Create and run the sync runner
-    let mut runner = SyncRunner::new(
-        config,
-        &sync_engine,
-        peer_id.to_string(),
-        is_initiator,
-    );
-
-    // Run sync (no blobs for now)
-    let result = runner.run_without_blobs(&mut stream)
-        .map_err(|e| JsValue::from_str(&format!("Sync failed: {}", e)))?;
-
-    // Export the updated snapshot
-    let updated_snapshot = sync_engine.export_snapshot_raw()
-        .map_err(|e| JsValue::from_str(&format!("Failed to export snapshot: {}", e)))?;
-
-    // Build result
-    let raw_result = RawSyncResult {
-        updated_snapshot,
-        updates_sent: result.updates_sent,
-        updates_received: result.updates_received,
-        blobs_sent: result.blobs_sent,
-        blobs_received: result.blobs_received,
-        bytes_sent: result.bytes_sent,
-        bytes_received: result.bytes_received,
-        is_live: result.is_live,
-        peer_hostname: result.peer_hostname,
-        peer_nickname: result.peer_nickname,
-        error: result.error,
-    };
-
-    // Serialize result to JSON with the snapshot as base64
-    let result_json = serde_json::json!({
-        "updatedSnapshot": base64::engine::general_purpose::STANDARD.encode(&raw_result.updated_snapshot),
-        "updatesSent": raw_result.updates_sent,
-        "updatesReceived": raw_result.updates_received,
-        "blobsSent": raw_result.blobs_sent,
-        "blobsReceived": raw_result.blobs_received,
-        "bytesSent": raw_result.bytes_sent,
-        "bytesReceived": raw_result.bytes_received,
-        "isLive": raw_result.is_live,
-        "peerHostname": raw_result.peer_hostname,
-        "peerNickname": raw_result.peer_nickname,
-        "error": raw_result.error,
-    });
-
-    Ok(JsValue::from_str(&result_json.to_string()))
-}
-
-/// Run sync with raw Loro bytes and blob support
-#[wasm_bindgen(js_name = syncWithRawAndBlobs)]
-pub fn sync_with_raw_and_blobs(
-    loro_snapshot: &Uint8Array,
-    vault_key_hex: &str,
-    vault_id_hex: &str,
-    peer_id: &str,
-    is_initiator: bool,
-    send: Function,
-    recv: Function,
-    close: Function,
-    list_hashes: Function,
-    get_blob: Function,
-    store_blob: Function,
-    config_json: Option<String>,
-) -> Result<JsValue, JsValue> {
-    // Parse vault key
-    let vault_key_bytes = hex::decode(vault_key_hex)
-        .map_err(|e| JsValue::from_str(&format!("Invalid vault key hex: {}", e)))?;
-    let vault_key = VaultKey::from_bytes(&vault_key_bytes)
-        .map_err(|e| JsValue::from_str(&format!("Invalid vault key: {}", e)))?;
-
-    // Parse vault ID
-    let vault_id_bytes = hex::decode(vault_id_hex)
-        .map_err(|e| JsValue::from_str(&format!("Invalid vault ID hex: {}", e)))?;
-    if vault_id_bytes.len() != 32 {
-        return Err(JsValue::from_str("Vault ID must be 32 bytes"));
-    }
-    let mut vault_id = [0u8; 32];
-    vault_id.copy_from_slice(&vault_id_bytes);
-
-    // Parse config
-    let config = match config_json {
-        Some(json) => {
-            let js_config: RunnerConfigJs = serde_json::from_str(&json)
-                .map_err(|e| JsValue::from_str(&format!("Invalid config: {}", e)))?;
-            RunnerConfig {
-                hostname: js_config.hostname.unwrap_or_else(|| "Unknown".into()),
-                nickname: js_config.nickname,
-                plugin_version: js_config.plugin_version,
-                pairing_nonce: None,
-                receive_timeout_ms: js_config.receive_timeout_ms.unwrap_or(30000),
-                ping_interval_ms: js_config.ping_interval_ms.unwrap_or(15000),
-                max_inline_blob_size: js_config.max_inline_blob_size.unwrap_or(1024 * 1024),
-            }
-        }
-        None => RunnerConfig::default(),
-    };
-
-    // Create stream adapter
-    let mut stream = JsSyncStream {
-        js_send: send,
-        js_recv: recv,
-        js_close: close,
-    };
-
-    // Create blob adapter
-    let mut blobs = JsBlobOps {
-        js_list_hashes: list_hashes,
-        js_get: get_blob,
-        js_store: store_blob,
-    };
-
-    // Create SyncEngine with the provided data
-    let host = Arc::new(crate::host::mock::MockHost::new());
-    let mut sync_engine = SyncEngine::new_with_key(host, vault_key)
-        .map_err(|e| JsValue::from_str(&format!("Failed to create sync engine: {}", e)))?;
-
-    // Set vault ID
-    sync_engine.init_vault(vault_id);
-
-    // Import the TypeScript Loro snapshot
-    let snapshot_bytes = loro_snapshot.to_vec();
-    sync_engine.import_snapshot_raw(&snapshot_bytes)
-        .map_err(|e| JsValue::from_str(&format!("Failed to import snapshot: {}", e)))?;
-
-    // Create and run the sync runner
-    let mut runner = SyncRunner::new(
-        config,
-        &sync_engine,
-        peer_id.to_string(),
-        is_initiator,
-    );
-
-    // Run sync with blobs
-    let result = runner.run(&mut stream, &mut blobs)
-        .map_err(|e| JsValue::from_str(&format!("Sync failed: {}", e)))?;
-
-    // Export the updated snapshot
-    let updated_snapshot = sync_engine.export_snapshot_raw()
-        .map_err(|e| JsValue::from_str(&format!("Failed to export snapshot: {}", e)))?;
-
-    // Serialize result to JSON with the snapshot as base64
-    use base64::Engine;
-    let result_json = serde_json::json!({
-        "updatedSnapshot": base64::engine::general_purpose::STANDARD.encode(&updated_snapshot),
-        "updatesSent": result.updates_sent,
-        "updatesReceived": result.updates_received,
-        "blobsSent": result.blobs_sent,
-        "blobsReceived": result.blobs_received,
-        "bytesSent": result.bytes_sent,
-        "bytesReceived": result.bytes_received,
-        "isLive": result.is_live,
-        "peerHostname": result.peer_hostname,
-        "peerNickname": result.peer_nickname,
-        "error": result.error,
-    });
-
-    Ok(JsValue::from_str(&result_json.to_string()))
-}
 
 #[cfg(test)]
 mod tests {
