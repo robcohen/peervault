@@ -54,6 +54,8 @@ xsalsa20poly1305 = "0.9"   # NaCl secretbox compatible
 sha2 = "0.10"
 hmac = "0.12"  # For AWS Signature V4
 hkdf = "0.12"
+argon2 = "0.5"  # Memory-hard passphrase KDF
+zeroize = { version = "1", features = ["derive"] }  # Wipe key material on drop
 rand = "0.9"
 
 # ECIES for key exchange (replaces manual x25519 + HKDF + encrypt)
