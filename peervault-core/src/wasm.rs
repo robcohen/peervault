@@ -3224,11 +3224,11 @@ impl WasmSyncRunner {
 
         let mut stream = JsSyncStream { js_send, js_recv, js_close };
 
-        let store_guard = engine.store.blocking_read();
+        let store_guard = engine.store.read().await;
         let loro_store = store_guard.as_ref()
             .ok_or_else(|| JsValue::from_str("Store not started"))?;
 
-        let key_guard = engine.encryption_key.blocking_read();
+        let key_guard = engine.encryption_key.read().await;
         let vault_key = key_guard.clone()
             .ok_or_else(|| JsValue::from_str("Encryption key not set"))?;
 

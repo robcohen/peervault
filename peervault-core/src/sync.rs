@@ -57,9 +57,9 @@ impl SyncEngine {
     /// Create a new sync engine with a vault key
     pub fn new_with_key(host: Arc<dyn HostInterface>, vault_key: VaultKey) -> Result<Self, CoreError> {
         let mut engine = Self::new(host)?;
-        // Temporarily need to block on setting the key for initialization
-        // In practice, this is fine since new_with_key is typically called at startup
-        *engine.vault_key.blocking_write() = Some(vault_key);
+        // Initialize the key by replacing the field directly — avoids blocking_write,
+        // which panics if new_with_key is ever called inside an async runtime context.
+        engine.vault_key = Arc::new(RwLock::new(Some(vault_key)));
         Ok(engine)
     }
 
