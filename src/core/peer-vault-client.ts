@@ -517,6 +517,14 @@ export class PeerVaultClient {
 
   async removePeer(peerId: string): Promise<void> {
     this.peers = this.peers.filter((p) => p.id !== peerId);
+    // Keep the WASM core's known-peers set in lockstep with the TS peer list —
+    // otherwise a removed peer stays authorized in the core and can re-pair/sync
+    // silently (the two lists were drifting).
+    try {
+      this.vault?.removeKnownPeer(peerId);
+    } catch (e) {
+      console.warn("[PeerVault] removeKnownPeer failed:", e);
+    }
     await this.savePeers();
   }
 
