@@ -10,7 +10,7 @@
 
 use std::sync::Mutex;
 
-use peervault_core::cloud::{CloudConfig, CloudSync, CloudSyncable, S3Client};
+use peervault_core::cloud::{CloudConfig, CloudSync, CloudSyncable, S3Client, S3Error};
 use peervault_core::CoreError;
 
 fn enabled() -> bool {
@@ -159,4 +159,41 @@ async fn cloudsync_blob_roundtrip_with_encrypted_index() {
         !String::from_utf8_lossy(&raw).contains(&hash),
         "blob-index leaks the content hash in cleartext"
     );
+}
+
+#[tokio::test]
+async fn conditional_put_optimistic_concurrency() {
+    if !enabled() {
+        eprintln!("skipping conditional-put: set PEERVAULT_MINIO_TEST=1");
+        return;
+    }
+    let client = S3Client::new(minio_config("it-cas")).expect("client");
+
+    // Write v1, capture its ETag.
+    client.put_object("cas.json", b"v1".to_vec(), Some("application/json")).await.expect("put v1");
+    let (body, etag_v1) = client.get_object_with_etag("cas.json").await.expect("get v1");
+    assert_eq!(body, b"v1");
+    assert!(etag_v1.is_some(), "backend did not return an ETag on GET");
+
+    // Overwrite → v2 (ETag now differs from etag_v1).
+    client.put_object("cas.json", b"v2".to_vec(), Some("application/json")).await.expect("put v2");
+
+    // Conditional PUT with the STALE v1 ETag. A backend that honors If-Match must
+    // reject this (412 → PreconditionFailed); one that doesn't will accept it and
+    // we degrade to last-write-wins. Either outcome is acceptable — assert we get
+    // one of them cleanly, and report which.
+    let result = client
+        .put_object_conditional("cas.json", b"v3".to_vec(), Some("application/json"), etag_v1.as_deref())
+        .await;
+    match result {
+        Err(S3Error::PreconditionFailed) => {
+            eprintln!("backend HONORS If-Match: optimistic concurrency protects meta.json");
+        }
+        Ok(()) => {
+            eprintln!("backend IGNORES If-Match: CAS degrades to last-write-wins (still safe for meta.json)");
+        }
+        Err(e) => panic!("unexpected error from conditional PUT: {:?}", e),
+    }
+
+    client.delete_object("cas.json").await.ok();
 }

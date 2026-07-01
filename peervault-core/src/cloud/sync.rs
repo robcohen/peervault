@@ -156,6 +156,9 @@ impl CloudSync {
         let mut meta;
         let mut imported_keys;
         let mut attempt = 0;
+        // ETag of the meta.json we base our writes on, for the optimistic-
+        // concurrency commit in step 5.
+        let mut base_etag: Option<String> = None;
         loop {
             result.bytes_downloaded = 0;
             result.deltas_downloaded = 0;
@@ -174,9 +177,10 @@ impl CloudSync {
             result.bytes_downloaded += dl_stats.bytes;
 
             attempt += 1;
-            let latest = self.fetch_or_create_meta(engine).await?;
+            let (latest, latest_etag) = self.fetch_or_create_meta_with_etag(engine).await?;
             if latest.snapshot_version == snapshot_before || attempt >= MAX_DOWNLOAD_ATTEMPTS {
                 meta = latest;
+                base_etag = latest_etag;
                 break;
             }
             debug!("Snapshot changed during download (attempt {}), retrying", attempt);
@@ -200,7 +204,7 @@ impl CloudSync {
         // Step 5: Update metadata
         self.state.phase = SyncPhase::Finalizing;
         meta.last_sync = Some(iso_now());
-        self.upload_meta(&meta).await?;
+        self.commit_meta(&meta, base_etag).await?;
 
         self.state.phase = SyncPhase::Idle;
         self.state.last_synced_at = meta.last_sync.clone();
@@ -285,8 +289,18 @@ impl CloudSync {
 
     /// Fetch cloud metadata or create new
     async fn fetch_or_create_meta<E: CloudSyncable>(&self, engine: &E) -> Result<CloudMeta, CloudSyncError> {
-        match self.s3.get_object("meta.json").await {
-            Ok(data) => {
+        Ok(self.fetch_or_create_meta_with_etag(engine).await?.0)
+    }
+
+    /// Like `fetch_or_create_meta`, but also returns meta.json's current ETag (for
+    /// the optimistic-concurrency commit in `commit_meta`). `None` when the object
+    /// doesn't exist yet or the backend sent no ETag.
+    async fn fetch_or_create_meta_with_etag<E: CloudSyncable>(
+        &self,
+        engine: &E,
+    ) -> Result<(CloudMeta, Option<String>), CloudSyncError> {
+        match self.s3.get_object_with_etag("meta.json").await {
+            Ok((data, etag)) => {
                 let meta: CloudMeta = serde_json::from_slice(&data)
                     .map_err(|e| CloudSyncError::Corruption(format!("Invalid meta.json: {}", e)))?;
 
@@ -299,14 +313,68 @@ impl CloudSync {
                     });
                 }
 
-                Ok(meta)
+                Ok((meta, etag))
             }
             Err(S3Error::NotFound(_)) => {
-                // Create new metadata
-                Ok(CloudMeta::new(*engine.vault_id()))
+                // Create new metadata (no ETag — the object doesn't exist yet).
+                Ok((CloudMeta::new(*engine.vault_id()), None))
             }
             Err(e) => Err(CloudSyncError::S3(e.to_string())),
         }
+    }
+
+    /// Raw meta.json fetch (bytes → CloudMeta + ETag) with no vault-id check —
+    /// used by `commit_meta`'s conflict retry, where the vault was already
+    /// validated this sync. Returns `None` if the object was deleted.
+    async fn get_meta_raw(&self) -> Result<(Option<CloudMeta>, Option<String>), CloudSyncError> {
+        match self.s3.get_object_with_etag("meta.json").await {
+            Ok((data, etag)) => {
+                let meta = serde_json::from_slice(&data)
+                    .map_err(|e| CloudSyncError::Corruption(format!("Invalid meta.json: {}", e)))?;
+                Ok((Some(meta), etag))
+            }
+            Err(S3Error::NotFound(_)) => Ok((None, None)),
+            Err(e) => Err(CloudSyncError::S3(e.to_string())),
+        }
+    }
+
+    /// Publish meta.json with optimistic concurrency. If another device wrote it
+    /// since we read it (the `If-Match` precondition fails), re-read the latest and
+    /// merge our authoritative fields onto it, then retry. After a few attempts we
+    /// fall back to an unconditional write — last-write-wins is safe for meta's
+    /// fields (snapshots are full, deltas are content-addressed, `last_sync` is
+    /// informational). On backends without conditional-PUT support the very first
+    /// write simply succeeds (the header is ignored).
+    async fn commit_meta(
+        &self,
+        ours: &CloudMeta,
+        base_etag: Option<String>,
+    ) -> Result<(), CloudSyncError> {
+        let mut meta = ours.clone();
+        let mut etag = base_etag;
+        for attempt in 0..3u32 {
+            let data = serde_json::to_vec_pretty(&meta)
+                .map_err(|e| CloudSyncError::Corruption(format!("Serialize meta: {}", e)))?;
+            match self
+                .s3
+                .put_object_conditional("meta.json", data, Some("application/json"), etag.as_deref())
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(S3Error::PreconditionFailed) => {
+                    warn!("meta.json changed concurrently (attempt {}); merging + retrying", attempt + 1);
+                    let (latest, latest_etag) = self.get_meta_raw().await?;
+                    meta = match latest {
+                        Some(latest) => merge_meta(latest, ours),
+                        None => ours.clone(),
+                    };
+                    etag = latest_etag;
+                }
+                Err(e) => return Err(CloudSyncError::S3(e.to_string())),
+            }
+        }
+        // Give up on CAS after a few rounds; unconditional write.
+        self.upload_meta(&meta).await
     }
 
     /// Upload metadata
@@ -543,6 +611,22 @@ impl CloudSync {
 struct TransferStats {
     count: usize,
     bytes: u64,
+}
+
+/// Merge our sync's authoritative meta fields onto a base written concurrently
+/// by another device (used when the optimistic commit hits a conflict).
+fn merge_meta(mut latest: CloudMeta, ours: &CloudMeta) -> CloudMeta {
+    // If we produced a newer snapshot (via compaction), our snapshot pointer wins.
+    if ours.snapshot_version != latest.snapshot_version
+        && ours.last_snapshot.as_deref() >= latest.last_snapshot.as_deref()
+    {
+        latest.snapshot_version = ours.snapshot_version.clone();
+        latest.last_snapshot = ours.last_snapshot.clone();
+    }
+    latest.last_sync = ours.last_sync.clone();
+    // delta_count is informational; keep the larger to avoid under-counting.
+    latest.delta_count = latest.delta_count.max(ours.delta_count);
+    latest
 }
 
 /// Get current time as ISO 8601 string

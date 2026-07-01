@@ -41,6 +41,9 @@ pub enum S3Error {
 
     #[error("Object not found: {0}")]
     NotFound(String),
+
+    #[error("Precondition failed (object changed since read)")]
+    PreconditionFailed,
 }
 
 impl S3Client {
@@ -94,6 +97,12 @@ impl S3Client {
 
     /// Get an object from S3
     pub async fn get_object(&self, key: &str) -> S3Result<Vec<u8>> {
+        Ok(self.get_object_with_etag(key).await?.0)
+    }
+
+    /// Like `get_object`, but also returns the object's ETag (if the backend sent
+    /// one) for optimistic concurrency control via `put_object_conditional`.
+    pub async fn get_object_with_etag(&self, key: &str) -> S3Result<(Vec<u8>, Option<String>)> {
         let full_key = self.config.object_path(key);
         let url = format!("{}/{}/{}", self.config.endpoint, self.config.bucket, full_key);
 
@@ -119,6 +128,12 @@ impl S3Client {
             return Err(S3Error::S3 { status, code, message });
         }
 
+        let etag = response
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
         // Guard against OOM from an oversized or hostile object: reject before
         // buffering the whole body into memory (severe on the WASM heap).
         const MAX_OBJECT_SIZE: u64 = 256 * 1024 * 1024;
@@ -132,13 +147,29 @@ impl S3Client {
             }
         }
 
-        response.bytes().await
+        let bytes = response.bytes().await
             .map(|b| b.to_vec())
-            .map_err(|e| S3Error::Network(e.to_string()))
+            .map_err(|e| S3Error::Network(e.to_string()))?;
+        Ok((bytes, etag))
     }
 
     /// Put an object to S3
     pub async fn put_object(&self, key: &str, data: Vec<u8>, content_type: Option<&str>) -> S3Result<()> {
+        self.put_object_conditional(key, data, content_type, None).await
+    }
+
+    /// Put an object with an optional `If-Match` precondition (optimistic
+    /// concurrency). When `if_match` is set and the object's current ETag differs,
+    /// S3 replies 412 → `S3Error::PreconditionFailed`. Backends without
+    /// conditional-PUT support ignore the header (the write proceeds), so callers
+    /// degrade gracefully to last-write-wins.
+    pub async fn put_object_conditional(
+        &self,
+        key: &str,
+        data: Vec<u8>,
+        content_type: Option<&str>,
+        if_match: Option<&str>,
+    ) -> S3Result<()> {
         let full_key = self.config.object_path(key);
         let url = format!("{}/{}/{}", self.config.endpoint, self.config.bucket, full_key);
 
@@ -153,12 +184,20 @@ impl S3Client {
         if let Some(ct) = content_type {
             req = req.header("Content-Type", ct);
         }
+        // Sent unsigned, like Content-Type; lenient S3 backends accept unsigned
+        // extra headers.
+        if let Some(etag) = if_match {
+            req = req.header("If-Match", etag);
+        }
 
         let response = req.send().await
             .map_err(|e| S3Error::Network(e.to_string()))?;
 
+        let status = response.status().as_u16();
+        if status == 412 {
+            return Err(S3Error::PreconditionFailed);
+        }
         if !response.status().is_success() {
-            let status = response.status().as_u16();
             let body = response.text().await.unwrap_or_default();
             let (code, message) = parse_s3_error(&body);
             return Err(S3Error::S3 { status, code, message });
