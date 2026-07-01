@@ -1341,6 +1341,35 @@ use crate::blobs_bridge::BlobsBridge;
 ///
 /// Used for log/error truncation of attacker-controlled strings (pairing nonces,
 /// peer ids) where naive byte slicing (`&s[..n]`) can panic mid-codepoint.
+/// Build a JS `Error` carrying a stable machine-readable `code` alongside the
+/// human message, so the TypeScript layer can branch on the failure kind instead
+/// of string-matching. Backward compatible: `.message` is unchanged; `.code` is
+/// additive.
+fn js_error(code: &str, message: &str) -> JsValue {
+    let err = js_sys::Error::new(message);
+    let _ = js_sys::Reflect::set(&err, &JsValue::from_str("code"), &JsValue::from_str(code));
+    err.into()
+}
+
+/// Map a `CoreError` to a coded JS error, preserving the actionable variants
+/// (e.g. `KEY_CONFLICT`, `DELTA_TOO_LARGE`) that the plugin needs to distinguish.
+fn core_err_to_js(e: crate::error::CoreError) -> JsValue {
+    use crate::error::CoreError;
+    let code = match &e {
+        CoreError::KeyConflict { .. } => "KEY_CONFLICT",
+        CoreError::DeltaTooLarge { .. } => "DELTA_TOO_LARGE",
+        CoreError::Crypto(_) => "CRYPTO",
+        CoreError::Timeout(_) => "TIMEOUT",
+        CoreError::Protocol(_) => "PROTOCOL",
+        CoreError::Crdt(_) => "CRDT",
+        CoreError::Host(_) => "HOST",
+        CoreError::Store(_) => "STORE",
+        CoreError::Config(_) => "CONFIG",
+        CoreError::Internal(_) => "INTERNAL",
+    };
+    js_error(code, &e.to_string())
+}
+
 fn short(s: &str, n: usize) -> &str {
     match s.char_indices().nth(n) {
         Some((idx, _)) => &s[..idx],
@@ -1399,7 +1428,7 @@ async fn run_initiator_sync_v3(
     on_event: &Option<Function>,
 ) -> Result<(), JsValue> {
     use crate::runner::{SyncRunner, RunnerConfig};
-    let ce = |e: crate::error::CoreError| JsValue::from_str(&e.to_string());
+    let ce = core_err_to_js;
 
     let cfg = RunnerConfig {
         hostname: hostname.to_string(),
@@ -1507,7 +1536,7 @@ async fn handle_incoming_streams_v3_inner(
     transport: &Arc<RwLock<Option<IrohTransport>>>,
     shutdown: &tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), JsValue> {
-    let ce = |e: crate::error::CoreError| JsValue::from_str(&e.to_string());
+    let ce = core_err_to_js;
 
     // Accept a stream from the connection
     let mut stream = {
