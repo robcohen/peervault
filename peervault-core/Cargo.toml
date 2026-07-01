@@ -67,11 +67,10 @@ reqwest = { version = "0.13", default-features = false, features = ["json"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# NOTE: kept at 1.x deliberately. bincode 2/3 change the default wire encoding and
-# restructured serde support (3.0 dropped the `serde` feature). Upgrading touches the
-# V3 sync wire format and must be done with a cross-version compatibility test under
-# the Docker e2e, not as a blind bump.
-bincode = "1"
+# bincode 2.x. All encode/decode goes through crate::wire using config::legacy(),
+# which is byte-compatible with bincode 1.x, so the sync wire format is unchanged.
+# (3.0 dropped the `serde` feature, so we stay on 2.x for serde-derived types.)
+bincode = { version = "2", features = ["serde"] }
 
 # Hex encoding
 hex = "0.4"

@@ -429,14 +429,14 @@ impl IrohStream {
 
     /// Send a message (serialized with bincode)
     pub async fn send_message<T: serde::Serialize>(&mut self, msg: &T) -> Result<()> {
-        let data = bincode::serialize(msg)?;
+        let data = crate::wire::encode(msg)?;
         self.send(&data).await
     }
 
     /// Receive a message (deserialized with bincode)
     pub async fn recv_message<T: serde::de::DeserializeOwned>(&mut self) -> Result<T> {
         let data = self.recv().await?;
-        let msg = bincode::deserialize(&data)?;
+        let msg = crate::wire::decode(&data)?;
         Ok(msg)
     }
 
