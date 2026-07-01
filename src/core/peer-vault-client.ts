@@ -10,6 +10,7 @@ import type { App } from "obsidian";
 // for the WASM→host event schema. Regenerate with:
 //   cd peervault-core && cargo test --features "ts-export test-utils" --lib export_ts_bindings
 import type { WasmEvent } from "./generated/events";
+import type { ReconcilePlan } from "./generated/reconcile";
 
 // =============================================================================
 // Types
@@ -117,6 +118,7 @@ interface WasmPeerVault {
   get(key: string): Promise<Uint8Array | null>;
   delete(key: string): Promise<void>;
   list(prefix?: string | null): Promise<string[]>;
+  reconcilePlan(dirtyPaths: string[]): Promise<string>; // JSON ReconcilePlan
 
   // State persistence
   export(): Promise<Uint8Array>;
@@ -164,7 +166,20 @@ function getSafeStorage(): any | null {
   }
 }
 
-class Storage {
+/**
+ * Host storage abstraction — the only platform-specific dependency of
+ * `PeerVaultClient`. Obsidian implements it over the vault adapter
+ * (`ObsidianStorage`); other hosts (VSCode, custom apps) implement these three
+ * methods over their own storage and reuse the client unchanged.
+ */
+export interface HostStorage {
+  get(key: string): Promise<Uint8Array | null>;
+  set(key: string, value: Uint8Array): Promise<void>;
+  delete(key: string): Promise<void>;
+}
+
+/** Obsidian-backed HostStorage (plugin data dir via the vault adapter). */
+export class ObsidianStorage implements HostStorage {
   constructor(private app: App) {}
 
   async get(key: string): Promise<Uint8Array | null> {
@@ -204,8 +219,7 @@ class Storage {
 
 export class PeerVaultClient {
   private config: ClientConfig;
-  private app: App;
-  private storage: Storage;
+  private storage: HostStorage;
   private handlers: EventHandler[] = [];
 
   private wasmModule: WasmModule | null = null;
@@ -222,10 +236,9 @@ export class PeerVaultClient {
   private pendingPairings: Map<string, number> = new Map();
   private static PAIRING_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 
-  constructor(app: App, config: ClientConfig) {
-    this.app = app;
+  constructor(storage: HostStorage, config: ClientConfig) {
     this.config = config;
-    this.storage = new Storage(app);
+    this.storage = storage;
   }
 
   // ===========================================================================
@@ -517,6 +530,17 @@ export class PeerVaultClient {
     this.emit({ type: "peer-connected", peerId, peerName: peer.name });
 
     return peerId;
+  }
+
+  /**
+   * Compute the disk-reconciliation plan from the core. The core owns the
+   * remote-deletion baseline, so every host gets identical deletion semantics.
+   * `dirtyPaths`: paths with local edits not yet ingested (never deleted).
+   */
+  async reconcilePlan(dirtyPaths: string[]): Promise<ReconcilePlan> {
+    if (!this.vault) throw new Error("Not initialized");
+    const json = await this.vault.reconcilePlan(dirtyPaths);
+    return JSON.parse(json) as ReconcilePlan;
   }
 
   async removePeer(peerId: string): Promise<void> {

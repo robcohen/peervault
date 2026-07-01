@@ -11,7 +11,6 @@
 //! even when transported over an already-encrypted connection.
 
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use iroh_blobs::Hash;
 use crate::host::HostInterface;
 use crate::error::CoreError;

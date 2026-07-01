@@ -13,9 +13,8 @@ use iroh_gossip::net::{Gossip, GOSSIP_ALPN};
 use iroh_gossip::proto::TopicId;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
-use crate::crypto::VaultKey;
 use crate::error::CoreError;
 
 /// Maximum gossip message size (64KB — covers most CRDT deltas)

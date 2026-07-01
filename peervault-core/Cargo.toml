@@ -14,7 +14,7 @@ wasm-opt = false
 
 [features]
 default = ["native"]
-native = ["tokio/rt-multi-thread", "reqwest/rustls"]
+native = ["tokio/rt-multi-thread", "tokio/time", "reqwest/rustls"]
 test-utils = []  # Exposes MockHost for integration tests
 ts-export = ["ts-rs"]  # emit src/core/generated/*.ts from the Rust event schema
 # Note: In WASM, reqwest uses browser fetch API automatically
