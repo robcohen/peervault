@@ -16,8 +16,6 @@ use crate::net::{IrohTransport, IrohConnection, IrohStream, Ticket};
 use iroh::SecretKey;
 use crate::store::{LoroStore, DocStore};
 use crate::cloud::{CloudConfig, CloudSync, CloudSyncState, SyncPhase};
-use crate::key_exchange::{KeyExchangeSession, KeyExchangeError};
-use crate::protocol::keys::{Message as KeyMessage, Request as KeyRequest, Response as KeyResponse};
 use crate::sync::SyncEngine;
 use crate::runner::{SyncRunner, RunnerConfig, SyncStream, BlobOps};
 use iroh_blobs::Hash;
@@ -456,8 +454,6 @@ pub struct WasmPeerVault {
     encryption_key: Arc<RwLock<Option<VaultKey>>>,
     /// Cloud sync instance (optional)
     cloud_sync: Arc<RwLock<Option<CloudSync>>>,
-    /// Key exchange session (for receiving vault key during pairing)
-    key_exchange: Arc<RwLock<Option<KeyExchangeSession>>>,
     /// Pending pairing nonces (nonce_hex -> expires_at_ms)
     /// Used for one-time ticket validation
     pending_pairings: Arc<RwLock<HashMap<String, u64>>>,
@@ -499,7 +495,6 @@ impl WasmPeerVault {
             on_storage_change: None,
             encryption_key: Arc::new(RwLock::new(None)),
             cloud_sync: Arc::new(RwLock::new(None)),
-            key_exchange: Arc::new(RwLock::new(None)),
             pending_pairings: Arc::new(RwLock::new(HashMap::new())),
             known_peers: Arc::new(RwLock::new(HashMap::new())),
             blobs_bridge: Arc::new(RwLock::new(None)),
@@ -637,144 +632,6 @@ impl WasmPeerVault {
 
         future_to_promise(async move {
             *key_store.write().await = None;
-            Ok(JsValue::TRUE)
-        })
-    }
-
-    // =========================================================================
-    // Key Exchange (P2P Vault Key Sharing)
-    // =========================================================================
-
-    /// Start a key exchange session as the initiator (requesting a key)
-    ///
-    /// Returns a base64-encoded request message to send to the peer.
-    /// Call this when pairing with a peer who has the vault key.
-    #[wasm_bindgen(js_name = startKeyExchangeRequest)]
-    pub fn start_key_exchange_request(&self) -> Promise {
-        let key_exchange = self.key_exchange.clone();
-        let encryption_key = self.encryption_key.clone();
-
-        future_to_promise(async move {
-            // Check if we already have a key
-            let has_key = encryption_key.read().await.is_some();
-
-            // Create new session as initiator
-            let session = KeyExchangeSession::new_initiator();
-            let request = session.create_request(has_key);
-
-            // Encode the request message
-            let encoded = request.encode()
-                .map_err(|e| JsValue::from_str(&format!("Failed to encode request: {}", e)))?;
-
-            // Store the session
-            *key_exchange.write().await = Some(session);
-
-            // Return base64-encoded message
-            use base64::Engine;
-            Ok(JsValue::from_str(&base64::engine::general_purpose::STANDARD.encode(&encoded)))
-        })
-    }
-
-    /// Handle a key exchange response from peer (as initiator)
-    ///
-    /// Takes the base64-encoded response message from peer.
-    /// Extracts and stores the vault key if successful.
-    /// Returns true if the key was received successfully.
-    #[wasm_bindgen(js_name = handleKeyExchangeResponse)]
-    pub fn handle_key_exchange_response(&self, response_b64: &str) -> Promise {
-        let key_exchange = self.key_exchange.clone();
-        let encryption_key = self.encryption_key.clone();
-        let response_b64 = response_b64.to_string();
-
-        future_to_promise(async move {
-            use base64::Engine;
-
-            // Decode the response
-            let response_bytes = base64::engine::general_purpose::STANDARD.decode(&response_b64)
-                .map_err(|e| JsValue::from_str(&format!("Invalid base64: {}", e)))?;
-
-            let message = KeyMessage::decode(&response_bytes)
-                .map_err(|e| JsValue::from_str(&format!("Invalid message: {}", e)))?;
-
-            // Get our session
-            let mut session_guard = key_exchange.write().await;
-            let session = session_guard.as_mut()
-                .ok_or_else(|| JsValue::from_str("No active key exchange session"))?;
-
-            // Handle the response
-            match message {
-                KeyMessage::Response(response) => {
-                    let vault_key = session.handle_response(&response)
-                        .map_err(|e| JsValue::from_str(&format!("Key exchange failed: {}", e)))?;
-
-                    // Store the vault key
-                    *encryption_key.write().await = Some(vault_key);
-
-                    // Clear the session
-                    *session_guard = None;
-
-                    Ok(JsValue::from_str(if response.is_new_key { "new" } else { "existing" }))
-                }
-                KeyMessage::Error(e) => {
-                    Err(JsValue::from_str(&format!("Peer rejected: {}", e.message)))
-                }
-                _ => Err(JsValue::from_str("Unexpected message type")),
-            }
-        })
-    }
-
-    /// Handle a key exchange request from peer (as responder)
-    ///
-    /// Takes the base64-encoded request message from peer.
-    /// Returns a base64-encoded response message to send back.
-    /// Requires that we already have a vault key.
-    #[wasm_bindgen(js_name = handleKeyExchangeRequest)]
-    pub fn handle_key_exchange_request(&self, request_b64: &str) -> Promise {
-        let encryption_key = self.encryption_key.clone();
-        let request_b64 = request_b64.to_string();
-
-        future_to_promise(async move {
-            use base64::Engine;
-
-            // Decode the request
-            let request_bytes = base64::engine::general_purpose::STANDARD.decode(&request_b64)
-                .map_err(|e| JsValue::from_str(&format!("Invalid base64: {}", e)))?;
-
-            let message = KeyMessage::decode(&request_bytes)
-                .map_err(|e| JsValue::from_str(&format!("Invalid message: {}", e)))?;
-
-            // Get our vault key
-            let vault_key = encryption_key.read().await.clone()
-                .ok_or_else(|| JsValue::from_str("No vault key available to share"))?;
-
-            // Handle the request
-            match message {
-                KeyMessage::Request(request) => {
-                    // Create a responder session
-                    let mut session = KeyExchangeSession::new_responder();
-
-                    // Generate response
-                    let response = session.handle_request(&request, Some(&vault_key))
-                        .map_err(|e| JsValue::from_str(&format!("Key exchange failed: {}", e)))?;
-
-                    // Encode the response
-                    let encoded = response.encode()
-                        .map_err(|e| JsValue::from_str(&format!("Failed to encode response: {}", e)))?;
-
-                    Ok(JsValue::from_str(&base64::engine::general_purpose::STANDARD.encode(&encoded)))
-                }
-                _ => Err(JsValue::from_str("Expected key exchange request")),
-            }
-        })
-    }
-
-    /// Cancel an in-progress key exchange session
-    #[wasm_bindgen(js_name = cancelKeyExchange)]
-    pub fn cancel_key_exchange(&self) -> Promise {
-        let key_exchange = self.key_exchange.clone();
-
-        future_to_promise(async move {
-            *key_exchange.write().await = None;
             Ok(JsValue::TRUE)
         })
     }
