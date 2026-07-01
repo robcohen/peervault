@@ -83,6 +83,7 @@ base64 = "0.22"
 
 # Async utilities
 futures = "0.3"
+async-trait = "0.1"  # async methods on the SyncStream trait
 
 # Time - web-time works in both native and WASM
 web-time = "1"

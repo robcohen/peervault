@@ -73,6 +73,10 @@ pub struct SyncRunResult {
     pub peer_hostname: String,
     /// Peer's nickname
     pub peer_nickname: Option<String>,
+    /// Whether the acceptor newly paired this peer (validator returned Ok(true))
+    pub pairing_is_new: bool,
+    /// The one-time pairing nonce that was accepted (for the caller to consume)
+    pub pairing_nonce: Option<String>,
     /// Error if sync failed
     pub error: Option<String>,
 }
@@ -89,6 +93,8 @@ impl Default for SyncRunResult {
             is_live: false,
             peer_hostname: String::new(),
             peer_nickname: None,
+            pairing_is_new: false,
+            pairing_nonce: None,
             error: None,
         }
     }
@@ -98,15 +104,16 @@ impl Default for SyncRunResult {
 ///
 /// This is simpler than the full Transport trait - just send/recv bytes.
 /// The WASM bindings will implement this.
+#[async_trait::async_trait]
 pub trait SyncStream: Send + Sync {
     /// Send a message (length-prefixed)
-    fn send(&mut self, data: &[u8]) -> Result<(), CoreError>;
+    async fn send(&mut self, data: &[u8]) -> Result<(), CoreError>;
 
     /// Receive a message with timeout
-    fn recv(&mut self, timeout_ms: u64) -> Result<Vec<u8>, CoreError>;
+    async fn recv(&mut self, timeout_ms: u64) -> Result<Vec<u8>, CoreError>;
 
     /// Close the stream
-    fn close(&mut self) -> Result<(), CoreError>;
+    async fn close(&mut self) -> Result<(), CoreError>;
 }
 
 /// Blob operations interface (provided by caller)
@@ -216,7 +223,7 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
     /// Run the sync protocol
     ///
     /// Returns when sync is complete (entering live mode) or on error.
-    pub fn run<S: SyncStream, B: BlobOps>(
+    pub async fn run<S: SyncStream, B: BlobOps>(
         &mut self,
         stream: &mut S,
         blobs: &mut B,
@@ -226,16 +233,16 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
             .map_err(|e| CoreError::Protocol(e.to_string()))?;
 
         // Phase 1: Exchange version info
-        self.exchange_versions(stream)?;
+        self.exchange_versions(stream).await?;
 
         // Phase 2: Exchange CRDT updates
-        self.exchange_updates(stream)?;
+        self.exchange_updates(stream).await?;
 
         // Phase 3: Exchange blobs
-        self.exchange_blobs(stream, blobs)?;
+        self.exchange_blobs(stream, blobs).await?;
 
         // Phase 4: Complete sync
-        self.complete_sync(stream)?;
+        self.complete_sync(stream).await?;
 
         // Enter live mode
         self.session.enter_live_mode()
@@ -246,30 +253,30 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
     }
 
     /// Run sync without blob exchange (simpler for CRDT-only sync)
-    pub fn run_without_blobs<S: SyncStream>(
+    pub async fn run_without_blobs<S: SyncStream>(
         &mut self,
         stream: &mut S,
     ) -> Result<SyncRunResult, CoreError> {
-        self.run(stream, &mut NoBlobOps)
+        self.run(stream, &mut NoBlobOps).await
     }
 
     /// Run phases 1-2 only (version exchange + CRDT sync).
     /// Returns the list of blob hashes to exchange.
     /// Call `exchange_blobs_inline` or handle blobs externally, then `complete_and_enter_live`.
-    pub fn run_crdt_only<S: SyncStream>(
+    pub async fn run_crdt_only<S: SyncStream>(
         &mut self,
         stream: &mut S,
     ) -> Result<(), CoreError> {
         self.session.start()
             .map_err(|e| CoreError::Protocol(e.to_string()))?;
-        self.exchange_versions(stream)?;
-        self.exchange_updates(stream)?;
+        self.exchange_versions(stream).await?;
+        self.exchange_updates(stream).await?;
         Ok(())
     }
 
     /// Exchange blob hash lists on the sync stream and compute diffs.
     /// Returns (hashes_we_need, hashes_peer_needs).
-    pub fn exchange_blob_hashes<S: SyncStream, B: BlobOps>(
+    pub async fn exchange_blob_hashes<S: SyncStream, B: BlobOps>(
         &mut self,
         stream: &mut S,
         blobs: &B,
@@ -283,10 +290,10 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
         let msg = Message::BlobHashes(BlobHashes {
             hashes: our_hashes.clone(),
         });
-        self.send_message(stream, &msg)?;
+        self.send_message(stream, &msg).await?;
 
         // Receive peer's hashes
-        let peer_hashes = self.recv_blob_hashes(stream)?;
+        let peer_hashes = self.recv_blob_hashes(stream).await?;
 
         // Compute diffs
         let our_set: std::collections::HashSet<_> = our_hashes.iter().collect();
@@ -305,7 +312,7 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
     }
 
     /// Send BlobSyncComplete on the sync stream (after external blob transfer).
-    pub fn send_blob_sync_complete<S: SyncStream>(
+    pub async fn send_blob_sync_complete<S: SyncStream>(
         &mut self,
         stream: &mut S,
         blob_count: usize,
@@ -313,11 +320,11 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
         let msg = Message::BlobSyncComplete(BlobSyncComplete {
             blob_count,
         });
-        self.send_message(stream, &msg)?;
+        self.send_message(stream, &msg).await?;
 
         // Wait for peer's BlobSyncComplete
         loop {
-            let data = stream.recv(self.config.receive_timeout_ms)?;
+            let data = stream.recv(self.config.receive_timeout_ms).await?;
             self.result.bytes_received += data.len() as u64;
             let msg = Message::decode(&data)
                 .map_err(|e| CoreError::Protocol(e.to_string()))?;
@@ -330,11 +337,11 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
     }
 
     /// Complete sync and enter live mode (phase 4).
-    pub fn complete_and_enter_live<S: SyncStream>(
+    pub async fn complete_and_enter_live<S: SyncStream>(
         &mut self,
         stream: &mut S,
     ) -> Result<SyncRunResult, CoreError> {
-        self.complete_sync(stream)?;
+        self.complete_sync(stream).await?;
         self.session.enter_live_mode()
             .map_err(|e| CoreError::Protocol(e.to_string()))?;
         self.result.is_live = true;
@@ -350,7 +357,7 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
     ///
     /// This runs until the connection is closed or an error occurs.
     /// Call this after `run()` succeeds.
-    pub fn run_live<S: SyncStream>(
+    pub async fn run_live<S: SyncStream>(
         &mut self,
         stream: &mut S,
         on_update: impl Fn(&[u8]) -> Result<(), CoreError>,
@@ -369,12 +376,12 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
                     seq,
                     timestamp: now_ms(),
                 });
-                self.send_message(stream, &ping)?;
+                self.send_message(stream, &ping).await?;
                 last_ping = Instant::now();
             }
 
             // Try to receive a message (non-blocking with short timeout)
-            match stream.recv(100) {
+            match stream.recv(100).await {
                 Ok(data) => {
                     self.result.bytes_received += data.len() as u64;
                     let msg = Message::decode(&data)
@@ -387,7 +394,7 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
                                 seq: ping.seq,
                                 timestamp: now_ms(),
                             });
-                            self.send_message(stream, &pong)?;
+                            self.send_message(stream, &pong).await?;
                         }
                         Message::Pong(pong) => {
                             self.session.handle_pong(pong.seq)
@@ -423,7 +430,7 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
     }
 
     /// Send an incremental update (call from live mode)
-    pub fn send_update<S: SyncStream>(
+    pub async fn send_update<S: SyncStream>(
         &mut self,
         stream: &mut S,
         data: &[u8],
@@ -432,7 +439,7 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
             data: data.to_vec(),
             op_count: 1,
         });
-        self.send_message(stream, &msg)?;
+        self.send_message(stream, &msg).await?;
         self.result.updates_sent += 1;
         Ok(())
     }
@@ -451,7 +458,7 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
     // Protocol Phases
     // =========================================================================
 
-    fn exchange_versions<S: SyncStream>(&mut self, stream: &mut S) -> Result<(), CoreError> {
+    async fn exchange_versions<S: SyncStream>(&mut self, stream: &mut S) -> Result<(), CoreError> {
         // Build our VERSION_INFO
         let our_info = VersionInfo {
             protocol_version: PROTOCOL_VERSION,
@@ -468,21 +475,21 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
 
         // Initiator sends first
         if self.is_initiator {
-            self.send_message(stream, &Message::VersionInfo(our_info.clone()))?;
+            self.send_message(stream, &Message::VersionInfo(our_info.clone())).await?;
         }
 
         // Receive peer's VERSION_INFO
-        let peer_info = self.recv_version_info(stream)?;
+        let peer_info = self.recv_version_info(stream).await?;
 
         // Validate basic handshake invariants (vault id, protocol version) BEFORE
         // consuming any one-time pairing nonce. Otherwise a peer presenting a valid
         // nonce but a mismatched vault/version could burn the legitimate pairing nonce.
         if peer_info.vault_id != *self.engine.vault_id() {
-            self.send_error(stream, error_codes::VAULT_MISMATCH, "Vault ID mismatch")?;
+            self.send_error(stream, error_codes::VAULT_MISMATCH, "Vault ID mismatch").await?;
             return Err(CoreError::Protocol("Vault ID mismatch".into()));
         }
         if peer_info.protocol_version < 2 {
-            self.send_error(stream, error_codes::VERSION_MISMATCH, "Protocol version too old")?;
+            self.send_error(stream, error_codes::VERSION_MISMATCH, "Protocol version too old").await?;
             return Err(CoreError::Protocol(format!(
                 "Protocol version too old: {} (minimum 2)",
                 peer_info.protocol_version,
@@ -493,7 +500,12 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
         // This allows us to reject unknown peers with invalid nonces
         if !self.is_initiator {
             match self.validator.validate(&self.peer_node_id, peer_info.pairing_nonce.as_deref()) {
-                Ok(_is_new) => {
+                Ok(is_new) => {
+                    // Record for the caller to consume the nonce / auto-add the peer.
+                    self.result.pairing_is_new = is_new;
+                    if is_new {
+                        self.result.pairing_nonce = peer_info.pairing_nonce.clone();
+                    }
                     // Pairing validated - proceed with sync.
                     // `get(..16)` avoids panicking on a non-UTF-8-boundary nonce.
                     tracing::info!(
@@ -503,7 +515,7 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
                     );
                 }
                 Err(reason) => {
-                    self.send_error(stream, error_codes::PAIRING_REJECTED, &reason)?;
+                    self.send_error(stream, error_codes::PAIRING_REJECTED, &reason).await?;
                     return Err(CoreError::Protocol(format!("Pairing rejected: {}", reason)));
                 }
             }
@@ -511,7 +523,7 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
 
         // Acceptor sends after receiving (and validating)
         if !self.is_initiator {
-            self.send_message(stream, &Message::VersionInfo(our_info))?;
+            self.send_message(stream, &Message::VersionInfo(our_info)).await?;
         }
 
         // Store peer info
@@ -527,7 +539,7 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
         Ok(())
     }
 
-    fn exchange_updates<S: SyncStream>(&mut self, stream: &mut S) -> Result<(), CoreError> {
+    async fn exchange_updates<S: SyncStream>(&mut self, stream: &mut S) -> Result<(), CoreError> {
         self.session.begin_update_sync()
             .map_err(|e| CoreError::Protocol(e.to_string()))?;
 
@@ -540,7 +552,7 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
                 data: our_updates.clone(),
                 op_count: 1,
             });
-            self.send_message(stream, &msg)?;
+            self.send_message(stream, &msg).await?;
             self.result.updates_sent += 1;
         }
 
@@ -548,11 +560,11 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
         let complete_msg = Message::SyncComplete(SyncComplete {
             version_bytes: self.engine.version_vector(),
         });
-        self.send_message(stream, &complete_msg)?;
+        self.send_message(stream, &complete_msg).await?;
 
         // Receive peer's updates
         loop {
-            let data = stream.recv(self.config.receive_timeout_ms)?;
+            let data = stream.recv(self.config.receive_timeout_ms).await?;
             self.result.bytes_received += data.len() as u64;
 
             let msg = Message::decode(&data)
@@ -573,7 +585,7 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
                                 stream,
                                 error_codes::KEY_CONFLICT,
                                 "Vault key mismatch - both devices have different encryption keys"
-                            )?;
+                            ).await?;
                             return Err(CoreError::KeyConflict {
                                 our_device: self.config.hostname.clone(),
                                 peer_device: self.result.peer_hostname.clone(),
@@ -617,7 +629,7 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
 
     /// V2 inline blob exchange (sends/receives blobs on the sync stream).
     /// Use `exchange_blob_hashes` + external iroh-blobs transfer for V3.
-    pub fn exchange_blobs<S: SyncStream, B: BlobOps>(
+    pub async fn exchange_blobs<S: SyncStream, B: BlobOps>(
         &mut self,
         stream: &mut S,
         blobs: &mut B,
@@ -632,10 +644,10 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
         let msg = Message::BlobHashes(BlobHashes {
             hashes: our_hashes.clone(),
         });
-        self.send_message(stream, &msg)?;
+        self.send_message(stream, &msg).await?;
 
         // Receive peer's hashes
-        let peer_hashes = self.recv_blob_hashes(stream)?;
+        let peer_hashes = self.recv_blob_hashes(stream).await?;
 
         // Compute what we need from peer
         let our_set: std::collections::HashSet<_> = our_hashes.iter().collect();
@@ -656,7 +668,7 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
             let msg = Message::BlobRequest(BlobRequest {
                 hashes: need_from_peer.clone(),
             });
-            self.send_message(stream, &msg)?;
+            self.send_message(stream, &msg).await?;
         }
 
         // Handle blob exchange (send and receive interleaved).
@@ -681,7 +693,7 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
 
         while received < need_from_peer.len() || sent < send_to_peer.len() {
             // Try to receive
-            match stream.recv(1000) {
+            match stream.recv(1000).await {
                 Ok(data) => {
                     messages += 1;
                     if messages > max_messages {
@@ -714,7 +726,7 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
                                         data: encrypted,
                                         mime_type: None,
                                     });
-                                    self.send_message(stream, &msg)?;
+                                    self.send_message(stream, &msg).await?;
                                     self.result.blobs_sent += 1;
                                 }
                             }
@@ -739,7 +751,7 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
                                     data: encrypted,
                                     mime_type: None,
                                 });
-                                self.send_message(stream, &msg)?;
+                                self.send_message(stream, &msg).await?;
                                 self.result.blobs_sent += 1;
                             }
                             None => {
@@ -769,21 +781,21 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
         let msg = Message::BlobSyncComplete(BlobSyncComplete {
             blob_count: self.result.blobs_sent,
         });
-        self.send_message(stream, &msg)?;
+        self.send_message(stream, &msg).await?;
 
         Ok(())
     }
 
-    fn complete_sync<S: SyncStream>(&mut self, stream: &mut S) -> Result<(), CoreError> {
+    async fn complete_sync<S: SyncStream>(&mut self, stream: &mut S) -> Result<(), CoreError> {
         // Send SYNC_COMPLETE
         let msg = Message::SyncComplete(SyncComplete {
             version_bytes: self.engine.version_vector(),
         });
-        self.send_message(stream, &msg)?;
+        self.send_message(stream, &msg).await?;
 
         // Wait for peer's SYNC_COMPLETE
         loop {
-            let data = stream.recv(self.config.receive_timeout_ms)?;
+            let data = stream.recv(self.config.receive_timeout_ms).await?;
             self.result.bytes_received += data.len() as u64;
 
             let msg = Message::decode(&data)
@@ -811,15 +823,15 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
     // Helpers
     // =========================================================================
 
-    fn send_message<S: SyncStream>(&mut self, stream: &mut S, msg: &Message) -> Result<(), CoreError> {
+    async fn send_message<S: SyncStream>(&mut self, stream: &mut S, msg: &Message) -> Result<(), CoreError> {
         let data = msg.encode()
             .map_err(|e| CoreError::Protocol(e.to_string()))?;
         self.result.bytes_sent += data.len() as u64;
         self.session.metrics_mut().record_sent(data.len());
-        stream.send(&data)
+        stream.send(&data).await
     }
 
-    fn send_error<S: SyncStream>(
+    async fn send_error<S: SyncStream>(
         &mut self,
         stream: &mut S,
         code: u8,
@@ -829,11 +841,11 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
             code,
             message: message.into(),
         });
-        self.send_message(stream, &msg)
+        self.send_message(stream, &msg).await
     }
 
-    fn recv_version_info<S: SyncStream>(&mut self, stream: &mut S) -> Result<VersionInfo, CoreError> {
-        let data = stream.recv(self.config.receive_timeout_ms)?;
+    async fn recv_version_info<S: SyncStream>(&mut self, stream: &mut S) -> Result<VersionInfo, CoreError> {
+        let data = stream.recv(self.config.receive_timeout_ms).await?;
         self.result.bytes_received += data.len() as u64;
         self.session.metrics_mut().record_received(data.len());
 
@@ -851,8 +863,8 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
         }
     }
 
-    fn recv_blob_hashes<S: SyncStream>(&mut self, stream: &mut S) -> Result<Vec<Hash>, CoreError> {
-        let data = stream.recv(self.config.receive_timeout_ms)?;
+    async fn recv_blob_hashes<S: SyncStream>(&mut self, stream: &mut S) -> Result<Vec<Hash>, CoreError> {
+        let data = stream.recv(self.config.receive_timeout_ms).await?;
         self.result.bytes_received += data.len() as u64;
 
         let msg = Message::decode(&data)
@@ -908,19 +920,20 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl SyncStream for TestStream {
-        fn send(&mut self, data: &[u8]) -> Result<(), CoreError> {
+        async fn send(&mut self, data: &[u8]) -> Result<(), CoreError> {
             self.send_buf.lock().unwrap().push_back(data.to_vec());
             Ok(())
         }
 
-        fn recv(&mut self, _timeout_ms: u64) -> Result<Vec<u8>, CoreError> {
+        async fn recv(&mut self, _timeout_ms: u64) -> Result<Vec<u8>, CoreError> {
             self.recv_buf.lock().unwrap()
                 .pop_front()
                 .ok_or_else(|| CoreError::Timeout("No data".into()))
         }
 
-        fn close(&mut self) -> Result<(), CoreError> {
+        async fn close(&mut self) -> Result<(), CoreError> {
             Ok(())
         }
     }
@@ -932,8 +945,8 @@ mod tests {
         (host, engine)
     }
 
-    #[test]
-    fn test_version_exchange() {
+    #[tokio::test]
+    async fn test_version_exchange() {
         // Create engines with shared vault key
         let host1 = Arc::new(MockHost::new());
         let host2 = Arc::new(MockHost::new());
@@ -980,10 +993,10 @@ mod tests {
             pairing_nonce: None,
             supports_iroh_blobs: true,
         };
-        runner1.send_message(&mut s1, &Message::VersionInfo(our_info)).unwrap();
+        runner1.send_message(&mut s1, &Message::VersionInfo(our_info)).await.unwrap();
 
         // Acceptor receives and sends
-        let peer_info = runner2.recv_version_info(&mut s2).unwrap();
+        let peer_info = runner2.recv_version_info(&mut s2).await.unwrap();
         assert_eq!(peer_info.hostname, "test1");
 
         let our_info2 = VersionInfo {
@@ -997,15 +1010,15 @@ mod tests {
             pairing_nonce: None,
             supports_iroh_blobs: true,
         };
-        runner2.send_message(&mut s2, &Message::VersionInfo(our_info2)).unwrap();
+        runner2.send_message(&mut s2, &Message::VersionInfo(our_info2)).await.unwrap();
 
         // Initiator receives
-        let peer_info = runner1.recv_version_info(&mut s1).unwrap();
+        let peer_info = runner1.recv_version_info(&mut s1).await.unwrap();
         assert_eq!(peer_info.hostname, "test2");
     }
 
-    #[test]
-    fn test_message_roundtrip() {
+    #[tokio::test]
+    async fn test_message_roundtrip() {
         let ping = Message::Ping(Ping { seq: 42, timestamp: 12345 });
         let encoded = ping.encode().unwrap();
         let decoded = Message::decode(&encoded).unwrap();

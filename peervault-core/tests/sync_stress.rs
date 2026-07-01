@@ -34,12 +34,13 @@ impl ChannelStream {
     }
 }
 
+#[async_trait::async_trait]
 impl SyncStream for ChannelStream {
-    fn send(&mut self, data: &[u8]) -> Result<(), CoreError> {
+    async fn send(&mut self, data: &[u8]) -> Result<(), CoreError> {
         self.tx.send(data.to_vec())
             .map_err(|_| CoreError::Protocol("Channel closed".into()))
     }
-    fn recv(&mut self, timeout_ms: u64) -> Result<Vec<u8>, CoreError> {
+    async fn recv(&mut self, timeout_ms: u64) -> Result<Vec<u8>, CoreError> {
         self.rx.lock().unwrap()
             .recv_timeout(std::time::Duration::from_millis(timeout_ms))
             .map_err(|e| match e {
@@ -47,7 +48,7 @@ impl SyncStream for ChannelStream {
                 std::sync::mpsc::RecvTimeoutError::Disconnected => CoreError::Protocol("Channel disconnected".into()),
             })
     }
-    fn close(&mut self) -> Result<(), CoreError> { Ok(()) }
+    async fn close(&mut self) -> Result<(), CoreError> { Ok(()) }
 }
 
 struct TestBlobOps {
@@ -96,11 +97,11 @@ fn run_sync(e1: &SyncEngine, e2: &SyncEngine) {
     thread::scope(|scope| {
         let r1 = scope.spawn(|| {
             let mut runner = SyncRunner::new(config.clone(), e1, "peer2".into(), true);
-            runner.run(&mut s1, &mut NoBlobOps)
+            tokio::runtime::Runtime::new().unwrap().block_on(runner.run(&mut s1, &mut NoBlobOps))
         });
         let r2 = scope.spawn(|| {
             let mut runner = SyncRunner::new(config.clone(), e2, "peer1".into(), false);
-            runner.run(&mut s2, &mut NoBlobOps)
+            tokio::runtime::Runtime::new().unwrap().block_on(runner.run(&mut s2, &mut NoBlobOps))
         });
         r1.join().expect("initiator panicked").expect("initiator failed");
         r2.join().expect("acceptor panicked").expect("acceptor failed");
@@ -116,11 +117,11 @@ fn run_sync_with_blobs(
     thread::scope(|scope| {
         let r1 = scope.spawn(|| {
             let mut runner = SyncRunner::new(config.clone(), e1, "peer2".into(), true);
-            runner.run(&mut s1, b1)
+            tokio::runtime::Runtime::new().unwrap().block_on(runner.run(&mut s1, b1))
         });
         let r2 = scope.spawn(|| {
             let mut runner = SyncRunner::new(config.clone(), e2, "peer1".into(), false);
-            runner.run(&mut s2, b2)
+            tokio::runtime::Runtime::new().unwrap().block_on(runner.run(&mut s2, b2))
         });
         r1.join().expect("initiator panicked").expect("initiator failed");
         r2.join().expect("acceptor panicked").expect("acceptor failed");

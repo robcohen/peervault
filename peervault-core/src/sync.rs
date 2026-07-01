@@ -31,7 +31,7 @@ pub struct SyncEngine {
     /// The Loro document store
     store: LoroStore,
     /// Vault encryption key (required)
-    vault_key: Arc<RwLock<Option<VaultKey>>>,
+    vault_key: Arc<std::sync::RwLock<Option<VaultKey>>>,
 }
 
 impl SyncEngine {
@@ -50,7 +50,7 @@ impl SyncEngine {
             host,
             peer_id,
             store: LoroStore::new(vault_id),
-            vault_key: Arc::new(RwLock::new(None)),
+            vault_key: Arc::new(std::sync::RwLock::new(None)),
         })
     }
 
@@ -59,7 +59,7 @@ impl SyncEngine {
         let mut engine = Self::new(host)?;
         // Initialize the key by replacing the field directly — avoids blocking_write,
         // which panics if new_with_key is ever called inside an async runtime context.
-        engine.vault_key = Arc::new(RwLock::new(Some(vault_key)));
+        engine.vault_key = Arc::new(std::sync::RwLock::new(Some(vault_key)));
         Ok(engine)
     }
 
@@ -70,29 +70,29 @@ impl SyncEngine {
 
     /// Set the vault encryption key
     pub async fn set_vault_key(&self, key: VaultKey) {
-        *self.vault_key.write().await = Some(key);
+        *self.vault_key.write().unwrap() = Some(key);
     }
 
     /// Check if vault key is set
     pub async fn has_vault_key(&self) -> bool {
-        self.vault_key.read().await.is_some()
+        self.vault_key.read().unwrap().is_some()
     }
 
     /// Get a clone of the vault key (for sharing during pairing)
     pub async fn get_vault_key(&self) -> Option<VaultKey> {
-        self.vault_key.read().await.clone()
+        self.vault_key.read().unwrap().clone()
     }
 
     /// Generate a new vault key
     pub async fn generate_vault_key(&self) -> VaultKey {
         let key = VaultKey::generate();
-        *self.vault_key.write().await = Some(key.clone());
+        *self.vault_key.write().unwrap() = Some(key.clone());
         key
     }
 
     /// Get the vault key, returning an error if not set
     fn require_vault_key_sync(&self) -> Result<VaultKey, CoreError> {
-        self.vault_key.blocking_read()
+        self.vault_key.read().unwrap()
             .clone()
             .ok_or_else(|| CoreError::Crypto("Vault key not set".into()))
     }
@@ -278,8 +278,9 @@ impl SyncEngine {
 
     /// Save vault key to storage (encrypted with device secret)
     pub async fn save_vault_key(&self, device_secret: &[u8; 32]) -> Result<(), CoreError> {
-        let vault_key = self.vault_key.read().await;
-        if let Some(key) = vault_key.as_ref() {
+        // Clone out and drop the (std) guard before any await.
+        let key = self.vault_key.read().unwrap().clone();
+        if let Some(key) = key {
             // Use device secret to wrap the vault key
             let wrapper = VaultKey::from_bytes(device_secret)
                 .map_err(|e| CoreError::Crypto(e.to_string()))?;
@@ -302,7 +303,7 @@ impl SyncEngine {
                 .map_err(|e| CoreError::Crypto(e.to_string()))?;
             let vault_key = VaultKey::from_bytes(&key_bytes)
                 .map_err(|e| CoreError::Crypto(e.to_string()))?;
-            *self.vault_key.write().await = Some(vault_key);
+            *self.vault_key.write().unwrap() = Some(vault_key);
             Ok(true)
         } else {
             Ok(false)
