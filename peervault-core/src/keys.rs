@@ -152,12 +152,12 @@ impl KeyManager {
 
         // Generate nonce
         let nonce_bytes = self.host.random_bytes(12);
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = Nonce::try_from(&nonce_bytes[..]).map_err(|e| CoreError::Crypto(format!("nonce: {}", e)))?;
 
         // Encrypt
         let cipher = ChaCha20Poly1305::new_from_slice(&vault_key)
             .map_err(|e| CoreError::Crypto(format!("cipher init failed: {}", e)))?;
-        let ciphertext = cipher.encrypt(nonce, data)
+        let ciphertext = cipher.encrypt(&nonce, data)
             .map_err(|e| CoreError::Crypto(format!("encryption failed: {}", e)))?;
 
         // Return nonce || ciphertext
@@ -178,12 +178,12 @@ impl KeyManager {
             CoreError::Crypto("no vault key".into())
         })?;
 
-        let nonce = Nonce::from_slice(&encrypted[..12]);
+        let nonce = Nonce::try_from(&encrypted[..12]).map_err(|e| CoreError::Crypto(format!("nonce: {}", e)))?;
         let ciphertext = &encrypted[12..];
 
         let cipher = ChaCha20Poly1305::new_from_slice(&vault_key)
             .map_err(|e| CoreError::Crypto(format!("cipher init failed: {}", e)))?;
-        cipher.decrypt(nonce, ciphertext)
+        cipher.decrypt(&nonce, ciphertext)
             .map_err(|e| CoreError::Crypto(format!("decryption failed: {}", e)))
     }
 
@@ -194,11 +194,11 @@ impl KeyManager {
         })?;
 
         let nonce_bytes = self.host.random_bytes(12);
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = Nonce::try_from(&nonce_bytes[..]).map_err(|e| CoreError::Crypto(format!("nonce: {}", e)))?;
 
         let cipher = ChaCha20Poly1305::new_from_slice(&device_secret)
             .map_err(|e| CoreError::Crypto(format!("cipher init failed: {}", e)))?;
-        let ciphertext = cipher.encrypt(nonce, vault_key.as_ref())
+        let ciphertext = cipher.encrypt(&nonce, vault_key.as_ref())
             .map_err(|e| CoreError::Crypto(format!("encryption failed: {}", e)))?;
 
         let mut result = Vec::with_capacity(12 + ciphertext.len());
@@ -218,12 +218,12 @@ impl KeyManager {
             CoreError::Crypto("no device secret".into())
         })?;
 
-        let nonce = Nonce::from_slice(&encrypted[..12]);
+        let nonce = Nonce::try_from(&encrypted[..12]).map_err(|e| CoreError::Crypto(format!("nonce: {}", e)))?;
         let ciphertext = &encrypted[12..];
 
         let cipher = ChaCha20Poly1305::new_from_slice(&device_secret)
             .map_err(|e| CoreError::Crypto(format!("cipher init failed: {}", e)))?;
-        let plaintext = cipher.decrypt(nonce, ciphertext)
+        let plaintext = cipher.decrypt(&nonce, ciphertext)
             .map_err(|e| CoreError::Crypto(format!("decryption failed: {}", e)))?;
 
         if plaintext.len() != 32 {

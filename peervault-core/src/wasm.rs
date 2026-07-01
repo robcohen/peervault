@@ -1645,10 +1645,9 @@ impl WasmPeerVault {
 // V3 Sync Protocol (binary, async, with pairing + blobs)
 // =============================================================================
 
-use tracing::{info, warn, debug, error};
+use tracing::{info, warn, debug};
 
 use crate::blobs_bridge::BlobsBridge;
-use crate::protocol::sync::{self as proto, Message as SyncMessage, PROTOCOL_VERSION};
 
 
 /// Run sync as INITIATOR using V3 binary protocol.
