@@ -455,11 +455,13 @@ pub struct WasmPeerVault {
     /// Cloud sync instance (optional)
     cloud_sync: Arc<RwLock<Option<CloudSync>>>,
     /// Pending pairing nonces (nonce_hex -> expires_at_ms)
-    /// Used for one-time ticket validation
-    pending_pairings: Arc<RwLock<HashMap<String, u64>>>,
+    /// Used for one-time ticket validation.
+    /// Plain std lock: only ever touched momentarily (never held across .await), so
+    /// this avoids tokio's `blocking_*` which panics if called in an async context.
+    pending_pairings: Arc<std::sync::RwLock<HashMap<String, u64>>>,
     /// Known peer IDs (peer_id -> added_at_ms)
-    /// Peers that have successfully completed pairing
-    known_peers: Arc<RwLock<HashMap<String, u64>>>,
+    /// Peers that have successfully completed pairing. Plain std lock (see above).
+    known_peers: Arc<std::sync::RwLock<HashMap<String, u64>>>,
     /// iroh-blobs bridge for V3 blob transfer
     blobs_bridge: Arc<RwLock<Option<crate::blobs_bridge::BlobsBridge>>>,
     /// iroh-gossip bridge for real-time CRDT delta broadcast
@@ -495,8 +497,8 @@ impl WasmPeerVault {
             on_storage_change: None,
             encryption_key: Arc::new(RwLock::new(None)),
             cloud_sync: Arc::new(RwLock::new(None)),
-            pending_pairings: Arc::new(RwLock::new(HashMap::new())),
-            known_peers: Arc::new(RwLock::new(HashMap::new())),
+            pending_pairings: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            known_peers: Arc::new(std::sync::RwLock::new(HashMap::new())),
             blobs_bridge: Arc::new(RwLock::new(None)),
             gossip_bridge: Arc::new(RwLock::new(None)),
         })
@@ -933,7 +935,7 @@ impl WasmPeerVault {
     /// used once and expires after the given timestamp.
     #[wasm_bindgen(js_name = registerPairingNonce)]
     pub fn register_pairing_nonce(&self, nonce: &str, expires_at_ms: f64) {
-        let mut pending = self.pending_pairings.blocking_write();
+        let mut pending = self.pending_pairings.write().unwrap();
         pending.insert(nonce.to_string(), expires_at_ms as u64);
         web_sys::console::log_1(&JsValue::from_str(&format!(
             "[WASM] Registered pairing nonce: {}...",
@@ -947,7 +949,7 @@ impl WasmPeerVault {
     /// Returns false if the nonce was invalid, expired, or already used.
     #[wasm_bindgen(js_name = validatePairingNonce)]
     pub fn validate_pairing_nonce(&self, nonce: &str) -> bool {
-        let mut pending = self.pending_pairings.blocking_write();
+        let mut pending = self.pending_pairings.write().unwrap();
 
         // Check if nonce exists
         if let Some(&expires_at) = pending.get(nonce) {
@@ -981,14 +983,14 @@ impl WasmPeerVault {
     /// Check if a peer is known (already paired)
     #[wasm_bindgen(js_name = isKnownPeer)]
     pub fn is_known_peer(&self, peer_id: &str) -> bool {
-        self.known_peers.blocking_read().contains_key(peer_id)
+        self.known_peers.read().unwrap().contains_key(peer_id)
     }
 
     /// Add a peer to the known peers list
     #[wasm_bindgen(js_name = addKnownPeer)]
     pub fn add_known_peer(&self, peer_id: &str) {
         let now = js_sys::Date::now() as u64;
-        self.known_peers.blocking_write().insert(peer_id.to_string(), now);
+        self.known_peers.write().unwrap().insert(peer_id.to_string(), now);
         web_sys::console::log_1(&JsValue::from_str(&format!(
             "[WASM] Added known peer: {}...",
             short(&peer_id, 16)
@@ -998,13 +1000,13 @@ impl WasmPeerVault {
     /// Remove a peer from the known peers list
     #[wasm_bindgen(js_name = removeKnownPeer)]
     pub fn remove_known_peer(&self, peer_id: &str) {
-        self.known_peers.blocking_write().remove(peer_id);
+        self.known_peers.write().unwrap().remove(peer_id);
     }
 
     /// Get list of known peer IDs
     #[wasm_bindgen(js_name = getKnownPeers)]
     pub fn get_known_peers(&self) -> Vec<JsValue> {
-        self.known_peers.blocking_read()
+        self.known_peers.read().unwrap()
             .keys()
             .map(|k| JsValue::from_str(k))
             .collect()
@@ -1888,8 +1890,8 @@ async fn handle_incoming_streams_v3(
     connections: Arc<RwLock<HashMap<String, IrohConnection>>>,
     store: Arc<RwLock<Option<LoroStore>>>,
     on_event: Option<Function>,
-    pending_pairings: Arc<RwLock<HashMap<String, u64>>>,
-    known_peers: Arc<RwLock<HashMap<String, u64>>>,
+    pending_pairings: Arc<std::sync::RwLock<HashMap<String, u64>>>,
+    known_peers: Arc<std::sync::RwLock<HashMap<String, u64>>>,
     encryption_key: Arc<RwLock<Option<VaultKey>>>,
     blobs_bridge_arc: Arc<RwLock<Option<BlobsBridge>>>,
     gossip_bridge_arc: Arc<RwLock<Option<crate::gossip_bridge::GossipBridge>>>,
@@ -1911,8 +1913,8 @@ async fn handle_incoming_streams_v3_inner(
     connections: &Arc<RwLock<HashMap<String, IrohConnection>>>,
     store: &Arc<RwLock<Option<LoroStore>>>,
     on_event: &Option<Function>,
-    pending_pairings: &Arc<RwLock<HashMap<String, u64>>>,
-    known_peers: &Arc<RwLock<HashMap<String, u64>>>,
+    pending_pairings: &Arc<std::sync::RwLock<HashMap<String, u64>>>,
+    known_peers: &Arc<std::sync::RwLock<HashMap<String, u64>>>,
     encryption_key: &Arc<RwLock<Option<VaultKey>>>,
     blobs_bridge_arc: &Arc<RwLock<Option<BlobsBridge>>>,
     gossip_bridge_arc: &Arc<RwLock<Option<crate::gossip_bridge::GossipBridge>>>,
@@ -1972,8 +1974,8 @@ async fn handle_incoming_streams_v3_inner(
     }
 
     // Validate pairing (take snapshots to avoid holding locks)
-    let known_snap: std::collections::HashMap<String, u64> = known_peers.read().await.clone();
-    let pending_snap: std::collections::HashMap<String, u64> = pending_pairings.read().await.clone();
+    let known_snap: std::collections::HashMap<String, u64> = known_peers.read().unwrap().clone();
+    let pending_snap: std::collections::HashMap<String, u64> = pending_pairings.read().unwrap().clone();
 
     let validation = match validate_pairing(
         peer_id,
@@ -1996,9 +1998,9 @@ async fn handle_incoming_streams_v3_inner(
     // Update state if newly paired
     if validation.is_new_peer {
         if let Some(nonce) = &validation.consumed_nonce {
-            pending_pairings.write().await.remove(nonce);
+            pending_pairings.write().unwrap().remove(nonce);
         }
-        known_peers.write().await.insert(
+        known_peers.write().unwrap().insert(
             peer_id.to_string(),
             web_time::SystemTime::now()
                 .duration_since(web_time::SystemTime::UNIX_EPOCH)
@@ -2425,8 +2427,8 @@ async fn run_accept_loop(
     connections: Arc<RwLock<HashMap<String, IrohConnection>>>,
     store: Arc<RwLock<Option<LoroStore>>>,
     on_event: Option<Function>,
-    pending_pairings: Arc<RwLock<HashMap<String, u64>>>,
-    known_peers: Arc<RwLock<HashMap<String, u64>>>,
+    pending_pairings: Arc<std::sync::RwLock<HashMap<String, u64>>>,
+    known_peers: Arc<std::sync::RwLock<HashMap<String, u64>>>,
     encryption_key: Arc<RwLock<Option<VaultKey>>>,
     blobs_bridge: Arc<RwLock<Option<BlobsBridge>>>,
     gossip_bridge: Arc<RwLock<Option<crate::gossip_bridge::GossipBridge>>>,
