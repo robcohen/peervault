@@ -157,7 +157,8 @@ const KEY_FMT_SAFE_STORAGE = 0x01;
  */
 function getSafeStorage(): any | null {
   try {
-    const req = (window as any).require ?? (globalThis as any).require;
+    // globalThis-based so this file typechecks without DOM libs (Node hosts).
+    const req = (globalThis as any).window?.require ?? (globalThis as any).require;
     const electron = req?.("electron");
     const ss = electron?.safeStorage ?? electron?.remote?.safeStorage;
     return ss && typeof ss.isEncryptionAvailable === "function" ? ss : null;

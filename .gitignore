@@ -79,3 +79,7 @@ peervault-*.tar.gz
 # Native daemon + Zed extension build artifacts
 hosts/peervaultd/target/
 hosts/zed/target/
+# VSCode host build artifacts
+hosts/vscode/node_modules/
+hosts/vscode/dist/
+hosts/vscode/*.vsix

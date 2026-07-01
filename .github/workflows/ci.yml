@@ -49,3 +49,6 @@ jobs:
 
       - name: peervaultd build
         run: nix develop --command bash -c 'cd hosts/peervaultd && cargo build'
+
+      - name: VSCode host typecheck
+        run: nix develop --command bash -c 'cd hosts/vscode && bun install && bun run check'
