@@ -121,6 +121,10 @@ pub struct WasmPeerVault {
     blobs_bridge: Arc<RwLock<Option<crate::blobs_bridge::BlobsBridge>>>,
     /// iroh-gossip bridge for real-time CRDT delta broadcast
     gossip_bridge: Arc<RwLock<Option<crate::gossip_bridge::GossipBridge>>>,
+    /// Shutdown signal for background tasks (accept loop, gossip receiver/debounce).
+    /// `stop()` sets it to `true`; long-running loops `select!` on it and exit.
+    /// `start()` resets it to `false` so a stop→start cycle re-arms cleanly.
+    shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 #[wasm_bindgen]
@@ -156,6 +160,7 @@ impl WasmPeerVault {
             known_peers: Arc::new(std::sync::RwLock::new(HashMap::new())),
             blobs_bridge: Arc::new(RwLock::new(None)),
             gossip_bridge: Arc::new(RwLock::new(None)),
+            shutdown: tokio::sync::watch::channel(false).0,
         })
     }
 
@@ -363,6 +368,10 @@ impl WasmPeerVault {
         let blobs_bridge = self.blobs_bridge.clone();
         let gossip_bridge_arc = self.gossip_bridge.clone();
         let encryption_key = self.encryption_key.clone();
+        // Re-arm the shutdown signal (so a stop→start cycle works) and hand the
+        // accept loop a receiver it selects on.
+        let _ = self.shutdown.send(false);
+        let shutdown_rx = self.shutdown.subscribe();
 
         future_to_promise(async move {
             // Create BlobsBridge
@@ -424,6 +433,7 @@ impl WasmPeerVault {
             let encryption_key_for_accept = encryption_key.clone();
             let blobs_bridge_for_accept = blobs_bridge.clone();
             let gossip_bridge_for_accept = gossip_bridge_arc.clone();
+            let shutdown_for_accept = shutdown_rx.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 run_accept_loop(
                     transport_for_accept,
@@ -435,6 +445,7 @@ impl WasmPeerVault {
                     encryption_key_for_accept,
                     blobs_bridge_for_accept,
                     gossip_bridge_for_accept,
+                    shutdown_for_accept,
                 ).await;
             });
 
@@ -461,6 +472,10 @@ impl WasmPeerVault {
         let blobs_bridge = self.blobs_bridge.clone();
         let gossip_bridge_arc = self.gossip_bridge.clone();
         let encryption_key = self.encryption_key.clone();
+        // Re-arm the shutdown signal (so a stop→start cycle works) and hand the
+        // accept loop a receiver it selects on.
+        let _ = self.shutdown.send(false);
+        let shutdown_rx = self.shutdown.subscribe();
 
         future_to_promise(async move {
             // Create BlobsBridge
@@ -517,6 +532,7 @@ impl WasmPeerVault {
             let encryption_key_for_accept = encryption_key.clone();
             let blobs_bridge_for_accept = blobs_bridge.clone();
             let gossip_bridge_for_accept = gossip_bridge_arc.clone();
+            let shutdown_for_accept = shutdown_rx.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 run_accept_loop(
                     transport_for_accept,
@@ -528,6 +544,7 @@ impl WasmPeerVault {
                     encryption_key_for_accept,
                     blobs_bridge_for_accept,
                     gossip_bridge_for_accept,
+                    shutdown_for_accept,
                 ).await;
             });
 
@@ -539,6 +556,12 @@ impl WasmPeerVault {
     #[wasm_bindgen]
     pub fn stop(&self) -> Promise {
         let transport = self.transport.clone();
+
+        // Signal shutdown FIRST, before contending for the transport write lock.
+        // The accept loop holds a transport read guard across `accept().await`; the
+        // signal makes it break and release the guard so `take()` below can proceed
+        // (otherwise stop() would hang until a connection happened to arrive).
+        let _ = self.shutdown.send(true);
 
         future_to_promise(async move {
             if let Some(t) = transport.write().await.take() {
@@ -701,6 +724,7 @@ impl WasmPeerVault {
         let encryption_key = self.encryption_key.clone();
         let blobs_bridge = self.blobs_bridge.clone();
         let gossip_bridge = self.gossip_bridge.clone();
+        let shutdown = self.shutdown.subscribe();
         let ticket_str = ticket_str.to_string();
 
         // Convert JsValue to Option<String>
@@ -849,12 +873,14 @@ impl WasmPeerVault {
                         let store_for_gossip = store.clone();
                         let enc_key_for_gossip = encryption_key.clone();
                         let on_event_for_gossip = on_event.clone();
+                        let shutdown_for_gossip = shutdown.clone();
                         wasm_bindgen_futures::spawn_local(async move {
                             run_gossip_receiver(
                                 receiver,
                                 store_for_gossip,
                                 enc_key_for_gossip,
                                 on_event_for_gossip,
+                                shutdown_for_gossip,
                             ).await;
                         });
 
@@ -864,6 +890,7 @@ impl WasmPeerVault {
                         let enc_for_debounce = encryption_key.clone();
                         let notify = gb.change_notify();
                         let on_event_for_debounce = on_event.clone();
+                        let shutdown_for_debounce = shutdown.clone();
                         wasm_bindgen_futures::spawn_local(async move {
                             run_gossip_debounce(
                                 gb_for_debounce,
@@ -871,6 +898,7 @@ impl WasmPeerVault {
                                 enc_for_debounce,
                                 notify,
                                 on_event_for_debounce,
+                                shutdown_for_debounce,
                             ).await;
                         });
                     }
@@ -1429,11 +1457,12 @@ async fn handle_incoming_streams_v3(
     blobs_bridge_arc: Arc<RwLock<Option<BlobsBridge>>>,
     gossip_bridge_arc: Arc<RwLock<Option<crate::gossip_bridge::GossipBridge>>>,
     transport: Arc<RwLock<Option<IrohTransport>>>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let result = handle_incoming_streams_v3_inner(
         &peer_id, &connections, &store, &on_event,
         &pending_pairings, &known_peers, &encryption_key,
-        &blobs_bridge_arc, &gossip_bridge_arc, &transport,
+        &blobs_bridge_arc, &gossip_bridge_arc, &transport, &shutdown,
     ).await;
 
     if let Err(e) = result {
@@ -1476,6 +1505,7 @@ async fn handle_incoming_streams_v3_inner(
     blobs_bridge_arc: &Arc<RwLock<Option<BlobsBridge>>>,
     gossip_bridge_arc: &Arc<RwLock<Option<crate::gossip_bridge::GossipBridge>>>,
     transport: &Arc<RwLock<Option<IrohTransport>>>,
+    shutdown: &tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), JsValue> {
     let ce = |e: crate::error::CoreError| JsValue::from_str(&e.to_string());
 
@@ -1607,12 +1637,14 @@ async fn handle_incoming_streams_v3_inner(
                 let store_for_gossip = store.clone();
                 let enc_key_for_gossip = encryption_key.clone();
                 let on_event_for_gossip = on_event.clone();
+                let shutdown_for_gossip = shutdown.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     run_gossip_receiver(
                         receiver,
                         store_for_gossip,
                         enc_key_for_gossip,
                         on_event_for_gossip,
+                        shutdown_for_gossip,
                     ).await;
                 });
 
@@ -1621,6 +1653,7 @@ async fn handle_incoming_streams_v3_inner(
                 let enc_for_debounce = encryption_key.clone();
                 let notify = gb.change_notify();
                 let on_event_for_debounce = on_event.clone();
+                let shutdown_for_debounce = shutdown.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     run_gossip_debounce(
                         gb_for_debounce,
@@ -1628,6 +1661,7 @@ async fn handle_incoming_streams_v3_inner(
                         enc_for_debounce,
                         notify,
                         on_event_for_debounce,
+                        shutdown_for_debounce,
                     ).await;
                 });
             }
@@ -1649,6 +1683,7 @@ async fn run_gossip_receiver(
     store: Arc<RwLock<Option<LoroStore>>>,
     encryption_key: Arc<RwLock<Option<VaultKey>>>,
     on_event: Option<Function>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     use futures::StreamExt;
     use iroh_gossip::api::Event;
@@ -1656,7 +1691,12 @@ async fn run_gossip_receiver(
     info!("Gossip receiver started");
 
     loop {
-        while let Some(event) = receiver.next().await {
+        // Stop cleanly on shutdown (select yields None → while exits).
+        while let Some(event) = (tokio::select! {
+            biased;
+            _ = shutdown.changed() => None,
+            ev = receiver.next() => ev,
+        }) {
             match event {
                 Ok(Event::Received(msg)) => {
                     let data = msg.content.to_vec();
@@ -1748,12 +1788,20 @@ async fn run_gossip_debounce(
     encryption_key: Arc<RwLock<Option<VaultKey>>>,
     change_notify: Arc<tokio::sync::Notify>,
     on_event: Option<Function>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     info!("Gossip debounce task started");
 
     loop {
-        // Wait for a change notification
-        change_notify.notified().await;
+        // Wait for a change notification, or exit on shutdown.
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => {
+                info!("Gossip debounce task: shutdown signaled");
+                break;
+            }
+            _ = change_notify.notified() => {}
+        }
 
         // Debounce: wait 200ms for more changes to accumulate
         let promise = js_sys::Promise::new(&mut |resolve, _| {
@@ -1857,10 +1905,16 @@ async fn run_accept_loop(
     encryption_key: Arc<RwLock<Option<VaultKey>>>,
     blobs_bridge: Arc<RwLock<Option<BlobsBridge>>>,
     gossip_bridge: Arc<RwLock<Option<crate::gossip_bridge::GossipBridge>>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     info!("Accept loop started");
 
     loop {
+        if *shutdown.borrow() {
+            info!("Accept loop: shutdown signaled");
+            break;
+        }
+
         // Get transport reference
         let transport_guard = transport.read().await;
         let iroh = match transport_guard.as_ref() {
@@ -1871,8 +1925,18 @@ async fn run_accept_loop(
             }
         };
 
-        // Try to accept a connection
-        match iroh.accept().await {
+        // Accept a connection, but bail out immediately if shutdown is signaled so
+        // we release the transport read guard (stop() needs the write guard).
+        let accepted = tokio::select! {
+            biased;
+            _ = shutdown.changed() => {
+                info!("Accept loop: shutdown during accept");
+                break;
+            }
+            result = iroh.accept() => result,
+        };
+
+        match accepted {
             Ok(connection) => {
                 let peer_id = connection.peer_id().to_string();
                 info!("Accept loop: accepted connection from {}", short(&peer_id, 16));
@@ -1903,6 +1967,7 @@ async fn run_accept_loop(
                 let blobs_bridge_clone = blobs_bridge.clone();
                 let gossip_bridge_clone = gossip_bridge.clone();
                 let transport_clone = transport.clone();
+                let shutdown_clone = shutdown.clone();
 
                 wasm_bindgen_futures::spawn_local(async move {
                     handle_incoming_streams_v3(
@@ -1916,6 +1981,7 @@ async fn run_accept_loop(
                         blobs_bridge_clone,
                         gossip_bridge_clone,
                         transport_clone,
+                        shutdown_clone,
                     ).await;
                 });
             }

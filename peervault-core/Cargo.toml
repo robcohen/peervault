@@ -33,7 +33,7 @@ wasm = [
 
 [dependencies]
 # Async runtime - minimal features for WASM compatibility
-tokio = { version = "1", default-features = false, features = ["sync"] }
+tokio = { version = "1", default-features = false, features = ["sync", "macros"] }
 
 # Iroh networking (P2P transport)
 # Use default-features = false for WASM compatibility
