@@ -8,7 +8,7 @@ use crate::transport::{
     Connection, ConnectionStats, PeerAddress, Stream, Transport, TransportError, TransportResult,
 };
 
-use iroh::{Endpoint, RelayMap, RelayMode, RelayUrl, SecretKey, Watcher};
+use iroh::{Endpoint, RelayMap, RelayMode, RelayUrl, SecretKey};
 use iroh::protocol::Router;
 use iroh_blobs::BlobsProtocol;
 use iroh_blobs::store::mem::MemStore;
@@ -54,7 +54,7 @@ impl WasmTransport {
                     .map_err(|_| "Invalid key: expected 32 bytes".to_string())?;
                 SecretKey::from_bytes(&arr)
             }
-            None => SecretKey::generate(&mut rand::rng()),
+            None => SecretKey::generate(),
         };
 
         let relay_mode = match relay_url {
@@ -68,7 +68,7 @@ impl WasmTransport {
         };
 
         // Build endpoint without ALPNs — Router handles ALPN registration
-        let endpoint = Endpoint::builder()
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
             .secret_key(secret_key.clone())
             .relay_mode(relay_mode)
             .bind()
@@ -129,7 +129,7 @@ impl WasmTransport {
         self.endpoint.online().await;
         let endpoint_addr = self.endpoint.addr();
         let ticket = EndpointTicket::new(endpoint_addr);
-        Ok(ticket.serialize())
+        Ok(ticket.encode_string())
     }
 
     /// Connect to a peer using their ticket.
@@ -183,7 +183,7 @@ impl WasmTransport {
 
         // Try base32 format first
         if ticket.starts_with("endpoint") {
-            return EndpointTicket::deserialize(ticket)
+            return EndpointTicket::decode_string(ticket)
                 .map(|t| t.endpoint_addr().clone())
                 .map_err(|e| JsValue::from_str(&format!("Invalid ticket: {}", e)));
         }
@@ -195,7 +195,7 @@ impl WasmTransport {
         }
 
         // Try both
-        if let Ok(t) = EndpointTicket::deserialize(ticket) {
+        if let Ok(t) = EndpointTicket::decode_string(ticket) {
             return Ok(t.endpoint_addr().clone());
         }
 
@@ -333,26 +333,21 @@ impl WasmConnection {
     }
 
     /// Get RTT in milliseconds.
+    ///
+    /// TODO(iroh-1.0): RTT is now per-path (`Connection::rtt(path_id) -> Option<Duration>`).
+    /// Wire up multipath RTT reporting; returns 0.0 (unknown) for now.
     #[wasm_bindgen(js_name = getRttMs)]
     pub fn get_rtt_ms(&self) -> f64 {
-        self.connection.rtt().as_secs_f64() * 1000.0
+        0.0
     }
 
     /// Get connection type.
+    ///
+    /// TODO(iroh-1.0): the `ConnectionType`/`Endpoint::conn_type` API was removed in
+    /// iroh 1.0. Re-derive direct/relay from the new path API; returns "unknown" for now.
     #[wasm_bindgen(js_name = getConnectionType)]
     pub fn get_connection_type(&self) -> String {
-        use iroh::endpoint::ConnectionType;
-
-        let remote_id = self.connection.remote_id();
-        match self.endpoint.conn_type(remote_id) {
-            Some(mut watcher) => match Watcher::get(&mut watcher) {
-                ConnectionType::Direct(_) => "direct".to_string(),
-                ConnectionType::Relay(_) => "relay".to_string(),
-                ConnectionType::Mixed(_, _) => "mixed".to_string(),
-                ConnectionType::None => "none".to_string(),
-            },
-            None => "none".to_string(),
-        }
+        "unknown".to_string()
     }
 
     /// Close the connection.
@@ -416,9 +411,10 @@ impl Connection for WasmConnection {
     }
 
     fn stats(&self) -> ConnectionStats {
+        // TODO(iroh-1.0): RTT is per-path now and the connection-type API was removed.
         ConnectionStats {
-            rtt_ms: Some(self.connection.rtt().as_millis() as u32),
-            is_relayed: self.get_connection_type() == "relay",
+            rtt_ms: None,
+            is_relayed: false,
             ..Default::default()
         }
     }

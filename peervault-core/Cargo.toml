@@ -38,10 +38,12 @@ tokio = { version = "1", default-features = false, features = ["sync"] }
 
 # Iroh networking (P2P transport)
 # Use default-features = false for WASM compatibility
-iroh = { version = "0.95", default-features = false }
-iroh-tickets = { version = "0.2", default-features = false }
-iroh-blobs = { version = "0.97", default-features = false }
-iroh-gossip = { version = "0.95", default-features = false, features = ["net"] }
+# tls-ring gives the ring crypto provider needed by the endpoint presets, without
+# the native-code default features (portmapper/fast-apple-datapath) that break WASM.
+iroh = { version = "1.0", default-features = false, features = ["tls-ring"] }
+iroh-tickets = { version = "1.0", default-features = false }
+iroh-blobs = { version = "0.103", default-features = false }
+iroh-gossip = { version = "0.101", default-features = false, features = ["net"] }
 
 # Loro CRDT - high-performance collaborative data structures
 loro = "1.10"
@@ -92,8 +94,9 @@ anyhow = "1"
 # Logging
 tracing = "0.1"
 
-# WASM bindings (optional) - pin exact version to match iroh-examples
-wasm-bindgen = { version = "=0.2.105", optional = true }
+# WASM bindings (optional). Must match the wasm-bindgen-cli used by `just wasm`
+# (wasm-pack fetches the matching CLI). Bumped for iroh 1.0 (needs js-sys 0.3.83+).
+wasm-bindgen = { version = "0.2.108", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
 js-sys = { version = "0.3", optional = true }
 web-sys = { version = "0.3", optional = true, features = [

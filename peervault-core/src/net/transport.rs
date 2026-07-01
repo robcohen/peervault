@@ -51,7 +51,7 @@ impl IrohTransport {
 
     /// Create a new transport with a specific relay URL
     pub async fn with_relay(relay_url: Option<&str>) -> Result<Self> {
-        let secret_key = SecretKey::generate(&mut rand::rng());
+        let secret_key = SecretKey::generate();
         Self::with_secret_key_and_relay(secret_key, relay_url).await
     }
 
@@ -91,7 +91,7 @@ impl IrohTransport {
             }
         };
 
-        let endpoint = Endpoint::builder()
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
             .secret_key(secret_key.clone())
             .relay_mode(relay_mode)
             .bind()

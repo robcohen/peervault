@@ -860,7 +860,7 @@ impl WasmPeerVault {
             // Build endpoint, then create GossipBridge (needs endpoint for Gossip),
             // then create transport (registers Gossip on Router)
             use iroh::{RelayMap, RelayMode, RelayUrl};
-            let secret_key = SecretKey::generate(&mut rand::rng());
+            let secret_key = SecretKey::generate();
             let relay_mode = match relay_url.as_deref() {
                 Some(url) => {
                     let relay: RelayUrl = url.parse()
@@ -873,7 +873,7 @@ impl WasmPeerVault {
                     RelayMode::Custom(RelayMap::from_iter(vec![relay]))
                 }
             };
-            let endpoint = iroh::Endpoint::builder()
+            let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
                 .secret_key(secret_key.clone())
                 .relay_mode(relay_mode)
                 .bind()
@@ -957,7 +957,7 @@ impl WasmPeerVault {
 
             // Build endpoint, GossipBridge, then transport (same as start())
             use iroh::{RelayMap, RelayMode, RelayUrl};
-            let secret_key = SecretKey::generate(&mut rand::rng());
+            let secret_key = SecretKey::generate();
             let relay_mode = match relay_url.as_deref() {
                 Some(url) => {
                     let relay: RelayUrl = url.parse()
@@ -970,7 +970,7 @@ impl WasmPeerVault {
                     RelayMode::Custom(RelayMap::from_iter(vec![relay]))
                 }
             };
-            let endpoint = iroh::Endpoint::builder()
+            let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
                 .secret_key(secret_key.clone())
                 .relay_mode(relay_mode)
                 .bind()
