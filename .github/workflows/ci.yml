@@ -46,3 +46,6 @@ jobs:
 
       - name: Install deps and typecheck
         run: nix develop --command bash -c 'bun install && bun run check'
+
+      - name: peervaultd build
+        run: nix develop --command bash -c 'cd hosts/peervaultd && cargo build'

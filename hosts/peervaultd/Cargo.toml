@@ -1,0 +1,22 @@
+[package]
+name = "peervaultd"
+version = "0.1.0"
+edition = "2021"
+description = "PeerVault sync daemon — syncs a directory P2P; editor-agnostic (Zed, vim, anything)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/robcohen/peervault"
+
+[[bin]]
+name = "peervaultd"
+path = "src/main.rs"
+
+[dependencies]
+peervault-core = { path = "../../peervault-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "net", "io-util", "io-std", "sync"] }
+notify = "8"
+serde_json = "1"
+hex = "0.4"
+rand = "0.10"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

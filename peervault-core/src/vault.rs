@@ -857,6 +857,13 @@ impl PeerVault {
             s.set_text(&key, &content_str)
                 .map_err(|e| CoreError::Protocol(format!("Failed to set: {}", e)))?;
 
+            // Host-authored keys are disk-accounted: advance the reconcile
+            // baseline so a later REMOTE delete of this key is recognized
+            // (deletes = baseline − current − dirty). Without this, files that
+            // entered via scan/ingest are invisible to deletion reconciliation
+            // and a stale disk copy can resurrect them.
+            self.reconcile_baseline.write().unwrap().insert(key.clone());
+
             // Notify gossip of change (debounced — will batch and broadcast)
             let gossip_guard = gossip_bridge.read().await;
             if let Some(ref gb) = *gossip_guard {
@@ -935,6 +942,10 @@ impl PeerVault {
 
             s.delete_file(&key)
                 .map_err(|e| CoreError::Protocol(format!("Failed to delete: {}", e)))?;
+
+            // The host already removed this key from its disk — take it out of
+            // the baseline so reconcile doesn't schedule a redundant delete.
+            self.reconcile_baseline.write().unwrap().remove(&key);
 
             // Notify gossip of change (debounced)
             let gossip_guard = gossip_bridge.read().await;
@@ -1663,7 +1674,9 @@ async fn run_gossip_debounce(
                 info!("Gossip debounce task: shutdown signaled");
                 break;
             }
-            _ = change_notify.notified() => {}
+            _ = change_notify.notified() => {
+                tracing::debug!("debounce: woke");
+            }
         }
 
         // Debounce: wait 200ms for more changes to accumulate
@@ -1913,6 +1926,14 @@ impl PeerVault {
     /// so they are never scheduled for deletion — deleting them would silently
     /// destroy a file the user just created. Advances the baseline to the
     /// current keys.
+    /// Debug: full CRDT deep-value (tests/diagnostics only).
+    pub async fn debug_deep_value(&self) -> String {
+        match self.store.read().await.as_ref() {
+            Some(s) => s.debug_deep_value(),
+            None => "<no store>".to_string(),
+        }
+    }
+
     pub async fn reconcile_plan(&self, dirty_paths: Vec<String>) -> Result<ReconcilePlan, CoreError> {
         let store_guard = self.store.read().await;
         let store = store_guard

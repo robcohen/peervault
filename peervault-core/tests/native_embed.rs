@@ -76,7 +76,21 @@ async fn two_native_engines_pair_and_converge() {
     let known = a.get_known_peers();
     assert!(!known.is_empty(), "acceptor did not record the paired peer");
 
-    // --- Live convergence via gossip ---
+    // --- Live convergence via gossip (both authorships) ---
+    // A-authored file under a folder BOTH peers will also write into: the joiner
+    // later deletes it (regression topology for cross-peer soft-deletes with
+    // duplicate concurrent folder nodes).
+    a.set("notes/from-a.md", b"authored by a").await.expect("set on a");
+    let mut a_file_on_b = false;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if b.get("notes/from-a.md").await.expect("get").is_some() {
+            a_file_on_b = true;
+            break;
+        }
+    }
+    assert!(a_file_on_b, "A-authored file did not reach B");
+
     b.set("notes/native.md", b"hello from a native host").await.expect("set on b");
 
     let mut converged = false;
@@ -96,6 +110,33 @@ async fn two_native_engines_pair_and_converge() {
         events.contains("pairing_complete") || events.contains("peer_connected"),
         "no pairing/connection events observed natively: {events}"
     );
+
+    // --- Deletion must propagate too (regression: soft-delete via gossip) ---
+    // Delete the A-AUTHORED file from B (the exact daemon failure topology).
+    if let Err(e) = b.delete("notes/from-a.md").await {
+        eprintln!("B state on failure: {}", b.debug_deep_value().await);
+        panic!("delete from-a on b: {e}");
+    }
+    let mut cross_delete = false;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if a.get("notes/from-a.md").await.expect("get").is_none() {
+            cross_delete = true;
+            break;
+        }
+    }
+    assert!(cross_delete, "deletion of A-authored file by B did not propagate to A");
+
+    b.delete("notes/native.md").await.expect("delete on b");
+    let mut delete_propagated = false;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if a.get("notes/native.md").await.expect("get").is_none() {
+            delete_propagated = true;
+            break;
+        }
+    }
+    assert!(delete_propagated, "remote deletion did not propagate to engine A within 30s");
 
     // --- Clean shutdown (exercises the watch-based cancellation natively) ---
     b.stop().await.expect("stop b");

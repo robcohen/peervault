@@ -15,9 +15,18 @@ involved.
 | **WASM** | JS/TS hosts (Obsidian, VSCode, browser) | `wasm-pack` package; `WasmPeerVault` in `wasm.rs` is a thin shim over `PeerVault` |
 | **Native** | Rust apps, CLIs, daemons | `peervault-core` as an rlib; call `PeerVault` directly on tokio |
 
-For editors that can't host a QUIC stack in-process (vim), the intended shape
-is a small native daemon (one `PeerVault` per vault directory) with a thin
-editor client — the daemon is just another native embedding.
+For editors that can't host a QUIC stack in-process (Zed, vim), the daemon
+exists: **`hosts/peervaultd/`** — run it in any directory (`peervaultd run`),
+pair with `peervaultd ctl ticket` / `--join <ticket>`, and every editor sees
+synced files. `peervaultd lsp` speaks a minimal LSP handshake on stdio so
+editor extensions can launch it as a workspace sidecar — **`hosts/zed/`** is
+exactly that (a ~40-line Zed extension). Pairing tickets are TS-compatible
+(`peervault_core::pairing`), so daemon ↔ Obsidian ↔ VSCode pairing interops.
+
+Known issue: the daemon's file-deletion propagation has a race under gossip
+echo (tracked; creates/edits/joins are validated). The engine itself handles
+cross-peer deletion correctly — see `tests/native_embed.rs` and
+`tests/delete_repro.rs`.
 
 ## What a host must provide
 
