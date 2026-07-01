@@ -119,6 +119,19 @@ impl S3Client {
             return Err(S3Error::S3 { status, code, message });
         }
 
+        // Guard against OOM from an oversized or hostile object: reject before
+        // buffering the whole body into memory (severe on the WASM heap).
+        const MAX_OBJECT_SIZE: u64 = 256 * 1024 * 1024;
+        if let Some(len) = response.content_length() {
+            if len > MAX_OBJECT_SIZE {
+                return Err(S3Error::S3 {
+                    status,
+                    code: "ObjectTooLarge".into(),
+                    message: format!("object {} is {} bytes (max {})", key, len, MAX_OBJECT_SIZE),
+                });
+            }
+        }
+
         response.bytes().await
             .map(|b| b.to_vec())
             .map_err(|e| S3Error::Network(e.to_string()))

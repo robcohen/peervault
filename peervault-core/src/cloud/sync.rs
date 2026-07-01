@@ -111,6 +111,10 @@ pub struct CloudSync {
     /// Snapshot version we have already downloaded and imported this session,
     /// so we don't re-download the (potentially large) snapshot every sync.
     applied_snapshot_version: Option<String>,
+    /// Delta object keys already downloaded + imported this session, so we don't
+    /// re-fetch/re-decrypt/re-import every delta on every sync. Reset on compaction
+    /// (which deletes the deltas). Session-scoped only (not persisted).
+    applied_deltas: std::collections::HashSet<String>,
 }
 
 impl CloudSync {
@@ -127,6 +131,7 @@ impl CloudSync {
             encryption,
             state: CloudSyncState::default(),
             applied_snapshot_version: None,
+            applied_deltas: std::collections::HashSet::new(),
         })
     }
 
@@ -358,8 +363,16 @@ impl CloudSync {
         self.state.pending_downloads = objects.len();
 
         for obj in objects {
-            // CRDT import is idempotent, so re-applying an already-seen delta is
-            // harmless; we re-import every listed delta each sync.
+            // Every listed delta is present and (once imported) part of the snapshot,
+            // so it must be tracked for compaction regardless of whether we download it.
+            imported_keys.push(obj.key.clone());
+            self.state.pending_downloads = self.state.pending_downloads.saturating_sub(1);
+
+            // Skip deltas we already downloaded + imported this session — avoids
+            // re-fetching and re-decrypting the whole delta set on every sync.
+            if self.applied_deltas.contains(&obj.key) {
+                continue;
+            }
 
             let encrypted = self.with_retry(|| async {
                 // obj.key already includes the "deltas/" sub-prefix (list_objects
@@ -375,8 +388,7 @@ impl CloudSync {
 
             stats.count += 1;
             stats.bytes += encrypted.len() as u64;
-            imported_keys.push(obj.key.clone());
-            self.state.pending_downloads = self.state.pending_downloads.saturating_sub(1);
+            self.applied_deltas.insert(obj.key.clone());
 
             debug!("Applied delta {} ({} bytes)", obj.key, delta_data.len());
         }
@@ -453,6 +465,7 @@ impl CloudSync {
         for key in imported_keys {
             // key already includes the "deltas/" sub-prefix.
             let _ = self.s3.delete_object(key).await;
+            self.applied_deltas.remove(key);
         }
 
         info!("Compaction complete ({} bytes)", snapshot.len());
