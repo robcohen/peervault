@@ -26,7 +26,6 @@ wasm = [
     "getrandom_02",
     "getrandom",
     "console_error_panic_hook",
-    "n0-future",
     "tracing-subscriber",
     "tracing-subscriber-wasm",
     "serde-wasm-bindgen",
@@ -52,7 +51,6 @@ loro = "1.10"
 chacha20poly1305 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"  # For AWS Signature V4
-hkdf = "0.12"
 argon2 = "0.5"  # Memory-hard passphrase KDF
 zeroize = { version = "1", features = ["derive"] }  # Wipe key material on drop
 rand = "0.10"
@@ -74,9 +72,6 @@ bincode = { version = "2", features = ["serde"] }
 
 # Hex encoding
 hex = "0.4"
-
-# URL encoding (for S3 queries)
-urlencoding = "2"
 
 # Base64 encoding (for tickets)
 base64 = "0.22"
@@ -111,8 +106,6 @@ getrandom_02 = { package = "getrandom", version = "0.2", optional = true, featur
 getrandom = { version = "0.3", optional = true, features = ["wasm_js"] }
 # Better panic messages in WASM
 console_error_panic_hook = { version = "0.1", optional = true }
-# Async utilities for WASM
-n0-future = { version = "0.3", optional = true }
 # Logging for WASM
 tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter"] }
 tracing-subscriber-wasm = { version = "0.1", optional = true }

@@ -17,8 +17,8 @@
     "package": "bun run build && cd dist && tar -czvf ../peervault-release.tar.gz main.js manifest.json styles.css"
   },
   "devDependencies": {
-    "@types/bun": "latest",
-    "@types/node": "^25.9.0",
+    "@types/bun": "^1.3.14",
+    "@types/node": "^26.1.0",
     "esbuild": "^0.28.0",
     "obsidian": "^1.13.1",
     "typescript": "^6.0.0"
