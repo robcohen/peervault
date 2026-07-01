@@ -1650,64 +1650,6 @@ use tracing::{info, warn, debug, error};
 use crate::blobs_bridge::BlobsBridge;
 use crate::protocol::sync::{self as proto, Message as SyncMessage, PROTOCOL_VERSION};
 
-/// Send a binary protocol message on an IrohStream
-async fn send_sync_msg(stream: &mut IrohStream, msg: &SyncMessage) -> Result<(), String> {
-    let data = msg.encode().map_err(|e| format!("encode: {}", e))?;
-    stream.send(&data).await.map_err(|e| format!("send: {}", e))
-}
-
-/// Receive a binary protocol message from an IrohStream
-async fn recv_sync_msg(stream: &mut IrohStream) -> Result<SyncMessage, String> {
-    let data = stream.recv().await.map_err(|e| format!("recv: {}", e))?;
-    SyncMessage::decode(&data).map_err(|e| format!("decode: {}", e))
-}
-
-/// Pairing validation using snapshots of known_peers + pending_pairings.
-/// Takes snapshots to avoid holding locks during sync.
-struct PairingValidation {
-    is_known: bool,
-    is_new_peer: bool,
-    consumed_nonce: Option<String>,
-}
-
-/// Validate a peer's pairing status.
-/// Returns Ok(PairingValidation) if accepted, Err(reason) if rejected.
-fn validate_pairing(
-    peer_id: &str,
-    pairing_nonce: Option<&str>,
-    known_peers: &std::collections::HashMap<String, u64>,
-    pending_pairings: &std::collections::HashMap<String, u64>,
-) -> Result<PairingValidation, String> {
-    // Known peer — always accept
-    if known_peers.contains_key(peer_id) {
-        return Ok(PairingValidation {
-            is_known: true,
-            is_new_peer: false,
-            consumed_nonce: None,
-        });
-    }
-
-    // Unknown peer — must have valid nonce
-    let nonce = pairing_nonce.ok_or_else(|| "Unknown peer, pairing nonce required".to_string())?;
-
-    let expires_at = pending_pairings.get(nonce)
-        .ok_or_else(|| format!("Unknown pairing nonce: {}...", short(&nonce, 16)))?;
-
-    let now = web_time::SystemTime::now()
-        .duration_since(web_time::SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-
-    if now > *expires_at {
-        return Err("Pairing nonce expired".to_string());
-    }
-
-    Ok(PairingValidation {
-        is_known: false,
-        is_new_peer: true,
-        consumed_nonce: Some(nonce.to_string()),
-    })
-}
 
 /// Run sync as INITIATOR using V3 binary protocol.
 ///
@@ -1844,6 +1786,30 @@ async fn handle_incoming_streams_v3(
     }
 }
 
+/// Pairing validator backing the runner's acceptor-side check with snapshots of
+/// the wasm pairing state (same logic as `validate_pairing`).
+struct WasmPairingValidator {
+    known: std::collections::HashMap<String, u64>,
+    pending: std::collections::HashMap<String, u64>,
+    now_ms: u64,
+}
+
+impl crate::runner::PairingValidator for WasmPairingValidator {
+    fn validate(&self, peer_id: &str, nonce: Option<&str>) -> Result<bool, String> {
+        if self.known.contains_key(peer_id) {
+            return Ok(false); // known peer, not newly paired
+        }
+        let nonce = nonce.ok_or_else(|| "Unknown peer, pairing nonce required".to_string())?;
+        let expires = self.pending.get(nonce)
+            .ok_or_else(|| format!("Unknown pairing nonce: {}...", short(nonce, 16)))?;
+        if self.now_ms > *expires {
+            return Err("Pairing nonce expired".to_string());
+        }
+        Ok(true) // new peer with a valid nonce
+    }
+}
+
+/// Handle an incoming V3 sync stream (acceptor side) via the unit-tested `SyncRunner`.
 async fn handle_incoming_streams_v3_inner(
     peer_id: &str,
     connections: &Arc<RwLock<HashMap<String, IrohConnection>>>,
@@ -1856,238 +1822,108 @@ async fn handle_incoming_streams_v3_inner(
     gossip_bridge_arc: &Arc<RwLock<Option<crate::gossip_bridge::GossipBridge>>>,
     transport: &Arc<RwLock<Option<IrohTransport>>>,
 ) -> Result<(), JsValue> {
-    let map_err = |e: String| JsValue::from_str(&e);
+    let ce = |e: crate::error::CoreError| JsValue::from_str(&e.to_string());
 
     // Accept a stream from the connection
-    let connections_guard = connections.read().await;
-    let conn = connections_guard.get(peer_id)
-        .ok_or_else(|| JsValue::from_str("Connection lost"))?;
-    let mut stream = conn.accept_stream().await
-        .map_err(|e| JsValue::from_str(&format!("Accept stream failed: {}", e)))?;
-    drop(connections_guard);
-
-    // Phase 1: Receive initiator's VERSION_INFO
-    let peer_info = match recv_sync_msg(&mut stream).await.map_err(map_err)? {
-        SyncMessage::VersionInfo(info) => info,
-        other => {
-            return Err(JsValue::from_str(&format!("Expected VersionInfo, got {:?}", other.message_type())));
-        }
+    let mut stream = {
+        let connections_guard = connections.read().await;
+        let conn = connections_guard.get(peer_id)
+            .ok_or_else(|| JsValue::from_str("Connection lost"))?;
+        conn.accept_stream().await
+            .map_err(|e| JsValue::from_str(&format!("Accept stream failed: {}", e)))?
     };
 
-    info!("Acceptor: received VersionInfo from {} (v{}, nonce={})",
-        peer_info.hostname, peer_info.protocol_version,
-        peer_info.pairing_nonce.as_deref().map(|n| short(n, 16)).unwrap_or("none"));
-
-    // Validate basic handshake invariants (vault id, protocol version) BEFORE
-    // consuming any one-time pairing nonce. Otherwise a peer presenting a valid
-    // nonce but a mismatched vault/version could burn the legitimate pairing
-    // nonce (and get inserted into known_peers) before being rejected.
+    // Snapshot local vault id + encryption key + store state (independent of the peer).
     let local_vault_id = {
         let store_guard = store.read().await;
-        let id = *store_guard.as_ref()
+        *store_guard.as_ref()
             .ok_or_else(|| JsValue::from_str("Store not initialized"))?
-            .vault_id();
-        drop(store_guard);
-        id
+            .vault_id()
     };
+    let vault_key = encryption_key.read().await.clone()
+        .ok_or_else(|| JsValue::from_str("No encryption key"))?;
+    let snapshot = {
+        let store_guard = store.read().await;
+        store_guard.as_ref()
+            .ok_or_else(|| JsValue::from_str("Store not initialized"))?
+            .export_snapshot()
+            .map_err(|e| JsValue::from_str(&format!("Export snapshot failed: {}", e)))?
+    };
+
+    // Build the temporary sync engine. init_vault carries the real vault id (new_with_key
+    // starts at zero and import does not restore it) so the VERSION_INFO we send and the
+    // vault-id validation are correct.
+    let host = Arc::new(crate::host::mock::MockHost::new());
+    let mut engine = SyncEngine::new_with_key(host, vault_key).map_err(ce)?;
+    engine.init_vault(local_vault_id);
+    engine.import_snapshot_raw(&snapshot).map_err(ce)?;
+
+    // Acceptor pairing validator (snapshots avoid holding locks during sync).
+    let now_ms = web_time::SystemTime::now()
+        .duration_since(web_time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let validator = WasmPairingValidator {
+        known: known_peers.read().unwrap().clone(),
+        pending: pending_pairings.read().unwrap().clone(),
+        now_ms,
+    };
+
+    let cfg = crate::runner::RunnerConfig {
+        hostname: format!("PeerVault-{}", &hex::encode(engine.vault_id())[..8]),
+        ..Default::default()
+    };
+    let mut runner = crate::runner::SyncRunner::with_validator(
+        cfg, &engine, peer_id.to_string(), false, validator,
+    );
+
     {
-        if peer_info.vault_id != local_vault_id {
-            let err = SyncMessage::Error(proto::SyncError {
-                code: proto::error_codes::VAULT_MISMATCH,
-                message: "Vault ID mismatch".into(),
-            });
-            let _ = send_sync_msg(&mut stream, &err).await;
-            return Err(JsValue::from_str("Vault ID mismatch"));
+        let mut adapter = SyncStreamAdapter(&mut stream);
+        // Version exchange (vault-id + protocol + pairing validation) + updates + SyncComplete.
+        runner.run_crdt_only(&mut adapter).await.map_err(ce)?;
+
+        // Out-of-band iroh-blobs transfer.
+        if runner.peer_supports_iroh_blobs() {
+            let bridge_guard = blobs_bridge_arc.read().await;
+            let transport_guard = transport.read().await;
+            if let (Some(bridge), Some(tp)) = (bridge_guard.as_ref(), transport_guard.as_ref()) {
+                let our_hashes = bridge.list_host_hashes().await
+                    .map_err(|e| JsValue::from_str(&format!("List blobs failed: {}", e)))?;
+                let static_blobs = StaticBlobOps { hashes: our_hashes };
+                let (need, send) = runner.exchange_blob_hashes(&mut adapter, &static_blobs).await.map_err(ce)?;
+                if !need.is_empty() || !send.is_empty() {
+                    let peer_endpoint_id: iroh::EndpointId = peer_id.parse()
+                        .map_err(|e| JsValue::from_str(&format!("Invalid peer ID: {}", e)))?;
+                    bridge.exchange_blobs_v3(tp.endpoint(), peer_endpoint_id, &need, &send).await
+                        .map_err(|e| JsValue::from_str(&format!("Blob transfer: {}", e)))?;
+                }
+                runner.send_blob_sync_complete(&mut adapter, send.len()).await.map_err(ce)?;
+            }
         }
     }
-    if peer_info.protocol_version < 2 {
-        let err = SyncMessage::Error(proto::SyncError {
-            code: proto::error_codes::VERSION_MISMATCH,
-            message: "Protocol version too old".into(),
-        });
-        let _ = send_sync_msg(&mut stream, &err).await;
-        return Err(JsValue::from_str("Protocol version too old"));
-    }
 
-    // Validate pairing (take snapshots to avoid holding locks)
-    let known_snap: std::collections::HashMap<String, u64> = known_peers.read().unwrap().clone();
-    let pending_snap: std::collections::HashMap<String, u64> = pending_pairings.read().unwrap().clone();
-
-    let validation = match validate_pairing(
-        peer_id,
-        peer_info.pairing_nonce.as_deref(),
-        &known_snap,
-        &pending_snap,
-    ) {
-        Ok(v) => v,
-        Err(reason) => {
-            warn!("Pairing rejected for {}: {}", short(&peer_id, 16), reason);
-            let err = SyncMessage::Error(proto::SyncError {
-                code: proto::error_codes::PAIRING_REJECTED,
-                message: reason,
-            });
-            let _ = send_sync_msg(&mut stream, &err).await;
-            return Err(JsValue::from_str("Pairing rejected"));
-        }
-    };
-
-    // Update state if newly paired
-    if validation.is_new_peer {
-        if let Some(nonce) = &validation.consumed_nonce {
+    // Consume the pairing nonce + auto-add the peer once sync succeeded.
+    if runner.result().pairing_is_new {
+        if let Some(nonce) = &runner.result().pairing_nonce {
             pending_pairings.write().unwrap().remove(nonce);
         }
-        known_peers.write().unwrap().insert(
-            peer_id.to_string(),
-            web_time::SystemTime::now()
-                .duration_since(web_time::SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-        );
-
-        // Emit pairing_complete event
+        known_peers.write().unwrap().insert(peer_id.to_string(), now_ms);
         if let Some(ref callback) = on_event {
             let event = serde_json::json!({
                 "type": "pairing_complete",
                 "peer_id": peer_id,
-                "device_name": peer_info.hostname,
+                "device_name": runner.result().peer_hostname,
             });
             let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(&event.to_string()));
         }
     }
 
-    // Get encryption key and store
-    let key_guard = encryption_key.read().await;
-    let vault_key = key_guard.clone()
-        .ok_or_else(|| JsValue::from_str("No encryption key"))?;
-    drop(key_guard);
+    let updates_received = runner.result().updates_received;
+    let updates_sent = runner.result().updates_sent;
 
-    // Create SyncEngine — snapshot store briefly, then release lock
-    let snapshot = {
-        let store_guard = store.read().await;
-        let loro_store = store_guard.as_ref()
-            .ok_or_else(|| JsValue::from_str("Store not initialized"))?;
-        loro_store.export_snapshot()
-            .map_err(|e| JsValue::from_str(&format!("Export snapshot failed: {}", e)))?
-        // store_guard dropped here
-    };
-    let host = Arc::new(crate::host::mock::MockHost::new());
-    let mut engine = SyncEngine::new_with_key(host, vault_key)
-        .map_err(|e| JsValue::from_str(&format!("SyncEngine failed: {}", e)))?;
-    // Carry the real vault id into the temporary sync engine. new_with_key starts
-    // at all-zeros and import_snapshot_raw does not restore the id, so without this
-    // the VERSION_INFO we send would advertise a zero vault id and peers could not
-    // validate it. init_vault must run before import so the imported data lands in
-    // the correctly-identified store.
-    engine.init_vault(local_vault_id);
-    engine.import_snapshot_raw(&snapshot)
-        .map_err(|e| JsValue::from_str(&format!("Import snapshot failed: {}", e)))?;
-
-    // Vault ID + protocol version were already validated above, before any
-    // pairing nonce was consumed. The store snapshot used to build `engine`
-    // shares the local vault id, so no re-check is needed here.
-
-    // Send our VERSION_INFO (acceptor sends after receiving)
-    let our_info = proto::VersionInfo {
-        protocol_version: PROTOCOL_VERSION,
-        vault_id: *engine.vault_id(),
-        version_bytes: engine.version_vector(),
-        hostname: format!("PeerVault-{}", &hex::encode(engine.vault_id())[..8]),
-        nickname: None,
-        has_vault_key: true,
-        plugin_version: None,
-        pairing_nonce: None, // acceptor never sends nonce
-        supports_iroh_blobs: true,
-    };
-    send_sync_msg(&mut stream, &SyncMessage::VersionInfo(our_info)).await.map_err(map_err)?;
-
-    // Phase 2: Exchange CRDT updates
-    let updates = engine.export_updates_since(&peer_info.version_bytes)
-        .map_err(|e| JsValue::from_str(&format!("Export updates failed: {}", e)))?;
-    send_sync_msg(&mut stream, &SyncMessage::Updates(proto::Updates {
-        data: updates,
-        op_count: 0,
-    })).await.map_err(map_err)?;
-
-    // Receive peer's updates and wait for SyncComplete
-    let mut updates_received = 0;
-    loop {
-        match recv_sync_msg(&mut stream).await.map_err(map_err)? {
-            SyncMessage::Updates(updates) => {
-                engine.import_updates(&updates.data)
-                    .map_err(|e| JsValue::from_str(&format!("Import failed: {}", e)))?;
-                updates_received += 1;
-            }
-            SyncMessage::SyncComplete(complete) => {
-                let our_complete = SyncMessage::SyncComplete(proto::SyncComplete {
-                    version_bytes: engine.version_vector(),
-                });
-                send_sync_msg(&mut stream, &our_complete).await.map_err(map_err)?;
-                break;
-            }
-            SyncMessage::Error(e) => {
-                return Err(JsValue::from_str(&format!("Peer error: {}", e.message)));
-            }
-            _ => continue,
-        }
-    }
-
-    // Phase 3: Blob exchange (V3 via iroh-blobs)
-    if peer_info.supports_iroh_blobs {
-        let bridge_guard = blobs_bridge_arc.read().await;
-        let transport_guard = transport.read().await;
-        if let (Some(bridge), Some(tp)) = (bridge_guard.as_ref(), transport_guard.as_ref()) {
-            let our_hashes = bridge.list_host_hashes().await
-                .map_err(|e| JsValue::from_str(&format!("List blobs failed: {}", e)))?;
-
-            send_sync_msg(&mut stream, &SyncMessage::BlobHashes(proto::BlobHashes {
-                hashes: our_hashes.clone(),
-            })).await.map_err(map_err)?;
-
-            let peer_hashes = match recv_sync_msg(&mut stream).await.map_err(map_err)? {
-                SyncMessage::BlobHashes(bh) => bh.hashes,
-                SyncMessage::BlobSyncComplete(_) => vec![],
-                other => {
-                    warn!("Expected BlobHashes, got {:?}", other.message_type());
-                    vec![]
-                }
-            };
-
-            let our_set: std::collections::HashSet<_> = our_hashes.iter().collect();
-            let peer_set: std::collections::HashSet<_> = peer_hashes.iter().collect();
-            let need: Vec<_> = peer_hashes.iter().filter(|h| !our_set.contains(h)).cloned().collect();
-            let send: Vec<_> = our_hashes.iter().filter(|h| !peer_set.contains(h)).cloned().collect();
-
-            if !need.is_empty() || !send.is_empty() {
-                let peer_endpoint_id: iroh::EndpointId = peer_id.parse()
-                    .map_err(|e| JsValue::from_str(&format!("Invalid peer ID: {}", e)))?;
-                bridge.exchange_blobs_v3(tp.endpoint(), peer_endpoint_id, &need, &send).await
-                    .map_err(|e| JsValue::from_str(&format!("Blob transfer: {}", e)))?;
-            }
-
-            send_sync_msg(&mut stream, &SyncMessage::BlobSyncComplete(proto::BlobSyncComplete {
-                blob_count: 0,
-            })).await.map_err(map_err)?;
-
-            let mut blob_sync_done = false;
-            for _ in 0..100 {
-                match recv_sync_msg(&mut stream).await.map_err(map_err)? {
-                    SyncMessage::BlobSyncComplete(_) => { blob_sync_done = true; break; }
-                    SyncMessage::Error(e) => {
-                        return Err(JsValue::from_str(&format!("Blob sync error: {}", e.message)));
-                    }
-                    _ => continue,
-                }
-            }
-            if !blob_sync_done {
-                warn!("Acceptor: blob sync completion not received after 100 messages");
-            }
-        }
-    }
-
-    // Import updated state back to LoroStore (briefly acquire lock)
+    // Import the synced state back into the shared LoroStore.
     {
-        let updated_snapshot = engine.export_snapshot_raw()
-            .map_err(|e| JsValue::from_str(&format!("Export snapshot: {}", e)))?;
+        let updated_snapshot = engine.export_snapshot_raw().map_err(ce)?;
         let store_guard = store.read().await;
         let loro_store = store_guard.as_ref()
             .ok_or_else(|| JsValue::from_str("Store not initialized"))?;
@@ -2095,14 +1931,13 @@ async fn handle_incoming_streams_v3_inner(
             .map_err(|e| JsValue::from_str(&format!("Import snapshot: {}", e)))?;
     }
 
-    // Emit sync_complete event
     if let Some(ref callback) = on_event {
         let event = serde_json::json!({
             "type": "sync_complete",
             "peer_id": peer_id,
             "direction": "incoming",
             "updates_received": updates_received,
-            "updates_sent": 1,
+            "updates_sent": updates_sent,
         });
         let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(&event.to_string()));
     }
@@ -2126,7 +1961,6 @@ async fn handle_incoming_streams_v3_inner(
                     ).await;
                 });
 
-                // Spawn debounce task (acceptor side)
                 let gb_for_debounce = gossip_bridge_arc.clone();
                 let store_for_debounce = store.clone();
                 let enc_for_debounce = encryption_key.clone();
@@ -2142,7 +1976,7 @@ async fn handle_incoming_streams_v3_inner(
                     ).await;
                 });
             }
-            Ok(None) => {} // Already subscribed
+            Ok(None) => {}
             Err(e) => {
                 warn!("Acceptor: failed to subscribe to gossip: {}", e);
             }

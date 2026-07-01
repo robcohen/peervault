@@ -73,6 +73,10 @@ pub struct SyncRunResult {
     pub peer_hostname: String,
     /// Peer's nickname
     pub peer_nickname: Option<String>,
+    /// Whether the acceptor newly paired this peer (validator returned Ok(true))
+    pub pairing_is_new: bool,
+    /// The one-time pairing nonce that was accepted (for the caller to consume)
+    pub pairing_nonce: Option<String>,
     /// Error if sync failed
     pub error: Option<String>,
 }
@@ -89,6 +93,8 @@ impl Default for SyncRunResult {
             is_live: false,
             peer_hostname: String::new(),
             peer_nickname: None,
+            pairing_is_new: false,
+            pairing_nonce: None,
             error: None,
         }
     }
@@ -494,7 +500,12 @@ impl<'a, V: PairingValidator> SyncRunner<'a, V> {
         // This allows us to reject unknown peers with invalid nonces
         if !self.is_initiator {
             match self.validator.validate(&self.peer_node_id, peer_info.pairing_nonce.as_deref()) {
-                Ok(_is_new) => {
+                Ok(is_new) => {
+                    // Record for the caller to consume the nonce / auto-add the peer.
+                    self.result.pairing_is_new = is_new;
+                    if is_new {
+                        self.result.pairing_nonce = peer_info.pairing_nonce.clone();
+                    }
                     // Pairing validated - proceed with sync.
                     // `get(..16)` avoids panicking on a non-UTF-8-boundary nonce.
                     tracing::info!(
