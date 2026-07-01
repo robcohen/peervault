@@ -115,3 +115,4 @@ serde-wasm-bindgen = { version = "0.6", optional = true }
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 wasm-bindgen-test = "0.3"
+proptest = "1"  # property-based CRDT convergence tests
