@@ -30,7 +30,7 @@ jobs:
       - name: Verify WASM has no native ("env") imports
         run: |
           nix develop --command bash -c '
-            count=$(wasm-tools print peervault-core/target/wasm32-unknown-unknown/release/peervault_core.wasm | grep -c "\"env\"" || true);
+            count=$(wasm-tools print target/wasm32-unknown-unknown/release/peervault_core.wasm | grep -c "\"env\"" || true);
             echo "env imports: $count";
             test "$count" -eq 0'
 

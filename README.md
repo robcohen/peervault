@@ -1,15 +1,25 @@
 # PeerVault
 
-P2P sync for Obsidian using Loro CRDT and Iroh transport. Sync your vaults directly between devices without a central server.
+P2P file sync using Loro CRDTs and iroh transport — no servers required. One
+host-agnostic Rust engine, multiple hosts:
+
+| Host | Where | Status |
+|------|-------|--------|
+| **Obsidian plugin** | this repo (`src/`) | shipping (BRAT) |
+| **VSCode extension** | `hosts/vscode/` | .vsix builds; pre-marketplace |
+| **Zed extension** | `hosts/zed/` | dev-extension (launches the daemon) |
+| **`peervaultd` daemon** | `hosts/peervaultd/` | any editor / CLI / vim |
+
+Pairing tickets interop across all hosts. See `docs/EMBEDDING.md` to build a
+new host adapter.
 
 ## Features
 
 - **Conflict-free sync** - Concurrent edits merge automatically using Loro CRDTs
 - **Offline-first** - Full functionality without network; sync when peers connect
 - **No central server** - Direct P2P connections via Iroh with relay fallback
-- **End-to-end encrypted** - All data encrypted in transit
-- **Full history** - Edit history preserved; deletions are recoverable
-- **Device groups** - Organize devices with per-group sync policies
+- **End-to-end encrypted** - Content encrypted with a shared vault key, on top of iroh's transport encryption
+- **History-preserving** - Deletions are CRDT tombstones (soft deletes), so full edit history survives sync; a recovery UI is planned
 - **Cloud backup** - Optional S3-compatible cloud sync with encryption
 
 ## Installation

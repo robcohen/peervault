@@ -331,7 +331,7 @@ async fn run(args: Args, lsp_root: Option<PathBuf>) -> Result<()> {
                 }
             }
             Some(event) = ev_rx.recv() => {
-                use peervault_core::events::WasmEvent::*;
+                use peervault_core::events::Event::*;
                 match event {
                     DocumentChanged { .. } | SyncComplete { .. } => {
                         reconcile_at = Some(Instant::now() + RECONCILE_DEBOUNCE);

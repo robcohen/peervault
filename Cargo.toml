@@ -1,0 +1,12 @@
+# Cargo workspace: the engine plus native hosts.
+# hosts/zed is intentionally excluded — Zed compiles it itself (dev-extension
+# install) against its own wasm target and extension API.
+[workspace]
+resolver = "2"
+members = [
+    "peervault-core",
+    "hosts/peervaultd",
+]
+exclude = [
+    "hosts/zed",
+]
