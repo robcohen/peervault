@@ -1,0 +1,11 @@
+id = "peervault"
+name = "PeerVault"
+description = "P2P workspace sync via the peervaultd daemon — no servers required"
+version = "0.1.0"
+schema_version = 1
+authors = ["PeerVault Contributors"]
+repository = "https://github.com/robcohen/peervault"
+
+[language_servers.peervaultd]
+name = "peervaultd"
+languages = ["Markdown", "Plain Text"]

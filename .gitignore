@@ -75,3 +75,7 @@ peervault-*.tar.gz
 # Local MinIO dev server (just minio-start)
 .minio/
 .local/
+
+# Native daemon + Zed extension build artifacts
+hosts/peervaultd/target/
+hosts/zed/target/

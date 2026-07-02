@@ -72,9 +72,13 @@ impl LoroStore {
     pub fn new(vault_id: [u8; 32]) -> Self {
         let doc = LoroDoc::new();
 
-        // Initialize the meta map with vault ID
-        let meta = doc.get_map(META_NAME);
-        meta.insert("vaultId", hex::encode(vault_id)).ok();
+        // NOTE: deliberately NO doc writes here. Writing vault metadata as CRDT
+        // ops gave every fresh store (including the temporary per-sync engines)
+        // private "init ops" under a random peer id; deltas exported by that
+        // store then carried causal deps on ops no peer had ever received, and
+        // Loro silently parked such deltas as pending — remote soft-deletes
+        // (and any small gossip delta) never applied. The vault id lives in the
+        // struct field; a fresh doc must have an EMPTY op history.
 
         Self {
             doc: RwLock::new(doc),
@@ -114,7 +118,12 @@ impl LoroStore {
             .as_secs()
     }
 
-    /// Find a node by path, returns TreeID if found
+    /// Find a node by path, returns TreeID if found.
+    ///
+    /// Concurrent creation of the same folder on two peers merges into
+    /// DUPLICATE sibling tree nodes with the same name; a first-match descent
+    /// silently loses files living in the other duplicate. This walk therefore
+    /// explores EVERY same-name branch (depth-first) until one resolves.
     fn find_node(&self, path: &str) -> Option<TreeID> {
         // Check cache first
         if let Some(id) = self.path_cache.read().unwrap().get(path) {
@@ -124,48 +133,41 @@ impl LoroStore {
         let doc = self.doc.read().unwrap();
         let tree = doc.get_tree(TREE_NAME);
 
-        // Walk tree to find node
-        // Path format: "folder/subfolder/file.md"
         let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         if parts.is_empty() {
             return None;
         }
 
-        let mut current_parent: Option<TreeID> = None;
-
-        for (i, part) in parts.iter().enumerate() {
-            let is_last = i == parts.len() - 1;
-            let children = if let Some(parent) = current_parent {
-                tree.children(&parent).unwrap_or_default()
-            } else {
-                tree.roots()
+        fn descend(tree: &LoroTree, parent: Option<TreeID>, parts: &[&str]) -> Option<TreeID> {
+            let children = match parent {
+                Some(p) => tree.children(&p).unwrap_or_default(),
+                None => tree.roots(),
             };
-
-            let mut found = false;
             for child_id in children {
-                // Use get_meta to get the node's metadata map
-                if let Ok(meta) = tree.get_meta(child_id) {
-                    if let Some(loro::ValueOrContainer::Value(LoroValue::String(name))) = meta.get("name") {
-                        if name.as_ref() == *part {
-                            if is_last {
-                                // Found the target node, cache it
-                                self.path_cache.write().unwrap().insert(path.to_string(), child_id);
-                                return Some(child_id);
-                            }
-                            current_parent = Some(child_id);
-                            found = true;
-                            break;
-                        }
-                    }
+                let Ok(meta) = tree.get_meta(child_id) else { continue };
+                let Some(loro::ValueOrContainer::Value(LoroValue::String(name))) = meta.get("name")
+                else {
+                    continue;
+                };
+                if name.as_ref() != parts[0] {
+                    continue;
+                }
+                if parts.len() == 1 {
+                    return Some(child_id);
+                }
+                // Recurse — and on a miss keep scanning same-name siblings.
+                if let Some(hit) = descend(tree, Some(child_id), &parts[1..]) {
+                    return Some(hit);
                 }
             }
-
-            if !found {
-                return None;
-            }
+            None
         }
 
-        None
+        let found = descend(&tree, None, &parts);
+        if let Some(id) = found {
+            self.path_cache.write().unwrap().insert(path.to_string(), id);
+        }
+        found
     }
 
     /// Create a node at path, creating parent folders as needed
@@ -366,6 +368,12 @@ impl LoroStore {
         }
     }
 
+    /// Debug: the full document state as JSON (tests/diagnostics only).
+    pub fn debug_deep_value(&self) -> String {
+        let doc = self.doc.read().unwrap();
+        format!("{:?}", doc.get_deep_value())
+    }
+
     /// Invalidate path cache (call after structural changes)
     fn invalidate_cache(&self) {
         self.path_cache.write().unwrap().clear();
@@ -398,8 +406,11 @@ impl DocStore for LoroStore {
 
     fn import_updates(&self, data: &[u8]) -> StoreResult<()> {
         let doc = self.doc.write().unwrap();
-        doc.import(data)
+        let status = doc.import(data)
             .map_err(|e| StoreError::Loro(e.to_string()))?;
+        if !status.pending.as_ref().map(|p| p.is_empty()).unwrap_or(true) {
+            tracing::warn!("import: ops parked as pending (missing deps): {:?}", status.pending);
+        }
         drop(doc);
         self.invalidate_cache();
         Ok(())

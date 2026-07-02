@@ -145,6 +145,7 @@ impl GossipBridge {
             *vv = Some(version_vector_before);
         }
         drop(vv);
+        tracing::debug!("gossip notify_change fired");
         self.change_notify.notify_one();
     }
 
