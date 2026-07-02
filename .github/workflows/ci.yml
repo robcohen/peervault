@@ -50,5 +50,8 @@ jobs:
       - name: peervaultd build
         run: nix develop --command bash -c 'cd hosts/peervaultd && cargo build'
 
+      - name: Zed extension build (wasm32-wasip1)
+        run: nix develop --command bash -c 'cd hosts/zed && cargo build --target wasm32-wasip1'
+
       - name: VSCode host typecheck
         run: nix develop --command bash -c 'cd hosts/vscode && bun install && bun run check'

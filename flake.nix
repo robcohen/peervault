@@ -21,7 +21,7 @@
         # Rust toolchain for potential native builds (Iroh, wasm-pack)
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [ "rust-src" "rust-analyzer" ];
-          targets = [ "wasm32-unknown-unknown" ];
+          targets = [ "wasm32-unknown-unknown" "wasm32-wasip1" ];
         };
 
       in {
