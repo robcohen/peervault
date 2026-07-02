@@ -45,6 +45,7 @@ struct Args {
     dir: PathBuf,
     relay: Option<String>,
     join: Option<String>,
+    log_file: Option<PathBuf>,
     ctl_args: Vec<String>,
 }
 
@@ -67,30 +68,44 @@ fn parse_args() -> Result<Args> {
     let mut dir = std::env::current_dir()?;
     let mut relay = None;
     let mut join = None;
+    let mut log_file = None;
     let mut ctl_args = Vec::new();
     while let Some(arg) = argv.next() {
         match arg.as_str() {
             "--dir" => dir = PathBuf::from(argv.next().context("--dir needs a value")?),
             "--relay" => relay = Some(argv.next().context("--relay needs a value")?),
             "--join" => join = Some(argv.next().context("--join needs a value")?),
+            "--log-file" => log_file = Some(PathBuf::from(argv.next().context("--log-file needs a value")?)),
             other => ctl_args.push(other.to_string()),
         }
     }
     // absolute() keeps symlinks unresolved: unix-socket paths are SUN_LEN-limited
     // and users may deliberately reach a deep dir through a short symlink.
-    Ok(Args { cmd, dir: std::path::absolute(&dir).unwrap_or(dir), relay, join, ctl_args })
+    Ok(Args { cmd, dir: std::path::absolute(&dir).unwrap_or(dir), relay, join, log_file, ctl_args })
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,iroh=warn,iroh_gossip=warn".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     let args = parse_args()?;
+    let filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "info,iroh=warn,iroh_gossip=warn".into())
+    };
+    match &args.log_file {
+        Some(path) => {
+            let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+            tracing_subscriber::fmt()
+                .with_env_filter(filter())
+                .with_writer(std::sync::Mutex::new(file))
+                .with_ansi(false)
+                .init();
+        }
+        None => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter())
+                .with_writer(std::io::stderr)
+                .init();
+        }
+    }
     let rt = tokio::runtime::Runtime::new()?;
     match args.cmd.as_str() {
         "ctl" => rt.block_on(ctl(&args)),
@@ -282,6 +297,16 @@ async fn run(args: Args, lsp_root: Option<PathBuf>) -> Result<()> {
                 break;
             }
             Some(event) = fs_rx.recv() => {
+                // Access events are READS (our own apply/compare passes, editors
+                // previewing, etc.) — never an edit signal. Feeding them into
+                // `pending` polluted the dirty-set: dirty paths are shielded from
+                // plan.deletes, so a remotely-deleted file's stale disk copy
+                // survived reconciliation and was later re-ingested as a "user
+                // edit" (the store said None post-delete) — resurrecting it on
+                // every peer. Ignore reads entirely.
+                if matches!(event.kind, notify::EventKind::Access(_)) {
+                    continue;
+                }
                 for p in event.paths {
                     let Some(rel) = rel_path(&root, &p) else { continue };
                     tracing::debug!("watch: {:?} {rel}", event.kind);

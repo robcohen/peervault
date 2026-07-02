@@ -23,10 +23,10 @@ editor extensions can launch it as a workspace sidecar — **`hosts/zed/`** is
 exactly that (a ~40-line Zed extension). Pairing tickets are TS-compatible
 (`peervault_core::pairing`), so daemon ↔ Obsidian ↔ VSCode pairing interops.
 
-Known issue: the daemon's file-deletion propagation has a race under gossip
-echo (tracked; creates/edits/joins are validated). The engine itself handles
-cross-peer deletion correctly — see `tests/native_embed.rs` and
-`tests/delete_repro.rs`.
+The full acceptance flow (join + initial sync, live creates/edits/deletes in
+both directions, incl. deletion inside the echo window) is validated with two
+real daemons over a local relay; engine-level guarantees are covered by
+`tests/native_embed.rs` and `tests/delete_repro.rs`.
 
 ## What a host must provide
 
