@@ -1,0 +1,86 @@
+{
+  "name": "peervault",
+  "displayName": "PeerVault",
+  "description": "P2P workspace sync using Loro CRDTs and Iroh transport — no servers required",
+  "version": "0.1.0",
+  "publisher": "robcohen",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/robcohen/peervault"
+  },
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.101.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "sync",
+    "p2p",
+    "crdt",
+    "collaboration",
+    "offline-first"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "peervault.copyTicket",
+        "title": "PeerVault: Copy Pairing Ticket"
+      },
+      {
+        "command": "peervault.addPeer",
+        "title": "PeerVault: Add Peer (paste ticket)"
+      },
+      {
+        "command": "peervault.syncNow",
+        "title": "PeerVault: Sync Now"
+      },
+      {
+        "command": "peervault.showStatus",
+        "title": "PeerVault: Show Status"
+      }
+    ],
+    "configuration": {
+      "title": "PeerVault",
+      "properties": {
+        "peervault.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable PeerVault sync for this workspace."
+        },
+        "peervault.deviceName": {
+          "type": "string",
+          "default": "",
+          "description": "Device display name shown to peers (defaults to the machine hostname)."
+        },
+        "peervault.relayUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Custom iroh relay URL (leave empty for the default public relay)."
+        },
+        "peervault.maxFileSizeMb": {
+          "type": "number",
+          "default": 10,
+          "description": "Files larger than this are skipped during the initial scan."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "build": "node esbuild.mjs",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.0",
+    "@types/vscode": "^1.101.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.28.0",
+    "typescript": "^6.0.0"
+  }
+}

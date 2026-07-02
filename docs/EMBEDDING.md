@@ -75,6 +75,13 @@ relay such as the docker/e2e one).
 
 ## TypeScript hosts
 
+A working second host exists: **`hosts/vscode/`** — a VSCode extension (~350
+lines of adapter) built on the shared client. Its `VscodeStorage` implements
+`HostStorage` over workspace storage, a `FileSystemWatcher` feeds local edits
+into the CRDT, and reconcile plans are applied with `vscode.workspace.fs`.
+`hosts/vscode/test/` contains the Node smoke test (engine in the extension-host
+runtime) and a headless two-instance extension simulation.
+
 `src/core/peer-vault-client.ts` is Obsidian-free except for `ObsidianStorage`:
 implement the three-method `HostStorage` interface over your platform's storage
 and reuse `PeerVaultClient` unchanged. `src/main.ts` shows the remaining host
