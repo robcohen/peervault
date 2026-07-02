@@ -9,7 +9,7 @@ import type { App } from "obsidian";
 // Generated from the Rust `WasmEvent` enum via ts-rs — the single source of truth
 // for the WASM→host event schema. Regenerate with:
 //   cd peervault-core && cargo test --features "ts-export test-utils" --lib export_ts_bindings
-import type { WasmEvent } from "./generated/events";
+import type { Event as WasmEvent } from "./generated/events";
 import type { ReconcilePlan } from "./generated/reconcile";
 
 // =============================================================================

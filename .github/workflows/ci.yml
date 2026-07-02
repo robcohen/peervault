@@ -30,7 +30,7 @@ jobs:
       - name: Verify WASM has no native ("env") imports
         run: |
           nix develop --command bash -c '
-            count=$(wasm-tools print peervault-core/target/wasm32-unknown-unknown/release/peervault_core.wasm | grep -c "\"env\"" || true);
+            count=$(wasm-tools print target/wasm32-unknown-unknown/release/peervault_core.wasm | grep -c "\"env\"" || true);
             echo "env imports: $count";
             test "$count" -eq 0'
 
@@ -49,6 +49,9 @@ jobs:
 
       - name: peervaultd build
         run: nix develop --command bash -c 'cd hosts/peervaultd && cargo build'
+
+      - name: Zed extension build (wasm32-wasip1)
+        run: nix develop --command bash -c 'cd hosts/zed && cargo build --target wasm32-wasip1'
 
       - name: VSCode host typecheck
         run: nix develop --command bash -c 'cd hosts/vscode && bun install && bun run check'

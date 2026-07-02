@@ -23,15 +23,33 @@ const EXCLUDED = [".git/", ".vscode/", ".peervault/", "node_modules/"];
 const FILE_DEBOUNCE_MS = 1500;
 const RECONCILE_DEBOUNCE_MS = 1000;
 
-/** HostStorage over the workspace-scoped extension storage directory. */
+/** The vault key never touches disk: it lives in VSCode SecretStorage (OS keychain). */
+const SECRET_KEYS = new Set(["encryption-key"]);
+
+/**
+ * HostStorage over the workspace-scoped extension storage directory, with
+ * secret material routed to `vscode.SecretStorage` (keychain-backed).
+ */
 class VscodeStorage implements HostStorage {
-  constructor(private base: vscode.Uri) {}
+  constructor(
+    private base: vscode.Uri,
+    private secrets: vscode.SecretStorage,
+    private secretScope: string,
+  ) {}
 
   private uri(key: string): vscode.Uri {
     return vscode.Uri.joinPath(this.base, key);
   }
 
+  private secretName(key: string): string {
+    return `peervault.${this.secretScope}.${key}`;
+  }
+
   async get(key: string): Promise<Uint8Array | null> {
+    if (SECRET_KEYS.has(key)) {
+      const b64 = await this.secrets.get(this.secretName(key));
+      return b64 ? new Uint8Array(Buffer.from(b64, "base64")) : null;
+    }
     try {
       return await vscode.workspace.fs.readFile(this.uri(key));
     } catch {
@@ -40,11 +58,19 @@ class VscodeStorage implements HostStorage {
   }
 
   async set(key: string, value: Uint8Array): Promise<void> {
+    if (SECRET_KEYS.has(key)) {
+      await this.secrets.store(this.secretName(key), Buffer.from(value).toString("base64"));
+      return;
+    }
     await vscode.workspace.fs.createDirectory(this.base);
     await vscode.workspace.fs.writeFile(this.uri(key), value);
   }
 
   async delete(key: string): Promise<void> {
+    if (SECRET_KEYS.has(key)) {
+      await this.secrets.delete(this.secretName(key));
+      return;
+    }
     try {
       await vscode.workspace.fs.delete(this.uri(key));
     } catch {
@@ -94,7 +120,10 @@ class PeerVaultExtension {
       ...(cfg.get<string>("relayUrl") ? { relayUrl: cfg.get<string>("relayUrl")! } : {}),
     };
 
-    this.client = new PeerVaultClient(new VscodeStorage(storageBase), config);
+    this.client = new PeerVaultClient(
+      new VscodeStorage(storageBase, this.context.secrets, vaultId.slice(0, 16)),
+      config,
+    );
     this.client.on((event) => this.onClientEvent(event));
     await this.client.initialize();
 

@@ -25,7 +25,7 @@ wasm:
 
 # Clean and rebuild WASM from scratch
 wasm-clean:
-    rm -rf peervault-core/target peervault-core/pkg
+    rm -rf target peervault-core/pkg
     just wasm
 
 # Verify WASM has no "env" imports (ring native code)

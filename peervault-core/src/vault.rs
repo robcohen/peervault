@@ -1238,9 +1238,9 @@ use crate::blobs_bridge::BlobsBridge;
 ///
 /// Used for log/error truncation of attacker-controlled strings (pairing nonces,
 /// peer ids) where naive byte slicing (`&s[..n]`) can panic mid-codepoint.
-/// Emit a typed `WasmEvent` to the host callback as a JSON string. Centralizes
+/// Emit a typed `Event` to the host callback as a JSON string. Centralizes
 /// serialization so every event shares one schema (see `crate::events`).
-fn emit_event(on_event: &Option<EventCallback>, event: &crate::events::WasmEvent) {
+fn emit_event(on_event: &Option<EventCallback>, event: &crate::events::Event) {
     if let Some(cb) = on_event {
         cb(event);
     }
@@ -1334,7 +1334,7 @@ async fn run_initiator_sync_v3(
         }
     }
 
-    emit_event(&on_event, &crate::events::WasmEvent::SyncComplete {
+    emit_event(&on_event, &crate::events::Event::SyncComplete {
         peer_id: peer_id.to_string(),
         direction: "outgoing".into(),
         updates_received: runner.result().updates_received,
@@ -1490,7 +1490,7 @@ async fn handle_incoming_streams_v3_inner(
             pending_pairings.write().unwrap().remove(nonce);
         }
         known_peers.write().unwrap().insert(peer_id.to_string(), now_ms);
-        emit_event(&on_event, &crate::events::WasmEvent::PairingComplete {
+        emit_event(&on_event, &crate::events::Event::PairingComplete {
             peer_id: peer_id.to_string(),
             device_name: runner.result().peer_hostname.clone(),
         });
@@ -1509,7 +1509,7 @@ async fn handle_incoming_streams_v3_inner(
             .map_err(|e| CoreError::Protocol(format!("Import snapshot: {}", e)))?;
     }
 
-    emit_event(&on_event, &crate::events::WasmEvent::SyncComplete {
+    emit_event(&on_event, &crate::events::Event::SyncComplete {
         peer_id: peer_id.to_string(),
         direction: "incoming".into(),
         updates_received,
@@ -1615,7 +1615,7 @@ async fn run_gossip_receiver(
                         }
 
                         // Emit document_changed event
-                        emit_event(&on_event, &crate::events::WasmEvent::DocumentChanged {
+                        emit_event(&on_event, &crate::events::Event::DocumentChanged {
                             source: "gossip".into(),
                             bytes: plaintext.len(),
                         });
@@ -1623,13 +1623,13 @@ async fn run_gossip_receiver(
                 }
                 Ok(Event::NeighborUp(peer)) => {
                     info!("Gossip: neighbor joined: {}", peer);
-                    emit_event(&on_event, &crate::events::WasmEvent::GossipNeighborUp {
+                    emit_event(&on_event, &crate::events::Event::GossipNeighborUp {
                         peer_id: peer.to_string(),
                     });
                 }
                 Ok(Event::NeighborDown(peer)) => {
                     info!("Gossip: neighbor left: {}", peer);
-                    emit_event(&on_event, &crate::events::WasmEvent::GossipNeighborDown {
+                    emit_event(&on_event, &crate::events::Event::GossipNeighborDown {
                         peer_id: peer.to_string(),
                     });
                 }
@@ -1735,7 +1735,7 @@ async fn run_gossip_debounce(
             }
             Err(crate::error::CoreError::DeltaTooLarge { size, max }) => {
                 warn!("Delta too large for gossip ({} > {}), peers need point-to-point sync", size, max);
-                emit_event(&on_event, &crate::events::WasmEvent::SyncNeeded {
+                emit_event(&on_event, &crate::events::Event::SyncNeeded {
                     reason: "delta_too_large".into(),
                     size,
                     max,
@@ -1806,7 +1806,7 @@ async fn run_accept_loop(
                 connections.write().await.insert(peer_id.clone(), connection);
 
                 // Emit event to JavaScript
-                emit_event(&on_event, &crate::events::WasmEvent::PeerConnected {
+                emit_event(&on_event, &crate::events::Event::PeerConnected {
                     peer_id: peer_id.clone(),
                     direction: "incoming".into(),
                 });
